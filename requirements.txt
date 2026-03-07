@@ -1,0 +1,12 @@
+mojito2
+pyupbit
+pykrx
+schedule
+requests
+PyQt5
+pandas_market_calendars
+pandas
+numpy
+pytz
+yfinance
+lxml
