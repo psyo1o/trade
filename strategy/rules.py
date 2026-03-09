@@ -55,29 +55,21 @@ def _resolve_display_name(ticker, name=""):
 
 # 🧰 1. 200일선 전략용 (야후 파이낸스 - 과거 데이터 길게 뽑기)
 def get_ohlcv_yfinance(ticker):
-    try:
-        # 🇺🇸 미장 티커: 영문+하이픈만 → .KS 안 붙임
-        # 🇰🇷 국내 티커: 숫자만 → .KS 붙임
-        if ticker.isdigit():  # 국내주식 (000660 같은 숫자)
-            code_yf = ticker + ".KS" if not ticker.endswith(".KS") and not ticker.endswith(".KQ") else ticker
-        else:  # 미국주식 (AAPL, BRK-B 등)
-            code_yf = ticker
-        
-        df = yf.download(code_yf, period="1y", interval="1d", progress=False)
-        if df.empty and ticker.isdigit():  # 국내주식만 .KQ로 재시도
-            code_yf = ticker.replace(".KS", ".KQ")
-            df = yf.download(code_yf, period="1y", interval="1d", progress=False)
-        
-        rows = []
-        for index, row in df.iterrows():
-            rows.append({
-                'o': float(row['Open']), 'h': float(row['High']),
-                'l': float(row['Low']), 'c': float(row['Close']), 'v': float(row['Volume'])
-            })
-        return rows
-    except Exception as e:
-        print(f"⚠️ 야후 데이터 에러: {e}")
+    """yfinance로 OHLCV(200일) 조회 후, 딕셔너리 리스트로 변환"""
+    is_kr = str(ticker).isdigit()
+    
+    # yfinance 티커 형식에 맞게 변환 (예: 005930 -> 005930.KS)
+    y_ticker = f"{ticker}.KS" if is_kr else ticker
+    
+    # 데이터 조회
+    df = yf.download(y_ticker, period="200d", interval="1d", progress=False)
+    if df.empty:
         return []
+        
+    # Pandas 공식 권장 방식: 컬럼명 변경 후 to_dict('records') 사용
+    df = df.rename(columns={'Open': 'o', 'High': 'h', 'Low': 'l', 'Close': 'c', 'Volume': 'v'})
+    ohlcv = df[['o', 'h', 'l', 'c', 'v']].to_dict('records')
+    return ohlcv
 
 # 🧰 2. 5% 갭상승 컷오프용 (한투 API - 아침 9시 딜레이 없는 실시간 타격)
 def get_ohlcv_realtime(broker, ticker):
@@ -207,26 +199,68 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
     return True, stop_loss, "V5.0 기관 추세돌파"
 
 # 🛑 V5.0 기관급 매도 엔진: "샹들리에 트레일링 스탑 (Chandelier Exit)"
-def check_pro_exit(curr_p, pos_info, ohlcv):
-    if not ohlcv: return False, ""
+def get_chandelier_exit(curr_p, pos_info, ohlcv):
+    if not ohlcv: return 0.0
     df = pd.DataFrame(ohlcv)
-    
-    # ATR 다시 계산 (행별 전일종가 정상 계산)
     df['prev_c'] = df['c'].shift(1)
     df['tr'] = df.apply(lambda x: max(x['h'] - x['l'], abs(x['h'] - x['prev_c']) if pd.notna(x['prev_c']) else 0, abs(x['l'] - x['prev_c']) if pd.notna(x['prev_c']) else 0), axis=1)
     atr = df['tr'].rolling(14).mean().iloc[-1]
-    
-    # 매수 이후 내가 경험한 가장 높은 가격 (최고점)
     max_price = max(pos_info.get('max_p', curr_p), curr_p)
+    return max_price - (atr * 3)
+
+def get_final_exit_price(ticker, curr_p, pos_info, ohlcv):
+    """현재가 및 수익률, 코어 종목 여부를 종합해 '최종 매도 컷 라인'을 계산"""
+    if not ohlcv: return float(pos_info.get('sl_p', 0))
     
-    # 💎 익절/손절선: 고점에서 ATR의 3배만큼 뺀 가격 (이 선이 계속 따라올라감)
-    chandelier_exit = max_price - (atr * 3)
+    # 1. 톱니바퀴 락 (오늘 샹들리에와 기존 저장된 손절가 중 무조건 높은 값 선택)
+    raw_chandelier = get_chandelier_exit(curr_p, pos_info, ohlcv)
+    locked_chandelier = max(raw_chandelier, pos_info.get('sl_p', 0))
     
-    # 최초 매수 시 설정한 하드 스탑(방어막)과 샹들리에 익절선 중 더 '높은' 가격을 현재 나의 기준선으로 잡음
-    hard_stop = pos_info.get('sl_p', curr_p * 0.9)
-    final_exit_line = max(hard_stop, chandelier_exit)
+    # 2. 수익률 계산
+    buy_price = pos_info.get('buy_p', curr_p)
+    profit_rate = ((curr_p - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
+
+    CORE_ASSETS = ["005930", "000660", "QQQ", "NVDA", "TSLA", "AAPL", "MSFT"]
+
+    # 3. 콘크리트 바닥 (이익 보존 락)
+    if ticker not in CORE_ASSETS:
+        if profit_rate >= 30.0:
+            profit_floor = buy_price * 1.15
+        elif profit_rate >= 20.0:
+            profit_floor = buy_price * 1.05
+        elif profit_rate >= 10.0:
+            profit_floor = buy_price * 1.005
+        else:
+            profit_floor = 0
+            
+        final_exit_line = max(locked_chandelier, profit_floor)
+    else:
+        final_exit_line = locked_chandelier
+        
+    return final_exit_line
+
+
+def check_pro_exit(ticker, curr_p, pos_info, ohlcv):
+    if not ohlcv: return False, ""
     
-    if curr_p < final_exit_line:
-        return True, "V5.0 샹들리에 라인 붕괴 (추세 종료)"
+    # 공통 계산 로직을 사용해 '실제 작동 중인 가장 높은 컷 라인'을 가져옴
+    final_exit_line = get_final_exit_price(ticker, curr_p, pos_info, ohlcv)
+
+    # 코어 종목 하드코딩 리스트 (main64.py와 동기화 권장)
+    CORE_ASSETS = ["005930", "000660", "QQQ", "NVDA", "TSLA", "AAPL", "MSFT"]
+    buy_price = pos_info.get('buy_p', curr_p)
+    profit_rate = ((curr_p - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
+
+    # 장부 업데이트 (sl_p를 새롭게 방어선으로 올려줌)
+    pos_info['sl_p'] = final_exit_line
+    
+    # 3. 매도 트리거 발동 검사
+    if curr_p <= final_exit_line:
+        # 사유 텍스트 다변화
+        if ticker not in CORE_ASSETS and profit_rate >= 10.0 and final_exit_line > get_chandelier_exit(curr_p, pos_info, ohlcv):
+            reason = f"이익 보존 락(Lock) 발동 (+{profit_rate:.1f}% 구간)"
+        else:
+            reason = "V5.0 샹들리에 라인 붕괴 (추세 종료)"
+        return True, reason
         
     return False, ""

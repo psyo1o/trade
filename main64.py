@@ -9,7 +9,7 @@ import pandas as pd
 import pandas_market_calendars as mcal
 
 from risk.guard import load_state, save_state, in_cooldown, set_cooldown, can_open_new, check_mdd_break
-from strategy.rules import get_ohlcv_yfinance, get_ohlcv_realtime, calculate_pro_signals, check_pro_exit
+from strategy.rules import get_ohlcv_yfinance, get_ohlcv_realtime, calculate_pro_signals, check_pro_exit, get_final_exit_price
 import screener
 
 def calculate_atr(ohlcv):
@@ -123,9 +123,9 @@ _schedule_loop_started = False
 # 🛡️ [대장주 보호막] 봇이 절대 건드리지 않는 종목
 CORE_ASSETS = ["005930", "000660", "QQQ", "NVDA", "TSLA", "AAPL", "MSFT"]
 
-# ⚙️ [최대 포지션 설정] 각 시장별 동시 보유 가능 종목 수
-MAX_POSITIONS_KR = 8      # 국장 최대 포지션
-MAX_POSITIONS_US = 8      # 미장 최대 포지션
+# ⚙️ [최대 포지션 설정] 각 시장별 동시 보유 가능 종목 수 (코어 자산 제외)
+MAX_POSITIONS_KR = 6      # 국장 최대 포지션 (코어 제외)
+MAX_POSITIONS_US = 6      # 미장 최대 포지션 (코어 제외)
 MAX_POSITIONS_COIN = 5    # 코인 최대 포지션
 
 # 📊 [지수 급락 기준] 각 시장의 신규 매수 중단 임계값
@@ -832,7 +832,12 @@ def execute_us_order_direct(broker, side, ticker, qty, price):
     nyse_tickers = {
         "XOM", "CVX", "SLB", "AON", "NOC", "CL", "ICE", "GE", "BA", "DIS", 
         "JNJ", "JPM", "KO", "MCD", "MMM", "PFE", "PG", "UNH", "V", "WMT", 
-        "CAT", "TRV", "DOW", "IBM", "HON", "RTX", "AMGN", "SYK", "LMT", "T"
+        "CAT", "TRV", "DOW", "IBM", "RTX", "SYK", "LMT", "T",
+        # 추가 보강된 NYSE 종목 (night_targets 기준)
+        "BRK-B", "LLY", "MA", "HD", "MRK", "ABBV", "CRM", "BAC", "TMO", "ACN", 
+        "LIN", "ABT", "VZ", "DHR", "UNP", "NOW", "COP", "PM", "SPGI", "BLK", 
+        "PGR", "C", "MMC", "CB", "BSX", "CI", "CVS", "ZTS", "WM", "MO", 
+        "ITW", "SHW", "DUK", "SO", "BDX", "MCO", "EOG"
     }
     excg_cd = "NYSE" if ticker in nyse_tickers else "NASD"
     
@@ -1902,16 +1907,13 @@ def run_trading_bot():
 
     # 2) 미장 고정 타겟 (main641 확장 리스트)
     night_targets = [
-        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "LLY", "AVGO",
+        "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "LLY", "AVGO",
         "JPM", "V", "XOM", "UNH", "MA", "PG", "JNJ", "HD", "MRK", "COST",
         "ABBV", "CVX", "CRM", "AMD", "NFLX", "KO", "PEP", "BAC", "TMO", "WMT",
         "ACN", "LIN", "MCD", "CSCO", "ABT", "INTC", "QCOM", "INTU", "VZ", "CMCSA",
         "TXN", "DHR", "PFE", "AMAT", "UNP", "IBM", "NOW", "COP", "PM", "BA",
         "ISRG", "GE", "HON", "CAT", "RTX", "DIS", "AMGN", "SYK", "LMT", "T",
-        "SPGI", "BKNG", "BLK", "MDLZ", "TJX", "ADP", "PGR", "C", "REGN", "VRTX",
-        "ADI", "MMC", "CB", "BSX", "CI", "CVS", "ZTS", "PANW", "SNPS",
-        "KLAC", "GILD", "CDNS", "EQIX", "WM", "CSX", "CME", "MO", "ITW", "SHW",
-        "DUK", "SO", "BDX", "MCO", "EOG", "SLB", "AON", "NOC", "CL", "ICE"
+        "SPGI", "BKNG", "BLK", "MDLZ", "TJX", "ADP", "PGR", "C", "MMC", "CB", "BSX", "CI", "CVS", "ZTS", "WM", "MO", "ITW", "SHW", "DUK", "SO", "BDX", "MCO", "EOG", "SLB", "AON", "NOC", "CL", "ICE"
     ]
 
     if is_market_open("KR"):
@@ -1941,7 +1943,6 @@ def run_trading_bot():
         if positions_count == 0:
             print(f"  ✅ [국장 매도 루프] 매도할 종목 없음 (완료)")
         else:
-            print(f"  📋 장부 포지션: {list(state.get('positions', {}).keys())}")
             # 🗄️ OHLCV 일괄 캐싱 (yfinance 우선)
             kr_sell_tickers = [normalize_ticker(s.get('pdno', '')) for s in kr_output1 if normalize_ticker(s.get('pdno', '')) in held_kr and normalize_ticker(s.get('pdno', '')) not in CORE_ASSETS]
             prefetch_ohlcv(kr_sell_tickers, market="KR")
@@ -1977,7 +1978,7 @@ def run_trading_bot():
                 ohlcv = get_cached_ohlcv(t, broker=broker_kr)
                 
                 if not ohlcv or len(ohlcv) < 14:
-                    # OHLCV 완전 실패 → 현재가만으로 hard_stop 손절만
+                    # OHLCV 완전 실패 → 현재가로 hard_stop 손절만
                     print(f"  🔴 [{t}] OHLCV 전체 실패 ({len(ohlcv) if ohlcv else 0}개), 현재가로 손절만 체크...")
                     price_resp = broker_kr.fetch_price(t)
                     if not price_resp or price_resp.get('rt_cd') != '0':
@@ -2002,12 +2003,12 @@ def run_trading_bot():
                         print(f"     📈 [{t}] max_p 업데이트: {old_max_p:,.0f} → {pos_info['max_p']:,.0f}")
                     state.setdefault("positions", {})[t] = pos_info
                     save_state(STATE_PATH, state)
-                    print(f"     📊 {t}: 현재가 {curr_p:,}원 / 손절가 {sl_p:,}원 / 수익률 {profit_rate_now:.2f}%")
+                    print(f"     📊 {t}: 현재가 {curr_p:,.0f}원 / 손절가 {sl_p:,.0f}원 / 수익률 {profit_rate_now:+.2f}%")
                     
                     if profit_rate_now < 0 and curr_p <= sl_p:
-                        print(f"     🔴 손절 신호! 현재가 {curr_p:,} ≤ 손절가 {sl_p:,}")
+                        print(f"     🔴 손절 신호! 현재가 {curr_p:,.0f} ≤ 손절가 {sl_p:,.0f}")
                         kr_name = get_kr_company_name(t)
-                        qty = int(_to_float(stock.get('hldg_qty', stock.get('ccld_qty_smtl1', 0))))
+                        qty = int(_to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
                         if qty > 0:
                             resp = create_market_sell_order_kis(t, qty, is_us=False, curr_price=curr_p)
                             if resp and resp.get('rt_cd') == '0':
@@ -2015,7 +2016,7 @@ def run_trading_bot():
                                 send_telegram(f"🚨 [국장 긴급 손절] {t}({kr_name})\n수익률: {profit_rate_now:.2f}%")
                                 _record_trade_event("KR", t, "SELL", qty, price=curr_p, profit_rate=profit_rate_now, reason="OHLCV실패_손절")
                                 stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
-                                stats["losses"] = int(stats.get("losses", 0)) + 1
+                                stats["losses"] = int(stats.get("losses", 0) or 0) + 1
                                 stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate_now)
                                 del state["positions"][t]
                                 set_cooldown(state, t)
@@ -2047,18 +2048,19 @@ def run_trading_bot():
 
                 # 📊 [상태 로그] 한눈에 보기
                 kr_name = get_kr_company_name(t)
-                # 📊 [상태 로그] 한눈에 보기
-                kr_name = get_kr_company_name(t)
-                print(f"  📊 [KR 보유] {kr_name}({t}) | 현재가: {int(curr_p):,}원 | 매수가: {int(buy_p):,}원 | 최고가: {int(new_max_p):,}원 | 수익률: {profit_rate_now:+.2f}%")
+                chandelier_p = get_final_exit_price(t, curr_p, pos_info, ohlcv)
+                print(f"  📊 [KR 보유] {kr_name}({t}) | 현재가: {int(curr_p):,}원 | 매수가: {int(buy_p):,}원 | 최고가: {int(new_max_p):,}원 | 매도선: {int(chandelier_p):,}원 | 수익률: {profit_rate_now:+.2f}%")
 
                 if new_max_p > old_max_p:
                      print(f"     📈 [{t}] 최고가(max_p) 갱신! {int(old_max_p):,}원 → {int(new_max_p):,}원")
 
+                hard_stop = float(pos_info.get('sl_p', buy_p * 0.9))
+
                 # 손절가 체크 로그
                 if profit_rate_now < 0:
-                    print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: {curr_p:,.0f}원 / 손절가: {hard_stop:,.0f}원)")
+                    print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: {curr_p:,.0f} / 손절가: {hard_stop:,.0f})")
                     if curr_p <= hard_stop:
-                        print(f"     ➜ 손절 체크: 현재가 {curr_p:,.0f}원 ≤ 손절가 {hard_stop:,.0f}원 = 🔴 매도 신호!")
+                        print(f"     ➜ 손절 체크: 현재가 {curr_p:,.0f} ≤ 손절가 {hard_stop:,.0f} = 🔴 매도 신호!")
 
                 # 0%~+1% 구간은 신규 매수 후 15분간만 매도 보류
                 buy_time = pos_info.get('buy_time', time.time() - 900)
@@ -2073,7 +2075,7 @@ def run_trading_bot():
                         continue
                 else:
                     # +1% 이상 수익 구간은 샹들리에 추세이탈로 익절/청산
-                    is_exit, reason = check_pro_exit(curr_p, pos_info, ohlcv)
+                    is_exit, reason = check_pro_exit(t, curr_p, pos_info, ohlcv)
                 if is_exit:
                     kr_name = get_kr_company_name(t)  # 종목명 미리 조회
                     qty = int(_to_float(stock.get('hldg_qty', stock.get('ccld_qty_smtl1', 0))))
@@ -2098,9 +2100,9 @@ def run_trading_bot():
                         profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                         stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                         if profit_rate > 0:
-                            stats["wins"] += 1
+                            stats["wins"] = int(stats.get("wins", 0) or 0) + 1
                         else:
-                            stats["losses"] += 1
+                            stats["losses"] = int(stats.get("losses", 0) or 0) + 1
                         stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
                         _record_trade_event("KR", t, "SELL", qty, price=curr_p, profit_rate=profit_rate, reason=reason)
                         print(f"  ✅ [국장 매도 체결] {kr_name}({t}) | 수익률: {profit_rate:+.2f}% | 사유: {reason}")
@@ -2345,7 +2347,7 @@ def run_trading_bot():
                         print(f"     📈 [{t}] max_p 업데이트: ${old_max_p:.2f} → ${pos_info['max_p']:.2f}")
                     state.setdefault("positions", {})[t] = pos_info
                     save_state(STATE_PATH, state)
-                    print(f"     📊 {t}: 현재가 ${curr_p:.2f} / 손절가 ${sl_p:.2f} / 수익률 {profit_rate_now:.2f}%")
+                    print(f"     📊 {t}: 현재가 ${curr_p:.2f} / 손절가 ${sl_p:.2f} / 수익률 {profit_rate_now:+.2f}%")
                     
                     if profit_rate_now < 0 and curr_p <= sl_p:
                         print(f"     🔴 손절 신호! 현재가 ${curr_p:.2f} ≤ 손절가 ${sl_p:.2f}")
@@ -2359,7 +2361,7 @@ def run_trading_bot():
                                 send_telegram(f"🚨 [미장 긴급 손절] {t}({us_name})\n수익률: {profit_rate_now:.2f}%")
                                 _record_trade_event("US", t, "SELL", qty, price=sell_price, profit_rate=profit_rate_now, reason="OHLCV실패_손절")
                                 stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
-                                stats["losses"] = int(stats.get("losses", 0)) + 1
+                                stats["losses"] = int(stats.get("losses", 0) or 0) + 1
                                 stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate_now)
                                 del state["positions"][t]
                                 set_cooldown(state, t)
@@ -2397,7 +2399,8 @@ def run_trading_bot():
 
                 # 📊 [상태 로그] 한눈에 보기
                 us_name = get_us_company_name(t)
-                print(f"  📊 [US 보유] {us_name}({t}) | 현재가: ${curr_p:.2f} | 매수가: ${buy_p:.2f} | 최고가: ${new_max_p:.2f} | 수익률: {profit_rate_now:+.2f}%")
+                chandelier_p = get_final_exit_price(t, curr_p, pos_info, ohlcv)
+                print(f"  📊 [US 보유] {us_name}({t}) | 현재가: ${curr_p:.2f} | 매수가: ${buy_p:.2f} | 최고가: ${new_max_p:.2f} | 매도선: ${chandelier_p:.2f} | 수익률: {profit_rate_now:+.2f}%")
 
                 if new_max_p > old_max_p:
                     print(f"     📈 [{t}] 최고가(max_p) 갱신! ${old_max_p:.2f} → ${new_max_p:.2f}")
@@ -2405,14 +2408,15 @@ def run_trading_bot():
 
                 # 손절가 체크 로그
                 if profit_rate_now < 0:
-                    print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: ${curr_p:.2f} / 손절가: ${hard_stop:.2f})")
+                    print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: {curr_p:,.0f} / 손절가: {hard_stop:,.0f})")
                     if curr_p <= hard_stop:
-                        print(f"     ➜ 손절 체크: 현재가 ${curr_p:.2f} ≤ 손절가 ${hard_stop:.2f} = 🔴 매도 신호!")
+                        print(f"     ➜ 손절 체크: 현재가 {curr_p:,.0f} ≤ 손절가 {hard_stop:,.0f} = 🔴 매도 신호!")
 
                 # 0%~+1% 구간은 매도 보류 (신규 매수 후 15분 동안)
                 buy_time = pos_info.get('buy_time', 0)
                 time_elapsed = time.time() - buy_time if buy_time else 900
                 if 0 <= profit_rate_now < 1.0 and time_elapsed < 900:
+                    print(f"  ⏭️ {t}: 신규 매수 보호 구간 ({int(900-time_elapsed)}초 남음)")
                     continue
 
                 # 손실 구간은 하드스탑(sl_p)만 적용
@@ -2423,7 +2427,7 @@ def run_trading_bot():
                         continue
                 else:
                     # +1% 이상 수익 구간은 샹들리에 추세이탈로 익절/청산
-                    is_exit, reason = check_pro_exit(curr_p, pos_info, ohlcv)
+                    is_exit, reason = check_pro_exit(t, curr_p, pos_info, ohlcv)
                 if is_exit:
                     us_name = get_us_company_name(t)  # 종목명 미리 조회
                     qty = float(_to_float(stock.get('ovrs_cblc_qty', stock.get('hldg_qty', 0))))
@@ -2451,7 +2455,7 @@ def run_trading_bot():
                         profit_rate = ((sell_price - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                         stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                         if profit_rate > 0:
-                            stats["wins"] += 1
+                            stats["wins"] = int(stats.get("wins", 0)) + 1
                         else:
                             stats["losses"] += 1
                         stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
@@ -2462,7 +2466,7 @@ def run_trading_bot():
                         set_cooldown(state, t)
                         save_state(STATE_PATH, state)
                     else:
-                        print(f"  ❌ {us_name}({t}) 매도 최종 실패 ({retry_count}회 시도): {resp.get('msg1', 'API 오류')}")
+                        print(f"  ❌ {us_name}({t}) 매도 최종 실패 ({retry_count}회 시도): {resp.get('msg1', 'API 오류') if resp else '응답 없음'}")
             except Exception as e:
                 print(f"  ❌ [US 매도 루프 예외] {t}: {e}")
                 traceback.print_exc()
@@ -2532,7 +2536,7 @@ def run_trading_bot():
 
                                 if resp and resp.get('rt_cd') == '0':
                                     print(f"  ✅ [미장 매수 체결] {us_name}({t}) | ${curr_p:.2f} × {qty}주 | 손절가: ${sl_p:.2f}")
-                                    send_telegram(f"🎯 [미장 V5.0 기관매수] {t}({us_name})\n평단가: ${curr_p:.2f} × {qty}주 | 손절가: ${sl_p:.2f}\n전략: {s_name}")
+                                    send_telegram(f"🎯 [{t_name} 매수] {t}({us_name})\n평단가: {int(curr_p):,}원 × {qty}주 | 손절가: {int(sl_p):,}원\n전략: {s_name}")
                                     us_cash -= (qty * curr_p)
                                     payload = {'buy_p': curr_p, 'sl_p': sl_p, 'max_p': curr_p, 'buy_time': time.time()}
                                     persist_position_registration(state, t, payload, context="US BUY")
@@ -2601,7 +2605,7 @@ def run_trading_bot():
                 state.setdefault("positions", {})[t] = pos_info
                 save_state(STATE_PATH, state)
                 
-                print(f"     📊 {t}: 현재가 {curr_p:,.0f}원 / 손절가 {sl_p:,.0f}원 / 수익률 {profit_rate_now:.2f}%")
+                print(f"     📊 {t}: 현재가 {curr_p:,.0f}원 / 손절가 {sl_p:,.0f}원 / 수익률 {profit_rate_now:+.2f}%")
                 
                 if profit_rate_now < 0 and curr_p <= sl_p:
                     print(f"     🔴 손절 신호! 현재가 {curr_p:,.0f} ≤ 손절가 {sl_p:,.0f}")
@@ -2642,10 +2646,15 @@ def run_trading_bot():
             pos_info['max_p'] = new_max_p
             state.setdefault("positions", {})[t] = pos_info
             save_state(STATE_PATH, state)  # 최고가 즉시 저장
-            if new_max_p > old_max_p:
-                print(f"  📈 [{t}] max_p 업데이트: {old_max_p:,.0f} → {new_max_p:,.0f}")
             profit_rate_now = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
             hard_stop = float(pos_info.get('sl_p', buy_p * 0.9))
+            chandelier_p = get_final_exit_price(t, curr_p, pos_info, ohlcv)
+            
+            # 📊 [상태 로그] 한눈에 보기
+            print(f"  📊 [COIN 보유] {t} | 현재가: {curr_p:,.2f}원 | 매수가: {buy_p:,.2f}원 | 최고가: {new_max_p:,.2f}원 | 매도선: {chandelier_p:,.2f}원 | 수익률: {profit_rate_now:+.2f}%")
+
+            if new_max_p > old_max_p:
+                print(f"     📈 [{t}] 최고가(max_p) 갱신! {old_max_p:,.0f} → {new_max_p:,.0f}")
 
             # 손절가 체크 로그
             if profit_rate_now < 0:
@@ -2668,7 +2677,7 @@ def run_trading_bot():
                     continue
             else:
                 # +1% 이상 수익 구간은 샹들리에 추세이탈로 익절/청산
-                is_exit, reason = check_pro_exit(curr_p, pos_info, ohlcv)
+                is_exit, reason = check_pro_exit(t, curr_p, pos_info, ohlcv)
             if is_exit:
                 # 최대 3회 재시도
                 retry_count = 0
@@ -2686,7 +2695,7 @@ def run_trading_bot():
                     profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                     stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                     if profit_rate > 0:
-                        stats["wins"] += 1
+                        stats["wins"] = int(stats.get("wins", 0)) + 1
                     else:
                         stats["losses"] += 1
                     stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
@@ -2748,7 +2757,7 @@ def run_trading_bot():
                                     current_p = pyupbit.get_current_price(t)
                                     coin_qty = budget / current_p if current_p > 0 else 0
                                     print(f"  ✅ [코인 매수 체결] {t} | {int(current_p):,}원 × {coin_qty:.4f} | 손절가: {sl_p:,.0f}원")
-                                    send_telegram(f"🎯 [코인 V5.0 기관매수] {t}\n평단가: {int(current_p):,}원 × {coin_qty:.4f} | 손절가: {sl_p:,.0f}원\n전략: {s_name}")
+                                    send_telegram(f"🎯 [코인 V5.0 기관매수] {t}({us_name})\n평단가: {int(current_p):,}원 × {coin_qty:.4f} | 손절가: {sl_p:,.0f}원\n전략: {s_name}")
                                     payload = {'buy_p': current_p, 'sl_p': sl_p, 'max_p': current_p, 'buy_time': time.time()}
                                     persist_position_registration(state, t, payload, context="COIN BUY")
                                     try:

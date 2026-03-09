@@ -25,15 +25,27 @@ def set_cooldown(state, code):
     state.setdefault("cooldown", {})[code] = datetime.now().isoformat(timespec="seconds")
 
 def can_open_new(ticker, state, max_positions=5): # 메인에서 안 던져주면 기본값 5
-    """[시장별 독립 슬롯] 메인에서 설정한 종목 수(max_positions)만큼 허락합니다!"""
+    """[시장별 독립 슬롯] 메인에서 설정한 종목 수(max_positions)만큼 허락합니다!
+    단, CORE_ASSETS(대장주)는 포지션 카운트에서 제외합니다. (별도 관리)
+    """
     positions = state.get("positions", {})
     
-    # 1. 봇의 장부에서 시장별로 개수를 따로 셉니다.
-    kr_count = sum(1 for k in positions.keys() if k.isdigit())
+    # 0. 코어 자산 정의 (main64.py와 동일하게 유지)
+    CORE_ASSETS = ["005930", "000660", "QQQ", "NVDA", "TSLA", "AAPL", "MSFT"]
+
+    # 1. 봇의 장부에서 시장별로 개수를 따로 셉니다. (코어 자산 제외)
+    kr_count = sum(1 for k in positions.keys() if k.isdigit() and k not in CORE_ASSETS)
     coin_count = sum(1 for k in positions.keys() if k.startswith("KRW-"))
     us_count = len(positions) - kr_count - coin_count
+    # 미장 카운트 보정 (전체 - 국장 - 코인 - 미장코어)
+    us_core_count = sum(1 for k in positions.keys() if k in CORE_ASSETS and not k.isdigit())
+    us_count = us_count - us_core_count
     
     # 2. 들어온 티커(ticker)가 어느 시장인지 확인하고, 메인이 요청한 제한(max_positions)과 비교!
+    # (코어 자산인 경우 무조건 True 반환 → 제한 없이 추가 매수 가능)
+    if ticker in CORE_ASSETS:
+        return True
+
     if ticker.startswith("KRW-"):
         return coin_count < max_positions
     elif ticker.isdigit():

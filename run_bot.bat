@@ -1,4 +1,5 @@
 @echo off
+pushd "%~dp0"
 title Bot Auto-Restart
 
 :loop
