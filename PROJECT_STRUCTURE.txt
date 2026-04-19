@@ -1,0 +1,138 @@
+﻿프로젝트 구조/파일 설명 (2026-04-19 기준, positions.qty·주말 수량 표시 반영)
+=====================================
+
+일반 운영: run_bot.bat 또는 py -3.11 run_gui.py 로 GUI만 사용하면 됨.
+run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
+
+1) 최상위 실행/설정 파일
+----------------------
+- run_bot.py
+  - 국장/미장/코인 통합 자동매매 메인 엔진.
+  - config.json, bot_state.json, trade_history.json을 읽고 쓰며,
+    strategy/* + execution/* + api/* 모듈을 오케스트레이션.
+  - 핵심 루프: run_trading_bot() (동기화 → 매도/리스크 → 신규매수).
+  - last_kis_display_snapshot 저장/로드(save_last / load_last_…), 주말 KIS 스킵 시 GUI·텔레 국·미 숫자에 사용.
+
+- run_gui.py
+  - PyQt5 기반 운영 GUI.
+  - run_bot 모듈을 import해서 엔진/잔고/수동매도/로그를 UI로 제어.
+  - 매매는 KST 분기(:00/:15/:30/:45); 텔레그램 생존보고는 기동 즉시 1회 후 KST :00/:30 정렬.
+  - KIS 주말 점검 창: 국·미 잔고 API 미호출, last_kis_display_snapshot·장부로 표시.
+    보유수량은 positions[티커].qty(평일 동기화/매수 시 기록), 없으면 표시 1 폴백.
+  - 설정(config.json)은 run_bot import 시 로드되므로 변경 후 GUI 재시작 필요.
+
+- screener.py
+  - 한국투자 API 기반 국장 스크리너.
+  - HTS 조건검색 결과를 kr_targets.json에 저장.
+  - 스케줄러(run_bot.start_scanner_scheduler)에서 매 거래일 14:50 KST 실행
+    (국장 매수 가능 구간 직전 갱신 목적).
+
+- us_screener.py
+  - 미장 감시 유니버스 재빌드(run_bot.get_top_market_cap_tickers(force_refresh=True)).
+  - us_universe_cache.json 갱신. 스케줄러에서 매 거래일 15:20 US/Eastern 실행
+    (미장 매수 창 15:30 ET 기준 약 10분 전, DST 자동).
+
+- config.json
+  - API 키, 텔레그램, test_mode, TWAP, 거시필터 등 런타임 설정.
+
+- bot_state.json
+  - 장부/상태 파일.
+  - positions — 티커별 buy_p, sl_p, tier, qty 등. qty는 평일 sync_positions·매수 체결 시 갱신(주말 GUI 수량 표시).
+  - cooldown(단기), ticker_cooldowns(매도 후 재진입 쿨다운 ISO 시각),
+    stats, Phase5 보조키(합산 고점/쿨다운 등) 저장.
+  - last_kis_display_snapshot — 국·미 예수·총평·수익률 직전 성공값(saved_at 포함). 주말 GUI/텔레 표시용.
+
+- us_universe_cache.json
+  - 미장 S&P500 시총 상위 100 + Nasdaq100 중 Tier1 제외 상위 50(최대 150) 및 GICS 섹터.
+  - 24시간 TTL; us_screener가 강제 재빌드 시에도 갱신.
+
+- trade_history.json
+  - 매매 이벤트 append 기록.
+
+
+2) 디렉터리별 역할
+------------------
+- api/
+  - 외부 브로커/데이터 API 래퍼 레이어.
+  - kis_api.py: 한국투자 토큰/브로커/잔고/주문.
+  - upbit_api.py: 업비트 잔고/주문.
+  - macro_data.py: VIX, Fear&Greed 원시 지표 수집.
+
+- strategy/
+  - 매수/매도 판단 로직(규칙·필터).
+  - rules.py: V5 전략 코어(OHLCV, 시그널, 청산 가격). yfinance 재시도; 국내 일봉은 KIS 우선 가능.
+  - sector_lock.py: 동일 GICS 섹터 과집중 제한
+    (한도 = max(1, (max_positions_XX + 1) // 2) 형태로 올림).
+  - ai_filter.py: false-breakout(휩쏘) 필터.
+  - macro_guard.py: 거시 방어막 정책(차단/축소/정상).
+
+- execution/
+  - 실행/리스크/동기화 유틸.
+  - guard.py: 장부 I/O, cooldown / ticker_cooldowns, MDD, 합산 서킷,
+    CORE_ASSETS 단일 정의; 매도 사유별 ticker_cooldowns 설정·조회;
+    기본 장부에 last_kis_display_snapshot 키 병합.
+  - sync_positions.py: 실계좌↔장부 자동복구/유령정리/평단보정·보유수량(qty) 동기화(평일 API).
+    주말 KIS 점검 창에서는 국·미 실계좌 시드만 건너뛰고 코인 시드는 유지(로그 한 줄).
+  - order_twap.py: 분할 매수/매도(TWAP) 슬라이스 계획/실행.
+  - circuit_break.py: 합산 자산 drawdown 판정 유틸.
+
+- utils/
+  - 공통 보조 모듈.
+  - logger.py: 자정 롤오버(30일) 로깅 + stdout/stderr 리다이렉트.
+  - telegram.py: 알림 및 atexit 종료 핸들러.
+  - helpers.py: 티커 정규화, 이름 조회, JSON 입출력, 코인 최소수량 기준,
+    분·쿼터·반시간 정렬(seconds_until_next_half_hour 등),
+    kis_equities_weekend_suppress_window_kst() — KST 토 08:00~월 07:00 전 국·미 KIS 호출 차단 판별.
+
+- tests/
+  - test_lab.py: Phase 샌드박스/실험 스크립트.
+
+
+3) 현재 핵심 공통 상수/정책
+--------------------------
+Phase 1~5 (코드·로그 용어, tests/test_lab.py 샌드박스와 대응)
+  - Phase 1: 섹터 분산 — strategy/sector_lock.py
+  - Phase 2: TWAP 분할 — execution/order_twap.py, run_bot 매수 경로
+  - Phase 3: AI 휩쏘 필터 — strategy/ai_filter.py
+  - Phase 4: 거시 방어막(VIX·FGI 등) — strategy/macro_guard.py, api/macro_data.py
+  - Phase 5: 합산 계좌 서킷 — execution/circuit_break.py, execution/guard.py
+  - 매도 후 재진입: ticker_cooldowns (guard.py, Phase 번호 없음)
+
+- CORE_ASSETS 단일 소스: execution/guard.py
+  - 주식 코어 + 코인 코어(KRW-BTC, KRW-ETH, KRW-SOL).
+  - run_bot.py / strategy/rules.py는 guard에서 import해서 사용.
+
+- CORE_COIN_ASSETS: execution/guard.py
+  - CORE_ASSETS 중 KRW- 코인만 추출한 튜플.
+  - 코인 스캔 폴백 대상 등에 재사용.
+
+- 코인 먼지 수량 기준: utils/helpers.py
+  - COIN_MIN_POSITION_QTY (= 0.0001)
+  - coin_qty_counts_for_position(qty)로 실질 보유 여부 통일 판정.
+
+
+4) 동작 흐름(요약)
+-----------------
+1. run_bot 시작 → config 로드, 브로커/텔레그램/로거 준비.
+2. run_trading_bot() 주기 실행.
+3. sync_all_positions()로 실보유와 장부 정합.
+4. 리스크 체크(MDD/합산서킷/거시/섹터/AI필터).
+5. 매도(조건 충족 시) 후 신규 매수(시장·시간·슬롯 조건 충족 시).
+6. 체결/상태를 trade_history.json, bot_state.json에 반영.
+
+참고 — 미장 유니버스: run_bot.get_top_market_cap_tickers (S&P Top100 + NDX 비중복 50,
+  최대 150). 국장 스캐너 14:50 KST / 미장 us_screener 15:20 ET.
+  OHLCV는 국내 6자리 KIS 일봉 우선·yfinance 보완.
+  매도 후 재진입은 ticker_cooldowns.
+  증권사 주말 점검(KIS): helpers.kis_equities_weekend_suppress_window_kst 참고 — 코인(업비트)만 실시간.
+  국·미 예수·총평 등은 last_kis_display_snapshot(평일 마지막 성공 조회). 보유종목 수량은 positions.qty.
+  업비트 매수: 가용 KRW×0.999 캡·최소 5000원(run_bot 상수).
+
+
+5) 수정 시 권장 원칙
+-------------------
+- 코어 종목 변경: execution/guard.py의 CORE_ASSETS만 수정.
+- 코인 최소수량 변경: utils/helpers.py의 COIN_MIN_POSITION_QTY만 수정.
+- TWAP 정책 변경: config.json(twap_*) 우선, 구조 변경 시 execution/order_twap.py 수정.
+- 장부 스키마 변경: execution/guard.py + execution/sync_positions.py + run_bot.py 함께 확인
+  (last_kis_display_snapshot, positions 하위 qty 등).

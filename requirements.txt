@@ -10,3 +10,7 @@ numpy
 pytz
 yfinance
 lxml
+ta
+pyupbit
+html5lib
+google-generativeai

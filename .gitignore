@@ -19,11 +19,17 @@ logs/
 kis_token.json
 token.dat
 config.json
+tests/ai_keys.txt
+tests/ai_keys*.txt
+.env
+.env.*
+*.pem
 
 # Runtime Data / State
 bot_state.json
 bot_state_backup_*.json
 trade_history.json
+us_universe_cache.json
 gui_run_out.log
 gui_run_err.log
 

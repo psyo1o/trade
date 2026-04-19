@@ -1,6 +1,8 @@
 @echo off
 pushd "%~dp0"
-echo ?? 64��Ʈ ���� �� ��Ű�� ��ġ�� �����մϴ�...
-pip install -r requirements.txt
-echo ? ��ġ�� �Ϸ�Ǿ����ϴ�! �ƹ� Ű�� ������ ����˴ϴ�.
+
+echo Installing packages for Python 3.11...
+py -3.11 -m pip install -r requirements.txt
+
+echo Installation complete! Press any key to exit.
 pause

@@ -1,3 +1,14 @@
+# -*- coding: utf-8 -*-
+"""
+한국투자 API 기반 **야간/장후 스크리너** — 당일 거래대금·시총 상위 후보를 뽑아 JSON에 저장.
+
+실행
+    * ``run_bot.start_scanner_scheduler`` 가 거래일 **15:00 KST** 에 ``run_night_screener`` 를 호출.
+    * 단독 테스트 시 이 파일을 직접 실행해도 된다 (``config.json``·``kis_hts_id`` 필요).
+
+토큰
+    * ``kis_token.json`` — ``run_bot`` 과 호환되는 ``access_token`` + ``timestamp`` 형식을 사용한다.
+"""
 import json, requests, time
 from pathlib import Path
 
@@ -21,7 +32,7 @@ def get_fresh_token():
         with open(token_file, "r") as f:
             try:
                 saved = json.load(f)
-                # main64.py 형식 (access_token) 또는 screener.py 형식 (token) 지원
+                # run_bot.py 형식 (access_token) 또는 screener.py 형식 (token) 지원
                 token = saved.get("access_token") or saved.get("token")
                 timestamp = saved.get("timestamp", 0)
                 # 11시간 50분 이내라면 기존 토큰 사용
@@ -42,7 +53,7 @@ def get_fresh_token():
     
     if "access_token" in data:
         token = data["access_token"]
-        # main64.py와 동일한 형식으로 저장
+        # run_bot.py와 동일한 형식으로 저장
         data['timestamp'] = time.time()
         with open(token_file, "w") as f:
             json.dump(data, f)
