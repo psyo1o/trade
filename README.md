@@ -1,6 +1,6 @@
 ﻿# c-bot 운영 개요
 
-_업데이트: 2026-04-19 (장부 보유수량 `qty` 문서 반영)_
+_업데이트: 2026-04-19 — `adjust_capital.py`·`circuit_aux`·텔레그램 보유시간 문서 반영_
 
 **일반 운영:** `run_bot.bat` 또는 `py -3.11 run_gui.py` 로 **GUI만** 쓰면 됩니다.  
 `run_bot.py` 단독(헤드리스)은 콘솔 서버·개발용으로만 쓰는 선택 경로입니다.
@@ -14,6 +14,15 @@ _업데이트: 2026-04-19 (장부 보유수량 `qty` 문서 반영)_
   - 핵심 루프: `run_trading_bot()` (동기화 → 매도/리스크 → 신규매수).
   - KIS **잔고 표시 스냅샷**(`last_kis_display_snapshot` 저장/로드): 평일 조회 성공 시 갱신,
     증권사 주말 점검 창에서는 텔레·GUI에 직전 값 재사용.
+  - Phase 5 합산 MDD용 **`circuit_aux_last_*`** (국·미·코인 스냅샷): 매매 루프에서 실조회 후 갱신.
+    **`refresh_circuit_aux_from_brokers(state, path)`** 로 동일 키만 브로커 기준 재기록 가능(`adjust_capital.py` 등).
+  - 텔레그램 **생존신고·보유 종목 줄**: 장부 `buy_time` / `buy_date` 기준 **보유 기간** 접미사(` | 보유 N일 …`).
+    **수동 매도** 성공 알림에도 동일.
+
+- `adjust_capital.py`
+  - **수동 입·출금** 반영 시 Phase 5 **`peak_equity_total_krw`(합산 고점)** 만 입금액만큼 가산/출금액만큼 감산.
+  - 실행 시 먼저 **`refresh_circuit_aux_from_brokers`** 로 잔고 스냅샷을 맞춘 뒤 금액 입력(출금 한도·총자산 일치 완화).
+  - 기록은 `capital_adjustments` 배열에 append·`bot_state.json` 저장. (`config.json` 필요, `py -3.11 adjust_capital.py`)
 
 - `run_gui.py`
   - PyQt5 기반 운영 GUI.
@@ -44,7 +53,11 @@ _업데이트: 2026-04-19 (장부 보유수량 `qty` 문서 반영)_
   - `positions`(티커별 `buy_p`, `sl_p`, `tier`, **`qty`** 등): **`qty`** 는 평일 `sync_all_positions` 시 실계좌 수량과 맞추고,
     매수 체결 시에도 기록되어 **주말(KIS 미조회) GUI 보유수량 표시**에 사용된다. 구버전 장부에 없으면 첫 평일 동기화·매매 후 채워짐.
   - `cooldown`(단기), `ticker_cooldowns`(매도 후 익절/손절·타임스탑 등 사유별 **재진입 쿨다운** ISO 시각),
-    `stats`, Phase5 보조키(합산 고점/쿨다운 등) 저장.
+    `stats`, Phase5 키 저장.
+  - **Phase 5 / 합산 서킷:** `peak_equity_total_krw`(합산 평가 고점), `account_circuit_cooldown_until`(쿨다운 만료 시각),
+    **`circuit_aux_last_kr_krw`** / **`circuit_aux_last_usd_total`**(미장 합산 USD) / **`circuit_aux_last_coin_krw`**
+    — 루프마다 또는 `refresh_circuit_aux_from_brokers` 로 갱신·원화 합산 시 환율(`estimate_usdkrw`) 적용.
+  - **`capital_adjustments`**: `adjust_capital.py` 가 남긴 입출금·고점 보정 이력(선택).
   - `last_kis_display_snapshot`: 국·미 **예수금·총평가·수익률** 및 `saved_at`(직전 KIS 조회 성공 시각).
     주말 점검 구간에는 API를 부르지 않고 이 스냅샷으로 GUI·텔레 생존보고 숫자를 채움.
 
@@ -84,7 +97,7 @@ _업데이트: 2026-04-19 (장부 보유수량 `qty` 문서 반영)_
 - `utils/`
   - 공통 보조 모듈.
   - `logger.py`: 자정 롤오버(30일) 로깅 + stdout/stderr 리다이렉트.
-  - `telegram.py`: 알림 및 atexit 종료 핸들러.
+  - `telegram.py`: 알림 및 atexit 종료 핸들러. 메시지 본문은 호출부(`run_bot` heartbeat·수동매도 등)에서 구성.
   - `helpers.py`: 티커 정규화, 이름 조회, JSON 입출력, 코인 최소수량 기준,
     분·쿼터·반시간 정렬(`seconds_until_next_half_hour` 등),
     **`kis_equities_weekend_suppress_window_kst()`** — KST 기준 증권사 주말 점검 창에서 **국·미 KIS 호출 차단** 여부 판단(업비트 제외).
@@ -117,7 +130,7 @@ _업데이트: 2026-04-19 (장부 보유수량 `qty` 문서 반영)_
 | **Phase 2** | **TWAP** — 대액 시장가 **분할** 매수·매도, 슬리피지·체결 부담 완화 | `execution/order_twap.py`, `run_bot.py` 매수 주문 경로(로그 `[Phase2 TWAP …]`) |
 | **Phase 3** | **AI 휩쏘(False Breakout)** 필터 — 급등·틀린 돌파 의심 구간 완화 | `strategy/ai_filter.py`, `config.json` 의 `ai_false_breakout_*` |
 | **Phase 4** | **거시 방어막** — VIX·Fear&Greed 등으로 신규 매수 완화·차단 | `strategy/macro_guard.py`, `api/macro_data.py`, 로그 `[Phase4 거시]` |
-| **Phase 5** | **합산 계좌 서킷** — 합산 자산 고점 대비 DD·쿨다운, 필요 시 전량 청산 시도·신규 매수 차단 | `execution/circuit_break.py`, `execution/guard.py` (`peak_equity_total_krw`, `account_circuit_*`), 로그 `[Phase5 서킷]` |
+| **Phase 5** | **합산 계좌 서킷** — 합산 자산 고점 대비 DD·쿨다운, 필요 시 전량 청산 시도·신규 매수 차단 | `execution/circuit_break.py`, `execution/guard.py` (`peak_equity_total_krw`, `account_circuit_*`), `run_bot` (`circuit_aux_*`, `refresh_circuit_aux_from_brokers`), **`adjust_capital.py`**(수동 입출금 시 고점 보정), 로그 `[Phase5 서킷]` |
 
 추가로 **MDD(종목·계좌 단위)** 등은 `execution/guard.py` 의 `check_mdd_break` 등과 연동되며,
 매도 후 **재진입 쿨다운**은 `ticker_cooldowns`(별도 Phase 번호 없음)로 관리합니다.
@@ -152,13 +165,19 @@ _업데이트: 2026-04-19 (장부 보유수량 `qty` 문서 반영)_
 - **보유종목 테이블(국·미):** 점검 구간에는 KIS 잔고 대신 장부 **`positions[*].qty`** 로 수량을 표시(없으면 표시용 `1` 폴백). 평일 한 번이라도 동기화되면 이후 주말에도 맞는 수량이 나옴.
 - **주의:** 한 번도 평일에 성공 조회가 없으면 스냅샷이 비어 국·미 표시가 0에 가까울 수 있음.
 
+### 4-3) 수동 입·출금과 합산 고점(`adjust_capital.py`)
+
+- 예수금만 입금/출금하면 **평가금 변동 없이** 총자산이 바뀌어, 기록된 **고점(`peak_equity_total_krw`)** 대비 드로다운이 왜곡될 수 있음.
+- **`adjust_capital.py`** 실행 → 실계좌 기준 **`circuit_aux_*` 갱신** 후, 입금/출금 선택 및 원화 금액 입력 → 고점에 동액 반영·`capital_adjustments` 기록.
+- 직후 봇이 돌면 `_maybe_run_account_circuit` 이 보정된 고점과 갱신된 합산 스냅샷으로 MDD를 계산.
+
 ## 5) 수정 시 권장 원칙
 
 - 코어 종목 변경: `execution/guard.py`의 `CORE_ASSETS`만 수정.
 - 코인 최소수량 변경: `utils/helpers.py`의 `COIN_MIN_POSITION_QTY`만 수정.
 - TWAP 정책 변경: `config.json(twap_*)` 우선, 구조 변경 시 `execution/order_twap.py` 수정.
 - 장부 스키마 변경: `execution/guard.py` + `execution/sync_positions.py` + `run_bot.py` 함께 확인
-  (`last_kis_display_snapshot`, `positions` 하위 **`qty`** 등).
+  (`last_kis_display_snapshot`, `positions` 하위 **`qty`**, **`circuit_aux_*`** / **`capital_adjustments`** 등).
 
 ## 6) 빠른 시작 (Quick Start)
 
@@ -198,6 +217,12 @@ py -3.11 run_bot.py
 
 ```bash
 py -3.11 tests/test_lab.py
+```
+
+- **수동 입출금 → Phase 5 고점 보정** (브로커 스냅샷 갱신 포함):
+
+```bash
+py -3.11 adjust_capital.py
 ```
 
 ### 6-4. 설정 변경 반영
@@ -437,7 +462,7 @@ py -3.11 tests/test_lab.py
 
 - `bot_state.json`
   - 실시간 운용 상태(positions·**qty**, cooldown, ticker_cooldowns, 일부 누적 통계,
-    **last_kis_display_snapshot** — 직전 KIS 표시용 스냅샷).
+    **last_kis_display_snapshot**, Phase5용 **`peak_equity_total_krw`** / **`circuit_aux_last_*`** / **`capital_adjustments`** 등).
   - 깨지면 `execution/guard.py`에서 기본 구조로 복구 시도.
 
 - `trade_history.json`

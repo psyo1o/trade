@@ -1145,13 +1145,16 @@ def manual_sell(market, code, quantity):
             ok = isinstance(resp, dict) and resp.get("rt_cd") == "0"
             msg = resp.get("msg1", "국장 시장가 매도 요청") if isinstance(resp, dict) else "국장 매도 응답 없음"
             if ok:
+                st0 = load_state(STATE_PATH)
+                pos0 = (st0.get("positions") or {}).get(code, {})
+                hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
                 exec_price = curr_p
                 profit_rate = _apply_manual_sell_state_update(code, exec_price)
                 _record_trade_event("KR", code, "SELL", int(qty), price=exec_price if exec_price > 0 else None, profit_rate=profit_rate, reason="MANUAL")
                 kr_name = get_kr_company_name(code)
                 profit_str = f"{profit_rate:+.2f}%" if profit_rate is not None else "N/A"
                 print(f"  ✅ [국장 수동매도 체결] {kr_name}({code}) {int(qty)}주 | 수익률: {profit_str}")
-                send_telegram(f"✅ [KR] {code}({kr_name}) {int(qty)}주 수동 매도 완료")
+                send_telegram(f"✅ [KR] {code}({kr_name}) {int(qty)}주 수동 매도 완료{hold_note}")
                 return {"success": True, "message": msg}
             return {"success": False, "message": msg}
 
@@ -1179,12 +1182,15 @@ def manual_sell(market, code, quantity):
             ok = isinstance(resp, dict) and resp.get("rt_cd") == "0"
             msg = resp.get("msg1", "미장 시장가 매도 요청") if isinstance(resp, dict) else "미장 매도 응답 없음"
             if ok:
+                st0 = load_state(STATE_PATH)
+                pos0 = (st0.get("positions") or {}).get(code, {})
+                hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
                 profit_rate = _apply_manual_sell_state_update(code, current_price)
                 _record_trade_event("US", code, "SELL", int(qty), price=current_price, profit_rate=profit_rate, reason="MANUAL")
                 us_name = get_us_company_name(code)
                 profit_str = f"{profit_rate:+.2f}%" if profit_rate is not None else "N/A"
                 print(f"  ✅ [미장 수동매도 체결] {us_name}({code}) {int(qty)}주 | 수익률: {profit_str}")
-                send_telegram(f"✅ [US] {code}({us_name}) {int(qty)}주 수동 매도 완료")
+                send_telegram(f"✅ [US] {code}({us_name}) {int(qty)}주 수동 매도 완료{hold_note}")
                 return {"success": True, "message": msg}
             return {"success": False, "message": msg}
 
@@ -1192,11 +1198,14 @@ def manual_sell(market, code, quantity):
             current_p = _to_float(pyupbit.get_current_price(code), 0.0)
             resp = upbit_api.upbit.sell_market_order(code, qty)
             if resp:
+                st0 = load_state(STATE_PATH)
+                pos0 = (st0.get("positions") or {}).get(code, {})
+                hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
                 profit_rate = _apply_manual_sell_state_update(code, current_p)
                 _record_trade_event("COIN", code, "SELL", qty, price=current_p if current_p > 0 else None, profit_rate=profit_rate, reason="MANUAL")
                 profit_str = f"{profit_rate:+.2f}%" if profit_rate is not None else "N/A"
                 print(f"  ✅ [코인 수동매도 체결] {code} {qty} | 수익률: {profit_str}")
-                send_telegram(f"✅ [COIN] {code} {qty} 수동 매도 완료")
+                send_telegram(f"✅ [COIN] {code} {qty} 수동 매도 완료{hold_note}")
                 return {"success": True, "message": "코인 시장가 매도 요청 완료"}
             return {"success": False, "message": "코인 매도 응답 없음"}
 
@@ -1214,6 +1223,125 @@ def _portfolio_total_krw_from_aux(state: dict) -> float:
     coin = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
     usd = float(state.get("circuit_aux_last_usd_total", 0) or 0)
     return kr + coin + usd * rate
+
+
+def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
+    """
+    Phase5 보조키 ``circuit_aux_last_*`` 를 브로커·업비트 최신 값으로 갱신.
+
+    * 평일: KIS 국·미 잔고 + 업비트 코인.
+    * 주말 점검 창(KIS 미호출): 국·미는 ``last_kis_display_snapshot`` 직전 값,
+      코인만 실조회.
+
+    ``adjust_capital.py`` 등에서 입출금 직후 합산 총액을 맞추기 위해 호출한다.
+    """
+    result = {
+        "kr_ok": False,
+        "us_ok": False,
+        "coin_ok": False,
+        "weekend_kis_skip": False,
+        "totals": {},
+    }
+    try:
+        refresh_brokers_if_needed(force=False)
+    except Exception:
+        pass
+
+    path = Path(path)
+    total_kr_equity = float(state.get("circuit_aux_last_kr_krw", 0) or 0)
+    total_us_equity = float(state.get("circuit_aux_last_usd_total", 0) or 0)
+    total_coin_equity = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
+
+    suppress = kis_equities_weekend_suppress_window_kst()
+    if suppress:
+        result["weekend_kis_skip"] = True
+        snap = load_last_kis_display_snapshot()
+        kr_d = snap.get("kr") or {}
+        us_d = snap.get("us") or {}
+        if isinstance(kr_d, dict) and kr_d.get("total") is not None:
+            total_kr_equity = float(kr_d["total"])
+            result["kr_ok"] = True
+        if isinstance(us_d, dict) and us_d.get("total") is not None:
+            total_us_equity = float(us_d["total"])
+            result["us_ok"] = True
+    else:
+        try:
+            bal = ensure_dict(get_balance_with_retry())
+            kr_balance_data = bal.get("output2", [])
+            if isinstance(kr_balance_data, list) and kr_balance_data:
+                kr_cash = int(_to_float(kr_balance_data[0].get("prvs_rcdl_excc_amt", 0)))
+                total_kr_equity = int(_to_float(kr_balance_data[0].get("tot_evlu_amt", kr_cash)))
+            elif isinstance(kr_balance_data, dict):
+                kr_cash = int(_to_float(kr_balance_data.get("prvs_rcdl_excc_amt", 0)))
+                total_kr_equity = int(_to_float(kr_balance_data.get("tot_evlu_amt", kr_cash)))
+            else:
+                total_kr_equity = 0
+            result["kr_ok"] = True
+        except Exception as e:
+            print(f"  ⚠️ [circuit_aux 갱신] 국장 조회 실패: {e}")
+
+        try:
+            us_cash = float(get_us_cash_real(kis_api.broker_us) or 0.0)
+            us_bal = ensure_dict(get_us_positions_with_retry())
+            out2 = safe_get(us_bal, "output2", {})
+            if us_cash <= 0.0 and out2:
+                try:
+                    if isinstance(out2, list) and len(out2) > 0:
+                        fallback_cash = out2[0].get("frcr_dncl_amt_2", out2[0].get("frcr_buy_amt_smtl", 0.0))
+                        us_cash = float(fallback_cash)
+                    elif isinstance(out2, dict):
+                        fallback_cash = out2.get("frcr_dncl_amt_2", out2.get("frcr_buy_amt_smtl", 0.0))
+                        us_cash = float(fallback_cash)
+                except Exception:
+                    pass
+            us_output1 = ensure_list(us_bal.get("output1", []))
+            if isinstance(out2, list) and out2:
+                us_stock_value = _to_float(out2[0].get("ovrs_stck_evlu_amt", 0))
+            elif isinstance(out2, dict):
+                us_stock_value = _to_float(out2.get("ovrs_stck_evlu_amt", 0))
+            else:
+                us_stock_value = 0.0
+            if us_stock_value <= 0 and us_output1:
+                manual_stock_eval = 0.0
+                for s in us_output1:
+                    val = _to_float(s.get("frcr_evlu_amt2", 0))
+                    if val <= 0:
+                        price = _to_float(s.get("ovrs_now_prc2", 0))
+                        qty = _to_float(s.get("ovrs_cblc_qty", s.get("hldg_qty", 0)))
+                        val = price * qty
+                    manual_stock_eval += val
+                if manual_stock_eval > 0:
+                    us_stock_value = manual_stock_eval
+            total_us_equity = us_cash + us_stock_value
+            result["us_ok"] = True
+        except Exception as e:
+            print(f"  ⚠️ [circuit_aux 갱신] 미장 조회 실패: {e}")
+
+    try:
+        balances = upbit_api.upbit.get_balances() or []
+        krw_row = next((b for b in balances if str(b.get("currency", "")).upper() == "KRW"), None) or {}
+        krw_on_book = _to_float(krw_row.get("balance", 0), 0.0)
+        total_coin_equity = float(krw_on_book)
+        for b in balances:
+            if b.get("currency") in ("KRW", "VTHO"):
+                continue
+            curr_p = pyupbit.get_current_price(f"KRW-{b['currency']}")
+            if curr_p:
+                total_coin_equity += float(_to_float(b.get("balance", 0))) * float(curr_p)
+        result["coin_ok"] = True
+    except Exception as e:
+        print(f"  ⚠️ [circuit_aux 갱신] 코인 조회 실패: {e}")
+
+    state["circuit_aux_last_kr_krw"] = float(total_kr_equity)
+    state["circuit_aux_last_usd_total"] = float(total_us_equity)
+    state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
+    save_state(path, state)
+    result["totals"] = {
+        "kr_krw": float(total_kr_equity),
+        "usd_total": float(total_us_equity),
+        "coin_krw": float(total_coin_equity),
+    }
+    return result
 
 
 def _phase5_emergency_liquidate_all(state: dict) -> None:
@@ -1243,9 +1371,9 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
                 if b.get("currency") in ("KRW", "VTHO"):
                     continue
                 t = f"KRW-{b['currency']}"
-            qf = float(_to_float(b.get("balance", 0)))
-            if coin_qty_counts_for_position(qf) and t not in CORE_ASSETS:
-                lines.append(f"COIN {t} x{qf}")
+                qf = float(_to_float(b.get("balance", 0)))
+                if coin_qty_counts_for_position(qf) and t not in CORE_ASSETS:
+                    lines.append(f"COIN {t} x{qf}")
             send_telegram(f"{msg}\n대상:\n" + "\n".join(lines[:40]))
         except Exception as e:
             print(f"  ⚠️ [TEST_MODE] 청산 시뮬 요약 실패: {e}")
@@ -1751,6 +1879,48 @@ def _execute_coin_market_buy_twap(
     return True
 
 
+def _holding_duration_human(pos: dict) -> str:
+    """장부 매수 시각 기준 보유 기간 (텔레그램 등 표시용)."""
+    import time as _time
+
+    if not isinstance(pos, dict):
+        return ""
+    anchor = None
+    bt = pos.get("buy_time")
+    if bt not in (None, "", 0):
+        try:
+            anchor = float(bt)
+        except (TypeError, ValueError):
+            pass
+    if anchor is None and pos.get("buy_date"):
+        try:
+            bd = str(pos["buy_date"]).strip()
+            if bd.endswith("Z"):
+                bd = bd[:-1] + "+00:00"
+            anchor = datetime.fromisoformat(bd).timestamp()
+        except Exception:
+            pass
+    if anchor is None:
+        return ""
+    try:
+        delta_sec = max(0.0, float(_time.time()) - float(anchor))
+    except Exception:
+        return ""
+    days, rem = divmod(int(delta_sec), 86400)
+    hrs, rem2 = divmod(rem, 3600)
+    mins = rem2 // 60
+    if days >= 1:
+        return f"{days}일 {hrs}시간"
+    if hrs >= 1:
+        return f"{hrs}시간 {mins}분"
+    return f"{mins}분"
+
+
+def _holding_duration_suffix(pos: dict) -> str:
+    d = _holding_duration_human(pos)
+    return f" | 보유 {d}" if d else ""
+
+
 def get_kr_holdings_with_roi():
     """🇰🇷 국장 보유 종목 + 현재 수익률 (balance API 현재가 사용)"""
     try:
@@ -1772,7 +1942,10 @@ def get_kr_holdings_with_roi():
                     pass
                 roi = ((curr_p - buy_p) / buy_p) * 100
                 kr_name = get_kr_company_name(code)
-                holdings.append(f"  {code}({kr_name}): {int(curr_p):,}원 | {roi:+.2f}% (주말·yfinance)")
+                suf = _holding_duration_suffix(pos)
+                holdings.append(
+                    f"  {code}({kr_name}): {int(curr_p):,}원 | {roi:+.2f}% (주말·yfinance){suf}"
+                )
             return holdings
         bal = ensure_dict(get_balance_with_retry())
         kr_output1 = bal.get('output1', []) if isinstance(bal.get('output1'), list) else []
@@ -1796,7 +1969,8 @@ def get_kr_holdings_with_roi():
                 
             roi = ((curr_p - buy_p) / buy_p) * 100
             kr_name = get_kr_company_name(code)
-            holdings.append(f"  {code}({kr_name}): {int(curr_p):,}원 | {roi:+.2f}%")
+            suf = _holding_duration_suffix(pos)
+            holdings.append(f"  {code}({kr_name}): {int(curr_p):,}원 | {roi:+.2f}%{suf}")
         
         return holdings
     except:
@@ -1843,7 +2017,9 @@ def get_us_holdings_with_roi():
             
             roi = ((curr_p - buy_p) / buy_p) * 100
             us_name = get_us_company_name(ticker)
-            holdings.append(f"  {ticker}({us_name}): ${curr_p:.2f} | {roi:+.2f}%")
+            pos_u = state.get("positions", {}).get(ticker, {})
+            suf = _holding_duration_suffix(pos_u if isinstance(pos_u, dict) else {})
+            holdings.append(f"  {ticker}({us_name}): ${curr_p:.2f} | {roi:+.2f}%{suf}")
         
         return holdings
     except Exception as e:
@@ -1880,7 +2056,8 @@ def get_coin_holdings_with_roi():
 
             roi = ((curr_p - buy_p) / buy_p) * 100
             coin_name = get_coin_name(ticker)
-            holdings.append(f"  {ticker}({coin_name}): {curr_p:,.0f}원 | {roi:+.2f}%")
+            suf = _holding_duration_suffix(pos)
+            holdings.append(f"  {ticker}({coin_name}): {curr_p:,.0f}원 | {roi:+.2f}%{suf}")
 
         return holdings
     except Exception as e:
