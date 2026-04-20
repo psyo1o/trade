@@ -9,19 +9,12 @@
     * ``peak_equity_{KR|US|COIN}`` — 시장별 MDD 브레이크용 고점.
     * ``peak_equity_total_krw`` / ``account_circuit_cooldown_until`` — Phase5 합산 서킷.
 
-``CORE_ASSETS`` 는 **프로젝트 전역 단일 정의**이다. ``run_bot``·``strategy.rules`` 등은 여기서 import 한다.
-``can_open_new`` 에서 포지션 슬롯 카운트에서 제외되는 대장주·코어 코인 묶음이다.
+V7.1: 모든 보유 종목을 액티브 매매·샹들리에 동일 적용. 포지션별 ``scale_out_done`` 은
+``load_state`` 시 기본값 ``false`` 로 보강된다.
 """
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
-
-CORE_ASSETS = [
-    "005930", "000660", "QQQ", "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL",
-    "KRW-BTC", "KRW-ETH", "KRW-SOL",
-]
-# CORE_ASSETS 중 업비트 KRW 마켓 코어만 (스캔 폴백·룰 분기 등에서 재사용)
-CORE_COIN_ASSETS = tuple(t for t in CORE_ASSETS if str(t).startswith("KRW-"))
 
 def load_state(path: Path):
     """
@@ -67,6 +60,10 @@ def load_state(path: Path):
     data.setdefault("ticker_cooldowns", {})
     # KIS 최종 성공 조회 시점의 국·미 표시용 스냅샷(주말 점검 시 GUI/텔레 재사용)
     data.setdefault("last_kis_display_snapshot", {})
+    # V7.1: 분할 익절 1회 플래그(기존 장부 호환)
+    for _tk, _pos in list(data.get("positions", {}).items()):
+        if isinstance(_pos, dict) and "scale_out_done" not in _pos:
+            _pos["scale_out_done"] = False
     return data
 
 def save_state(path: Path, state):
@@ -90,27 +87,15 @@ def set_cooldown(state, code):
     state.setdefault("cooldown", {})[code] = datetime.now().isoformat(timespec="seconds")
 
 def can_open_new(ticker, state, max_positions=5): # 메인에서 안 던져주면 기본값 5
-    """[시장별 독립 슬롯] 메인에서 설정한 종목 수(max_positions)만큼 허락합니다!
-    단, CORE_ASSETS(대장주·코어 코인 BTC/ETH/SOL)는 시장별 포지션 카운트에서 제외합니다.
-    """
+    """[시장별 독립 슬롯] 메인에서 설정한 종목 수(max_positions)만큼 허락합니다."""
     positions = state.get("positions", {})
-    
-    # 1. 봇의 장부에서 시장별로 개수를 따로 셉니다. (코어 자산 제외)
-    kr_count = sum(1 for k in positions.keys() if k.isdigit() and k not in CORE_ASSETS)
-    coin_count = sum(1 for k in positions.keys() if k.startswith("KRW-") and k not in CORE_ASSETS)
+    kr_count = sum(1 for k in positions.keys() if str(k).isdigit())
+    coin_count = sum(1 for k in positions.keys() if str(k).startswith("KRW-"))
     us_count = len(positions) - kr_count - coin_count
-    # 미장 카운트 보정 (전체 - 국장 - 코인 - 미장코어)
-    us_core_count = sum(1 for k in positions.keys() if k in CORE_ASSETS and not k.isdigit())
-    us_count = us_count - us_core_count
-    
-    # 2. 들어온 티커(ticker)가 어느 시장인지 확인하고, 메인이 요청한 제한(max_positions)과 비교!
-    # (코어 자산인 경우 무조건 True 반환 → 제한 없이 추가 매수 가능)
-    if ticker in CORE_ASSETS:
-        return True
 
-    if ticker.startswith("KRW-"):
+    if str(ticker).startswith("KRW-"):
         return coin_count < max_positions
-    elif ticker.isdigit():
+    elif str(ticker).isdigit():
         return kr_count < max_positions
     else:
         return us_count < max_positions

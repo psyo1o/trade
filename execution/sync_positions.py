@@ -174,7 +174,8 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
                 "sl_p": float(sl_p),
                 "max_p": float(real_avg_p),
                 "tier": tier,
-                "buy_date": datetime.now().isoformat() # 자동복구 시 buy_date 기록
+                "buy_date": datetime.now().isoformat(),  # 자동복구 시 buy_date 기록
+                "scale_out_done": False,
             }
             if live_qty > 0:
                 row["qty"] = float(live_qty)

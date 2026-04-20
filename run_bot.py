@@ -42,8 +42,6 @@ import pandas as pd
 import pandas_market_calendars as mcal
 import concurrent.futures
 from execution.guard import (
-    CORE_ASSETS,
-    CORE_COIN_ASSETS,
     load_state,
     save_state,
     in_cooldown,
@@ -58,6 +56,21 @@ from execution.guard import (
     update_peak_equity_total_krw,
 )
 from execution.circuit_break import evaluate_total_account_circuit, estimate_usdkrw
+from execution.scale_out import (
+    SCALE_OUT_MIN_NOTIONAL_KRW,
+    SCALE_OUT_PROFIT_PCT,
+    compute_coin_scale_out_qty,
+    compute_stock_scale_out_qty,
+    coin_scale_out_min_notional_ok,
+    notional_krw_kr_us,
+    plan_coin_sell_chunks,
+    position_scale_out_done,
+    post_partial_ledger,
+    run_coin_scale_out_chunks,
+    run_stock_scale_out_slices,
+    scale_out_trigger_ok,
+    stock_scale_out_min_notional_ok,
+)
 from execution.sync_positions import sync_all_positions
 from strategy.ai_filter import (
     evaluate_false_breakout_filter,
@@ -1359,20 +1372,20 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
                 for stock in ensure_list(bal.get("output1")):
                     code = normalize_ticker(stock.get("pdno", ""))
                     qty = int(_to_float(stock.get("hldg_qty", 0)))
-                    if qty > 0 and code and code not in CORE_ASSETS:
+                    if qty > 0 and code:
                         lines.append(f"KR {code} x{qty}")
                 us_bal = ensure_dict(get_us_positions_with_retry())
                 for item in ensure_list(us_bal.get("output1")):
                     c = normalize_ticker(item.get("ovrs_pdno", item.get("pdno", "")))
                     q = int(_to_float(item.get("ovrs_cblc_qty", item.get("hldg_qty", 0))))
-                    if q > 0 and c and c not in CORE_ASSETS:
+                    if q > 0 and c:
                         lines.append(f"US {c} x{q}")
             for b in upbit_api.upbit.get_balances() or []:
                 if b.get("currency") in ("KRW", "VTHO"):
                     continue
                 t = f"KRW-{b['currency']}"
                 qf = float(_to_float(b.get("balance", 0)))
-                if coin_qty_counts_for_position(qf) and t not in CORE_ASSETS:
+                if coin_qty_counts_for_position(qf):
                     lines.append(f"COIN {t} x{qf}")
             send_telegram(f"{msg}\n대상:\n" + "\n".join(lines[:40]))
         except Exception as e:
@@ -1386,7 +1399,7 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
             for stock in ensure_list(bal.get("output1")):
                 code = normalize_ticker(stock.get("pdno", ""))
                 qty = int(_to_float(stock.get("hldg_qty", 0)))
-                if qty <= 0 or not code or code in CORE_ASSETS:
+                if qty <= 0 or not code:
                     continue
                 manual_sell("KR", code, qty)
         except Exception as e:
@@ -1399,7 +1412,7 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
             for item in ensure_list(us_bal.get("output1")):
                 c = normalize_ticker(item.get("ovrs_pdno", item.get("pdno", "")))
                 q = int(_to_float(item.get("ovrs_cblc_qty", item.get("hldg_qty", 0))))
-                if q <= 0 or not c or c in CORE_ASSETS:
+                if q <= 0 or not c:
                     continue
                 manual_sell("US", c, q)
         except Exception as e:
@@ -1411,8 +1424,6 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
             if b.get("currency") in ("KRW", "VTHO"):
                 continue
             t = f"KRW-{b['currency']}"
-            if t in CORE_ASSETS:
-                continue
             qf = float(_to_float(b.get("balance", 0)))
             if not coin_qty_counts_for_position(qf):
                 continue
@@ -1538,6 +1549,11 @@ def persist_position_registration(state, ticker, position_payload, context="", s
         print(f"  ❌ [{context}] 장부 등록 실패: 빈 티커")
         return False
 
+    if not isinstance(position_payload, dict):
+        print(f"  ❌ [{context}] 장부 등록 실패: payload 타입 오류")
+        return False
+    position_payload = dict(position_payload)
+    position_payload.setdefault("scale_out_done", False)
     state.setdefault("positions", {})[ticker] = position_payload
     set_cooldown(state, ticker)
 
@@ -2342,14 +2358,14 @@ def run_trading_bot():
         # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
         positions_count = len([
             code for code in held_kr
-            if code in state.get("positions", {}) and code not in CORE_ASSETS
+            if code in state.get("positions", {})
         ])
         print(f"  🔍 [국장 매도 루프] 보유 포지션 {positions_count}개 손익 체크 시작...")
         if positions_count == 0:
             print(f"  ✅ [국장 매도 루프] 매도할 종목 없음 (완료)")
         else:
             # 🗄️ OHLCV 일괄 캐싱 (yfinance 우선)
-            kr_sell_tickers = [normalize_ticker(s.get('pdno', '')) for s in kr_output1 if normalize_ticker(s.get('pdno', '')) in held_kr and normalize_ticker(s.get('pdno', '')) not in CORE_ASSETS]
+            kr_sell_tickers = [normalize_ticker(s.get('pdno', '')) for s in kr_output1 if normalize_ticker(s.get('pdno', '')) in held_kr]
             prefetch_ohlcv(kr_sell_tickers, market="KR", broker=kis_api.broker_kr)
         for stock in kr_output1:
             t = normalize_ticker(stock.get('pdno', ''))
@@ -2357,9 +2373,6 @@ def run_trading_bot():
                 continue
             qty = int(_to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
             if qty <= 0 or t not in held_kr:
-                continue
-            if t in CORE_ASSETS:
-                print(f"  ⏭️  [{t}] CORE_ASSETS(True) - 스킵")
                 continue
             if t not in state.get("positions", {}):
                 avg_p = _to_float(stock.get('pchs_avg_prc', stock.get('pchs_avg_pric', stock.get('prpr', 0))), 0.0)
@@ -2372,7 +2385,8 @@ def run_trading_bot():
                         'max_p': float(avg_p),
                         'tier': '자동등록(보유종목)',
                         'buy_time': time.time(),
-                        'buy_date': datetime.now().isoformat()
+                        'buy_date': datetime.now().isoformat(),
+                        'scale_out_done': False,
                     }
                     state.setdefault("positions", {})[t] = payload
                     save_state(STATE_PATH, state)
@@ -2423,6 +2437,61 @@ def run_trading_bot():
                 buy_time = pos_info.get('buy_time', time.time() - 900)
                 if 0 <= profit_rate_now < 1.0 and (time.time() - buy_time < 900):
                     continue
+
+                # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
+                usdk = float(estimate_usdkrw())
+                q_led = int(round(_to_float(pos_info.get("qty"), qty)))
+                if q_led <= 0:
+                    q_led = int(qty)
+                notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), False, usdk)
+                if not position_scale_out_done(pos_info) and float(profit_rate_now) >= SCALE_OUT_PROFIT_PCT:
+                    if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
+                        print(
+                            f"  ℹ️ [KR Scale-Out 스킵] {t}: 수익 {profit_rate_now:+.2f}% ≥ {SCALE_OUT_PROFIT_PCT:.0f}% 이지만 "
+                            f"명목 max(매수가×수량, 현재가×수량)={notion_krw_so:,.0f}원 < "
+                            f"{SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원 (수량 {q_led}주)"
+                        )
+                    elif scale_out_trigger_ok(pos_info, profit_rate_now, notion_krw_so):
+                        sq = compute_stock_scale_out_qty(int(qty))
+                        if not sq:
+                            print(
+                                f"  ℹ️ [KR Scale-Out 스킵] {t}: 보유 {int(qty)}주 → 50% 몫 0주(1주만 있을 때 규칙상 생략)"
+                            )
+                        elif not stock_scale_out_min_notional_ok(int(sq), float(curr_p)):
+                            print(f"  ℹ️ [KR Scale-Out 스킵] {t}: 최소 매도 명목(1주 가치) 미만")
+                        else:
+                            sell_notion_krw = float(sq) * float(curr_p)
+                            tw_krw = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
+
+                            def _kr_so_slice(qq: int) -> bool:
+                                r = create_market_sell_order_kis(t, int(qq), is_us=False, curr_price=float(curr_p))
+                                return bool(isinstance(r, dict) and r.get("rt_cd") == "0")
+
+                            ok_so = run_stock_scale_out_slices(
+                                int(sq), sell_notion_krw, tw_krw, _kr_so_slice, TWAP_SLICE_DELAY_SEC
+                            )
+                            if ok_so:
+                                state.setdefault("positions", {})[t] = post_partial_ledger(
+                                    pos_info, float(sq), float(curr_p), float(qty)
+                                )
+                                save_state(STATE_PATH, state)
+                                try:
+                                    _record_trade_event(
+                                        "KR",
+                                        t,
+                                        "SELL",
+                                        int(sq),
+                                        price=float(curr_p),
+                                        profit_rate=float(profit_rate_now),
+                                        reason="V7.1 조건부 50% 분할 익절(Scale-Out)",
+                                    )
+                                except Exception as _e_so:
+                                    print(f"  ⚠️ [KR Scale-Out] 매매내역 기록 실패: {_e_so}")
+                                kr_nm = get_kr_company_name(t)
+                                print(f"  ✅ [KR Scale-Out] {kr_nm}({t}) {sq}주 분할 익절 · 장부 보정 완료")
+                                send_telegram(f"💎 [KR Scale-Out] {t}({kr_nm})\n{sq}주 분할 익절 체결, 남은 물량은 샹들리에 추적 유지")
+                                continue
+                            print(f"  ⚠️ [KR Scale-Out] {t} 주문 실패 — 다음 사이클에 재시도")
 
                 # 매도 결정 로직 (우선순위: 타임스탑 > 하드스탑 > 샹들리에)
                 reason = ""
@@ -2561,33 +2630,28 @@ def run_trading_bot():
                                 f"{ticker_cooldown_human(state, t)} 이전 (패스)"
                             )
                             continue
-                        # 핵심자산: cooldown 무시, 중복 매수 가능
-                        if t in CORE_ASSETS:
-                            pass  # 핵심자산은 모든 제약 무시
-                        else:
-                            # 일반 종목: cooldown 및 보유 여부 체크
-                            if in_cooldown(state, t):
-                                print(f"  ⏭️ {kr_name}({t}): 쿨다운 중 (패스)")
-                                continue
-                            if t in held_kr:
-                                print(f"  ⏭️ {kr_name}({t}): 이미 보유중 (패스)")
-                                continue
-                            if not can_open_new(t, state, max_positions=MAX_POSITIONS_KR):
-                                print(
-                                    f"  ⏭️ {kr_name}({t}): [MAX_POSITIONS:KR] "
-                                    f"국장 한도 {MAX_POSITIONS_KR}개 도달 (패스)"
-                                )
-                                continue
-                            sector_ok_kr, sector_msg_kr = allow_kr_sector_entry(
-                                t,
-                                state.get("positions", {}),
-                                MAX_POSITIONS_KR,
-                                normalize_ticker,
+                        if in_cooldown(state, t):
+                            print(f"  ⏭️ {kr_name}({t}): 쿨다운 중 (패스)")
+                            continue
+                        if t in held_kr:
+                            print(f"  ⏭️ {kr_name}({t}): 이미 보유중 (패스)")
+                            continue
+                        if not can_open_new(t, state, max_positions=MAX_POSITIONS_KR):
+                            print(
+                                f"  ⏭️ {kr_name}({t}): [MAX_POSITIONS:KR] "
+                                f"국장 한도 {MAX_POSITIONS_KR}개 도달 (패스)"
                             )
-                            if not sector_ok_kr:
-                                print(f"  ⏭️ {kr_name}({t}): {sector_msg_kr} (패스)")
-                                continue
-                        
+                            continue
+                        sector_ok_kr, sector_msg_kr = allow_kr_sector_entry(
+                            t,
+                            state.get("positions", {}),
+                            MAX_POSITIONS_KR,
+                            normalize_ticker,
+                        )
+                        if not sector_ok_kr:
+                            print(f"  ⏭️ {kr_name}({t}): {sector_msg_kr} (패스)")
+                            continue
+
                         try:
                             ohlcv_200 = get_ohlcv_yfinance(t)
                             
@@ -2777,11 +2841,11 @@ def run_trading_bot():
         # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
         sell_candidates = [
             code for code in held_us
-            if code in state.get("positions", {}) and code not in CORE_ASSETS
+            if code in state.get("positions", {})
         ]
         positions_count = len(sell_candidates)
         
-        print(f"  🔍 [미장 매도 루프] 매도 대상 포지션 {positions_count}개 손익 체크 시작... (CORE_ASSETS 제외됨)")
+        print(f"  🔍 [미장 매도 루프] 매도 대상 포지션 {positions_count}개 손익 체크 시작...")
         if positions_count == 0:
             print(f"  ✅ [미장 매도 루프] 매도할 종목 없음 (완료)")
         else:
@@ -2798,9 +2862,6 @@ def run_trading_bot():
             if qty_holding <= 0:
                  continue
 
-            if t in CORE_ASSETS:
-                print(f"  ⏭️  [{t}] CORE_ASSETS(True) - 스킵")
-                continue
             if t not in state.get("positions", {}):
                 avg_p = _to_float(stock.get('ovrs_avg_unpr', stock.get('ovrs_avg_pric', stock.get('ovrs_now_prc2', 0))), 0.0)
                 if avg_p <= 0:
@@ -2812,7 +2873,8 @@ def run_trading_bot():
                         'max_p': float(avg_p),
                         'tier': '자동등록(보유종목)',
                         'buy_time': time.time(),
-                        'buy_date': datetime.now().isoformat()
+                        'buy_date': datetime.now().isoformat(),
+                        'scale_out_done': False,
                     }
                     state.setdefault("positions", {})[t] = payload
                     save_state(STATE_PATH, state)
@@ -2859,6 +2921,61 @@ def run_trading_bot():
                 if 0 <= profit_rate_now < 1.0 and time_elapsed < 900:
                     print(f"  ⏭️ {t}: 신규 매수 보호 구간 ({int(900-time_elapsed)}초 남음)")
                     continue
+
+                # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
+                usdk = float(estimate_usdkrw())
+                qty_int = int(float(qty_holding))
+                q_led = int(round(_to_float(pos_info.get("qty"), qty_int)))
+                if q_led <= 0:
+                    q_led = qty_int
+                notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), True, usdk)
+                if not position_scale_out_done(pos_info) and float(profit_rate_now) >= SCALE_OUT_PROFIT_PCT:
+                    if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
+                        print(
+                            f"  ℹ️ [US Scale-Out 스킵] {t}: 수익 {profit_rate_now:+.2f}% ≥ {SCALE_OUT_PROFIT_PCT:.0f}% 이지만 "
+                            f"명목(원화 환산)={notion_krw_so:,.0f}원 < {SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원 (수량 {qty_int}주)"
+                        )
+                    elif scale_out_trigger_ok(pos_info, profit_rate_now, notion_krw_so):
+                        sq = compute_stock_scale_out_qty(qty_int)
+                        if not sq:
+                            print(
+                                f"  ℹ️ [US Scale-Out 스킵] {t}: 보유 {qty_int}주 → 50% 몫 0주(1주만 있을 때 규칙상 생략)"
+                            )
+                        elif not stock_scale_out_min_notional_ok(int(sq), float(curr_p)):
+                            print(f"  ℹ️ [US Scale-Out 스킵] {t}: 최소 매도 명목(1주 가치) 미만")
+                        else:
+                            sell_notion_krw = float(sq) * float(curr_p) * usdk
+                            tw_krw_eff = (float(TWAP_USD_THRESHOLD) * usdk) if TWAP_ENABLED else float("inf")
+
+                            def _us_so_slice(qq: int) -> bool:
+                                sp = round(float(curr_p) * 0.98, 2)
+                                r = execute_us_order_direct(kis_api.broker_us, "sell", t, int(qq), sp)
+                                return bool(isinstance(r, dict) and r.get("rt_cd") == "0")
+
+                            ok_so = run_stock_scale_out_slices(
+                                int(sq), sell_notion_krw, tw_krw_eff, _us_so_slice, TWAP_SLICE_DELAY_SEC
+                            )
+                            if ok_so:
+                                state.setdefault("positions", {})[t] = post_partial_ledger(
+                                    pos_info, float(sq), float(curr_p), float(qty_int)
+                                )
+                                save_state(STATE_PATH, state)
+                                try:
+                                    _record_trade_event(
+                                        "US",
+                                        t,
+                                        "SELL",
+                                        int(sq),
+                                        price=float(curr_p),
+                                        profit_rate=float(profit_rate_now),
+                                        reason="V7.1 조건부 50% 분할 익절(Scale-Out)",
+                                    )
+                                except Exception as _e_so:
+                                    print(f"  ⚠️ [US Scale-Out] 매매내역 기록 실패: {_e_so}")
+                                print(f"  ✅ [US Scale-Out] {us_name}({t}) {sq}주 분할 익절 · 장부 보정 완료")
+                                send_telegram(f"💎 [US Scale-Out] {t}({us_name})\n{sq}주 분할 익절 체결, 남은 물량은 샹들리에 추적 유지")
+                                continue
+                            print(f"  ⚠️ [US Scale-Out] {t} 주문 실패 — 다음 사이클에 재시도")
 
                 reason = ""
                 is_exit = False
@@ -2999,25 +3116,21 @@ def run_trading_bot():
                                         f"{ticker_cooldown_human(state, t)} 이전 (패스)"
                                     )
                                     continue
-                                # 핵심자산: cooldown 및 보유 여부 무시
-                                if t in CORE_ASSETS:
-                                    pass
-                                else:
-                                    if in_cooldown(state, t):
-                                        print(f"  ⏭️ {us_name}({t}): 쿨다운 중 (패스)")
-                                        continue
-                                    if t in held_us:
-                                        print(f"  ⏭️ {us_name}({t}): 이미 보유중 (패스)")
-                                        continue
-                                    sector_ok_us, sector_msg_us = allow_us_sector_entry(
-                                        t,
-                                        state.get("positions", {}),
-                                        MAX_POSITIONS_US,
-                                        normalize_ticker,
-                                    )
-                                    if not sector_ok_us:
-                                        print(f"  ⏭️ {us_name}({t}): {sector_msg_us} (패스)")
-                                        continue
+                                if in_cooldown(state, t):
+                                    print(f"  ⏭️ {us_name}({t}): 쿨다운 중 (패스)")
+                                    continue
+                                if t in held_us:
+                                    print(f"  ⏭️ {us_name}({t}): 이미 보유중 (패스)")
+                                    continue
+                                sector_ok_us, sector_msg_us = allow_us_sector_entry(
+                                    t,
+                                    state.get("positions", {}),
+                                    MAX_POSITIONS_US,
+                                    normalize_ticker,
+                                )
+                                if not sector_ok_us:
+                                    print(f"  ⏭️ {us_name}({t}): {sector_msg_us} (패스)")
+                                    continue
 
                                 # 🛡️ [수술 1] 개별 종목 ADX 폭발 시 하락장 무시 및 비중 상향 로직
                                 ohlcv = get_ohlcv_yfinance(t)
@@ -3177,11 +3290,7 @@ def run_trading_bot():
             if b.get('currency') in ['KRW', 'VTHO']:
                 continue
             t = f"KRW-{b['currency']}"
-            
-            # 🔥 [추가] 코어 자산은 매도 체크 자체를 패스
-            if t in CORE_ASSETS:
-                print(f"  💎 {t}: 코어 자산입니다. 매도 루프를 건너뜁니다.")
-                continue
+
             is_exit = False
 
             if t not in state.get("positions", {}):
@@ -3260,6 +3369,59 @@ def run_trading_bot():
             if 0 <= profit_rate_now < 1.0 and time_elapsed < 900:
                 print(f"  ⏭️ {t}: 신규 매수 보호 구간 ({int(900-time_elapsed)}초 남음)")
                 continue
+
+            # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
+            usdk = float(estimate_usdkrw())
+            q_led = float(_to_float(pos_info.get("qty"), qty))
+            if q_led <= 0:
+                q_led = float(qty)
+            notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), False, usdk)
+            if not position_scale_out_done(pos_info) and float(profit_rate_now) >= SCALE_OUT_PROFIT_PCT:
+                if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
+                    print(
+                        f"  ℹ️ [COIN Scale-Out 스킵] {t}: 수익 {profit_rate_now:+.2f}% ≥ {SCALE_OUT_PROFIT_PCT:.0f}% 이지만 "
+                        f"명목 max(매수가×수량, 현재가×수량)={notion_krw_so:,.0f}원 < "
+                        f"{SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원"
+                    )
+                elif scale_out_trigger_ok(pos_info, profit_rate_now, notion_krw_so):
+                    sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
+                    if not sell_q:
+                        print(f"  ℹ️ [COIN Scale-Out 스킵] {t}: 50% 절삼 후 수량 0")
+                    elif not coin_scale_out_min_notional_ok(float(sell_q), float(curr_p), UPBIT_COIN_MIN_ORDER_KRW):
+                        print(
+                            f"  ℹ️ [COIN Scale-Out 스킵] {t}: 매도분 명목 "
+                            f"{float(sell_q) * float(curr_p):,.0f}원 < 업비트 최소 {UPBIT_COIN_MIN_ORDER_KRW:,.0f}원"
+                        )
+                    else:
+                        tw_th = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
+                        chunks = plan_coin_sell_chunks(float(sell_q), float(curr_p), threshold_krw=float(tw_th))
+
+                        def _coin_so_vol(vv: float) -> bool:
+                            return bool(upbit_api.upbit.sell_market_order(t, float(vv)))
+
+                        ok_so = run_coin_scale_out_chunks(chunks, _coin_so_vol, TWAP_SLICE_DELAY_SEC)
+                        if ok_so:
+                            state.setdefault("positions", {})[t] = post_partial_ledger(
+                                pos_info, float(sell_q), float(curr_p), float(qty)
+                            )
+                            save_state(STATE_PATH, state)
+                            try:
+                                _record_trade_event(
+                                    "COIN",
+                                    t,
+                                    "SELL",
+                                    float(sell_q),
+                                    price=float(curr_p),
+                                    profit_rate=float(profit_rate_now),
+                                    reason="V7.1 조건부 50% 분할 익절(Scale-Out)",
+                                )
+                            except Exception as _e_so:
+                                print(f"  ⚠️ [COIN Scale-Out] 매매내역 기록 실패: {_e_so}")
+                            cn = get_coin_name(t)
+                            print(f"  ✅ [COIN Scale-Out] {t}({cn}) 분할 익절 {sell_q} · 장부 보정 완료")
+                            send_telegram(f"💎 [COIN Scale-Out] {t}({cn})\n분할 익절 체결, 남은 물량은 샹들리에 추적 유지")
+                            continue
+                        print(f"  ⚠️ [COIN Scale-Out] {t} 주문 실패 — 다음 사이클에 재시도")
 
             # 매도 결정 로직 (우선순위: 타임스탑 > 하드스탑 > 샹들리에)
             reason = ""
@@ -3395,7 +3557,7 @@ def run_trading_bot():
                                 tickers_data = requests.get("https://api.upbit.com/v1/ticker?markets=" + ",".join(markets), timeout=10).json()
                                 scan_targets = [x['market'] for x in sorted(tickers_data, key=lambda x: x.get('acc_trade_price_24h', 0), reverse=True)[:20]]
                             except Exception:
-                                scan_targets = list(CORE_COIN_ASSETS)
+                                scan_targets = []
 
                             print(f"  -> 🪙 코인 실시간 수급 상위 {len(scan_targets)}개 정밀 분석 시작!")
                             for idx, t in enumerate(scan_targets, 1):
@@ -3405,15 +3567,12 @@ def run_trading_bot():
                                         f"{ticker_cooldown_human(state, t)} 이전 (패스)"
                                     )
                                     continue
-                                if t not in CORE_ASSETS:
-                                    if in_cooldown(state, t):
-                                        print(f"  ⏭️ {t}: 쿨다운 중 (패스)")
-                                        continue
-                                    if not can_open_new(t, state, max_positions=MAX_POSITIONS_COIN):
-                                        print(f"  ⏭️ {t}: 포지션 개수 초과 ({MAX_POSITIONS_COIN}개) (패스)")
-                                        continue
-                                else:
-                                    print(f"  🔥 {t}: 코어 자산 분석 중... (제약 조건 무시)")        
+                                if in_cooldown(state, t):
+                                    print(f"  ⏭️ {t}: 쿨다운 중 (패스)")
+                                    continue
+                                if not can_open_new(t, state, max_positions=MAX_POSITIONS_COIN):
+                                    print(f"  ⏭️ {t}: 포지션 개수 초과 ({MAX_POSITIONS_COIN}개) (패스)")
+                                    continue
                                 df_upbit = pyupbit.get_ohlcv(t, interval="day", count=250)
                                 if df_upbit is None or len(df_upbit) < 20:
                                     print(f"  ⏭️ {t}: OHLCV 데이터 부족 (패스)")

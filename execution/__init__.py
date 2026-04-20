@@ -11,8 +11,6 @@
 - ``execution.circuit_break`` : 합산 자산 고점 대비 드로다운 판정(킬스위치 보조).
 """
 from execution.guard import (
-    CORE_ASSETS,
-    CORE_COIN_ASSETS,
     load_state,
     save_state,
     in_cooldown,
@@ -35,8 +33,6 @@ from execution.order_twap import (
 )
 
 __all__ = [
-    "CORE_ASSETS",
-    "CORE_COIN_ASSETS",
     "load_state",
     "save_state",
     "in_cooldown",

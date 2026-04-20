@@ -6,8 +6,6 @@ V5 전략 코어 — OHLCV 수집, 프로 시그널, 청산 가격.
     * **데이터** — ``get_ohlcv_yfinance`` / ``get_ohlcv_kis_domestic_daily`` / ``get_ohlcv_upbit`` / ``get_ohlcv_realtime`` 등.
     * **시그널** — ``calculate_pro_signals`` (진입 조건 요약).
     * **청산** — ``check_pro_exit``, ``get_final_exit_price`` (손절·트레일링 등).
-
-``CORE_ASSETS`` 는 ``execution.guard`` 에서만 정의하고 여기서 import 한다.
 """
 import pandas as pd
 import numpy as np
@@ -15,8 +13,6 @@ import time
 import yfinance as yf
 import requests
 import pyupbit
-
-from execution.guard import CORE_ASSETS
 
 _NAME_CACHE = {}
 
@@ -319,21 +315,16 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
         print(f"   🔍 {progress} {display_name} ❌ 패스: 20일선 하락 또는 이탈")
         return False, 0.0, "20일선 하락/이탈"
 
-    # 체크 2: 자산군별 맞춤형 장기 추세 필터 (스마트 분기)
+    # 체크 2: 장기 추세 필터 (국·미·코인 동일 적용)
     is_golden_trend = True
-    
-    # 🇺🇸🇰🇷 주식(국장/미장) 이거나 🪙 코어 코인(BTC/ETH/SOL)일 경우: 묵직한 장기 추세 방어막 작동
-    if not ticker.startswith("KRW-") or ticker in CORE_ASSETS:
-        if pd.notna(today['ma200']) and pd.notna(today['ma50']):
-            is_golden_trend = today['ma50'] > today['ma200']
-        elif pd.notna(today['ma50']):
-            is_golden_trend = curr_p > today['ma50']
-            
-        if not is_golden_trend:
-            # 주식·코어 코인이 역배열이면 칼같이 컷
-            if ticker in CORE_ASSETS:
-                print(f"   🔍 {progress} {display_name} ❌ 패스: 장기 상승 추세 아님 (역배열 방어막 작동)")
-            return False, 0.0, "장기추세 미달"
+    if pd.notna(today["ma200"]) and pd.notna(today["ma50"]):
+        is_golden_trend = bool(today["ma50"] > today["ma200"])
+    elif pd.notna(today["ma50"]):
+        is_golden_trend = bool(curr_p > today["ma50"])
+
+    if not is_golden_trend:
+        print(f"   🔍 {progress} {display_name} ❌ 패스: 장기 상승 추세 아님 (역배열 방어막 작동)")
+        return False, 0.0, "장기추세 미달"
 
     # 체크 3: 3중 스나이퍼 교차 검증 (수급 + MACD + RSI)
     is_volume_surged = pd.notna(today['v_ma20']) and today['v'] > today['v_ma20']
@@ -438,19 +429,16 @@ def get_final_exit_price(ticker, curr_p, pos_info, ohlcv):
     max_profit_rate = ((max_price - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
 
     # 3. 콘크리트 바닥 (이익 보존 락)
-    if ticker not in CORE_ASSETS:
-        if max_profit_rate >= 30.0:
-            profit_floor = buy_price * 1.15
-        elif max_profit_rate >= 20.0:
-            profit_floor = buy_price * 1.05
-        elif max_profit_rate >= 10.0:
-            profit_floor = buy_price * 1.005
-        else:
-            profit_floor = 0
-            
-        final_exit_line = max(locked_chandelier, profit_floor)
+    if max_profit_rate >= 30.0:
+        profit_floor = buy_price * 1.15
+    elif max_profit_rate >= 20.0:
+        profit_floor = buy_price * 1.05
+    elif max_profit_rate >= 10.0:
+        profit_floor = buy_price * 1.005
     else:
-        final_exit_line = locked_chandelier
+        profit_floor = 0
+
+    final_exit_line = max(locked_chandelier, profit_floor)
 
     return _finite_price(final_exit_line, sl_fb)
 
@@ -473,7 +461,7 @@ def check_pro_exit(ticker, curr_p, pos_info, ohlcv):
         print(f"🚨 [익절/손절 트리거 발동] {ticker} 매도 실행! (수익 방어 성공)")
         # 사유 텍스트 다변화
 
-        if ticker not in CORE_ASSETS and profit_rate >= 10.0 and final_stop_loss > get_chandelier_exit(current_price, pos_info, ohlcv):
+        if profit_rate >= 10.0 and final_stop_loss > get_chandelier_exit(current_price, pos_info, ohlcv):
             reason = f"이익 보존 락(Lock) 발동 (+{profit_rate:.1f}% 구간)"
         else:
             reason = "V5.0 샹들리에 라인 붕괴 (추세 종료)"

@@ -52,6 +52,10 @@ def _parse_amount_krw(raw: str) -> float:
     return v
 
 
+# GUI 등에서 재사용
+parse_capital_amount_krw = _parse_amount_krw
+
+
 def _refresh_aux_snapshot() -> None:
     """브로커·업비트 기준으로 circuit_aux_* 갱신 (실패 시 경고만)."""
     print("📡 실계좌 기준으로 합산 스냅샷(`circuit_aux_*`) 갱신 중…")
@@ -86,10 +90,92 @@ def _refresh_aux_snapshot() -> None:
         print("   (프로젝트 루트에 config.json 이 있고 네트워크·API가 정상인지 확인하세요.)")
 
 
-def main() -> int:
-    print("=== 합산 자산 고점(Phase 5 MDD) 수동 보정 ===\n")
+def apply_capital_peak_adjustment(
+    *,
+    withdraw: bool,
+    amount_krw: float,
+    state_path: Path | None = None,
+    source_label: str = "adjust_capital.py",
+) -> tuple[bool, str]:
+    """
+    ``circuit_aux_*`` 갱신 후 ``peak_equity_total_krw`` 입·출금 보정 및 ``capital_adjustments`` 기록.
+
+    Returns
+        ``(True, 요약 메시지)`` 또는 ``(False, 오류 메시지)``.
+    """
+    path = state_path or STATE_PATH
+    if amount_krw <= 0:
+        return False, "금액은 0보다 커야 합니다."
 
     _refresh_aux_snapshot()
+
+    state = load_state(path)
+    current_total = portfolio_total_krw_estimated(state)
+    old_peak = float(state.get(PEAK_EQUITY_TOTAL_KRW_KEY, 0.0) or 0.0)
+    peak_was_missing = old_peak <= 0.0
+
+    if old_peak <= 0.0:
+        old_peak = current_total
+
+    if withdraw:
+        if amount_krw > current_total:
+            return (
+                False,
+                f"출금액 {amount_krw:,.0f}원이 현재 추정 총자산 {current_total:,.0f}원보다 큽니다.",
+            )
+        new_peak = old_peak - amount_krw
+        kind = "withdraw"
+    else:
+        new_peak = old_peak + amount_krw
+        kind = "deposit"
+
+    if new_peak < 0.0:
+        return (
+            False,
+            f"보정 후 고점이 음수가 됩니다 ({new_peak:,.0f}). 출금액 또는 장부를 확인하세요.",
+        )
+
+    state[PEAK_EQUITY_TOTAL_KRW_KEY] = float(new_peak)
+
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "kind": kind,
+        "amount_krw": float(amount_krw),
+        "peak_before_krw": float(old_peak),
+        "peak_after_krw": float(new_peak),
+        "estimated_total_krw_at_adjust": float(current_total),
+        "circuit_aux_after_refresh": {
+            "kr_krw": float(state.get("circuit_aux_last_kr_krw", 0) or 0),
+            "usd_total": float(state.get("circuit_aux_last_usd_total", 0) or 0),
+            "coin_krw": float(state.get("circuit_aux_last_coin_krw", 0) or 0),
+        },
+        "source": str(source_label),
+    }
+    log = state.setdefault(CAPITAL_ADJUSTMENTS_KEY, [])
+    if isinstance(log, list):
+        log.append(entry)
+    else:
+        state[CAPITAL_ADJUSTMENTS_KEY] = [entry]
+
+    save_state(path, state)
+
+    lines = []
+    if peak_was_missing:
+        lines.append(
+            f"ℹ️ 장부에 합산 고점이 없거나 0이라, 추정 총자산 {current_total:,.0f}원을 고점으로 간주했습니다."
+        )
+    lines.extend(
+        [
+            f"이전 합산 고점: {old_peak:,.0f} 원 → 보정 후: {new_peak:,.0f} 원",
+            f"(참고) 추정 현재 총자산: {current_total:,.0f} 원",
+            f"저장: {path}",
+        ]
+    )
+    return True, "\n".join(lines)
+
+
+def main() -> int:
+    print("=== 합산 자산 고점(Phase 5 MDD) 수동 보정 ===\n")
 
     print("\n조작 종류를 선택하세요.")
     print("  1 — 입금 (고점에 금액만큼 가산)")
@@ -102,71 +188,19 @@ def main() -> int:
 
     try:
         amount_raw = input("금액 (원, 콤마 가능): ").strip()
-        amount = _parse_amount_krw(amount_raw)
+        amount = parse_capital_amount_krw(amount_raw)
     except ValueError as e:
         print(f"오류: {e}", file=sys.stderr)
         return 1
 
-    state = load_state(STATE_PATH)
-    current_total = portfolio_total_krw_estimated(state)
-    old_peak = float(state.get(PEAK_EQUITY_TOTAL_KRW_KEY, 0.0) or 0.0)
-
-    if old_peak <= 0.0:
-        print(
-            f"ℹ️  장부에 합산 고점({PEAK_EQUITY_TOTAL_KRW_KEY})이 없거나 0입니다.\n"
-            f"   직전 루프 기준 추정 총자산 {current_total:,.0f}원으로 고점을 간주하고 보정합니다.\n"
-        )
-        old_peak = current_total
-
-    if choice == "2":
-        if amount > current_total:
-            print(
-                f"오류: 출금액 {amount:,.0f}원이 현재 추정 총자산 {current_total:,.0f}원보다 큽니다.",
-                file=sys.stderr,
-            )
-            return 1
-        new_peak = old_peak - amount
-        kind = "withdraw"
-    else:
-        new_peak = old_peak + amount
-        kind = "deposit"
-
-    if new_peak < 0.0:
-        print(
-            f"오류: 보정 후 고점이 음수가 됩니다 ({new_peak:,.0f}). 출금액 또는 장부 상태를 확인하세요.",
-            file=sys.stderr,
-        )
+    withdraw = choice == "2"
+    ok, msg = apply_capital_peak_adjustment(withdraw=withdraw, amount_krw=amount, state_path=STATE_PATH)
+    if not ok:
+        print(msg, file=sys.stderr)
         return 1
 
-    state[PEAK_EQUITY_TOTAL_KRW_KEY] = float(new_peak)
-
-    entry = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "kind": kind,
-        "amount_krw": float(amount),
-        "peak_before_krw": float(old_peak),
-        "peak_after_krw": float(new_peak),
-        "estimated_total_krw_at_adjust": float(current_total),
-        "circuit_aux_after_refresh": {
-            "kr_krw": float(state.get("circuit_aux_last_kr_krw", 0) or 0),
-            "usd_total": float(state.get("circuit_aux_last_usd_total", 0) or 0),
-            "coin_krw": float(state.get("circuit_aux_last_coin_krw", 0) or 0),
-        },
-        "source": "adjust_capital.py",
-    }
-    log = state.setdefault(CAPITAL_ADJUSTMENTS_KEY, [])
-    if isinstance(log, list):
-        log.append(entry)
-    else:
-        state[CAPITAL_ADJUSTMENTS_KEY] = [entry]
-
-    save_state(STATE_PATH, state)
-
     print("\n--- 결과 ---")
-    print(f"이전 합산 고점(보정 전): {old_peak:,.0f} 원")
-    print(f"보정 후 합산 고점:     {new_peak:,.0f} 원")
-    print(f"(참고) 추정 현재 총자산: {current_total:,.0f} 원")
-    print(f"\n저장: {STATE_PATH}")
+    print(msg)
     print("메인 봇 다음 루프부터 위 고점 기준으로 Phase 5 MDD가 계산됩니다.")
     return 0
 

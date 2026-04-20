@@ -5,6 +5,7 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
 특징
     * 잔고·성적표·수동 매도·로그 뷰 등은 ``run_bot`` / ``execution`` / ``utils`` API를 그대로 호출.
     * ``import run_bot`` 시점에 ``config.json`` 이 로드되므로 **설정 변경 후 GUI 재시작** 필요.
+    * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_equity_total_krw``·``capital_adjustments`` 반영 (백그라운드 스레드).
     * 매매는 기동 1초 후 1회 실행한 뒤, **KST :00 / :15 / :30 / :45**에 `run_trading_bot`을 맞춘다.
     * ``QTimer.singleShot`` 겹침으로 로그가 두 줄씩 나오는 것을 막기 위해 **단일 ``QTimer`` + 실행 중 가드**를 쓴다.
     * 네트워크 감시·생존신고(heartbeat)는 **백그라운드 스레드**에서 돌리고, 텔레는 **기동 직후 1회** 보낸 뒤 **KST :00 / :30** 벽시계에 맞춘다.
@@ -21,9 +22,10 @@ import sys, json
 import socket
 import threading
 from datetime import datetime
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QLabel, QTextEdit, QTableWidget, QTableWidgetItem, 
-                             QHeaderView, QTabWidget, QMessageBox, QSpinBox)
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QLabel, QTextEdit, QTableWidget, QTableWidgetItem,
+                             QHeaderView, QTabWidget, QMessageBox, QSpinBox, QLineEdit, QRadioButton,
+                             QButtonGroup)
 from PyQt5.QtCore import QTimer, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont
 from pathlib import Path
@@ -152,6 +154,33 @@ class WorkerThread(QThread):
         except Exception as e:
             print(f"⚠️ 백그라운드 에러 발생: {e}")
             traceback.print_exc()
+
+
+class CapitalAdjustThread(QThread):
+    """``adjust_capital.apply_capital_peak_adjustment`` — 네트워크·API로 UI가 멈추지 않게 백그라운드."""
+
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, withdraw: bool, amount_krw: float, state_path: Path):
+        super().__init__()
+        self._withdraw = withdraw
+        self._amount = float(amount_krw)
+        self._state_path = state_path
+
+    def run(self):
+        try:
+            import adjust_capital
+
+            ok, msg = adjust_capital.apply_capital_peak_adjustment(
+                withdraw=self._withdraw,
+                amount_krw=self._amount,
+                state_path=self._state_path,
+                source_label="run_gui.py",
+            )
+            self.done.emit(ok, msg)
+        except Exception as e:
+            self.done.emit(False, f"{type(e).__name__}: {e}")
+
 
 # =====================================================================
 # 🚀 [비동기 일꾼] API 통신 및 현재가(야후/업비트) 조회 전담 스레드
@@ -373,6 +402,7 @@ class BotDashboard(QMainWindow):
         self.initUI()
         self._last_holdings_roi = {}
 
+        self._capital_thread: CapitalAdjustThread | None = None
         self._bg_sig = _GuiBackgroundSignals(self)
         self._bg_sig.net_check_result.connect(self._on_net_check_result)
         self._bg_sig.heartbeat_done.connect(self._on_heartbeat_done)
@@ -636,6 +666,83 @@ class BotDashboard(QMainWindow):
         ledger_layout.addWidget(self.ledger_table)
         
         tabs.addTab(ledger_tab, "장부 (현재 포지션)")
+
+        # 4. 합산 고점 보정 (adjust_capital.py와 동일 로직)
+        capital_tab = QWidget()
+        capital_layout = QVBoxLayout(capital_tab)
+        capital_help = QLabel(
+            "<b>고점 보정 (수동 입·출금)</b><br>"
+            "예수금만 입금/출금하면 Phase5 합산 고점(<code>peak_equity_total_krw</code>)과 실총액이 어긋날 수 있습니다.<br>"
+            "실행 시 CLI와 같이 <b>실계좌 스냅샷 갱신</b> 후 고점을 가산/감산하고 <code>capital_adjustments</code>에 기록합니다.<br>"
+            "<span style='color:#c0392b'>주말 KIS 점검 구간에는 국·미 스냅샷이 제한될 수 있습니다.</span>"
+        )
+        capital_help.setWordWrap(True)
+        capital_layout.addWidget(capital_help)
+
+        kind_row = QHBoxLayout()
+        self.capital_deposit_radio = QRadioButton("입금 (고점 +)")
+        self.capital_withdraw_radio = QRadioButton("출금 (고점 −)")
+        self.capital_deposit_radio.setChecked(True)
+        self._capital_kind_group = QButtonGroup(self)
+        self._capital_kind_group.addButton(self.capital_deposit_radio)
+        self._capital_kind_group.addButton(self.capital_withdraw_radio)
+        kind_row.addWidget(self.capital_deposit_radio)
+        kind_row.addWidget(self.capital_withdraw_radio)
+        kind_row.addStretch()
+        capital_layout.addLayout(kind_row)
+
+        amt_row = QHBoxLayout()
+        amt_row.addWidget(QLabel("금액 (원):"))
+        self.capital_amount_edit = QLineEdit()
+        self.capital_amount_edit.setPlaceholderText("예: 1000000 또는 1,000,000")
+        amt_row.addWidget(self.capital_amount_edit, stretch=1)
+        capital_layout.addLayout(amt_row)
+
+        self.capital_apply_btn = QPushButton("실행 (스냅샷 갱신 → 고점 반영)")
+        self.capital_apply_btn.setMinimumHeight(40)
+        self.capital_apply_btn.setStyleSheet("background-color: #1e8449; color: white; font-weight: bold;")
+        self.capital_apply_btn.clicked.connect(self._on_capital_adjust_clicked)
+        capital_layout.addWidget(self.capital_apply_btn)
+        capital_layout.addStretch()
+
+        tabs.addTab(capital_tab, "고점 보정 (입출금)")
+
+    def _on_capital_adjust_clicked(self):
+        import adjust_capital
+
+        raw = self.capital_amount_edit.text().strip()
+        try:
+            amount = adjust_capital.parse_capital_amount_krw(raw)
+        except ValueError as e:
+            QMessageBox.warning(self, "입력 오류", str(e))
+            return
+
+        withdraw = self.capital_withdraw_radio.isChecked()
+        verb = "출금" if withdraw else "입금"
+        confirm = QMessageBox.question(
+            self,
+            "고점 보정 확인",
+            f"<b>{verb}</b> <b>{amount:,.0f}</b>원을 합산 고점에 반영합니다.<br><br>"
+            "실계좌 기준 <code>circuit_aux_*</code> 갱신 후 저장합니다. 계속할까요?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.capital_apply_btn.setEnabled(False)
+        self._capital_thread = CapitalAdjustThread(withdraw, amount, STATE_PATH)
+        self._capital_thread.done.connect(self._on_capital_adjust_finished)
+        self._capital_thread.start()
+
+    def _on_capital_adjust_finished(self, ok: bool, msg: str):
+        self.capital_apply_btn.setEnabled(True)
+        self._capital_thread = None
+        if ok:
+            QMessageBox.information(self, "고점 보정 완료", msg.replace("\n", "<br>"))
+            self.refresh_balance()
+        else:
+            QMessageBox.warning(self, "고점 보정 실패", msg.replace("\n", "<br>"))
 
     def handle_manual_sell(self, market, ticker, qty, name):
         """수동 매도 버튼 클릭 시 호출되는 함수"""
