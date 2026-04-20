@@ -335,9 +335,14 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
     if is_volume_surged and is_macd_bullish and is_rsi_healthy:
         strategy_name = "V6 스나이퍼(수급+MACD+RSI+상투방지)"
         
-        # 🎯 [변경] 4000억 퀀트 매니저의 실전 방어선 (ATR 1.0배 노이즈 허용 + 최대 10% 하드스탑 방어막)
+        # 🎯 V8.0 듀얼 레이어 하드스탑
+        # 1) 추세선: ma20 - ATR*1.0
+        # 2) 절대 방어선: 현재가 - ATR*2.0 (ATR 이상 시), 실패 시 기존 -10% fallback
         calculated_sl = today['ma20'] - (today_atr * 1.0)
-        absolute_sl = curr_p * 0.90  # 현재가 대비 -10% 절대 방어선
+        if pd.notna(today_atr) and float(today_atr) > 0:
+            absolute_sl = curr_p - (float(today_atr) * 2.0)
+        else:
+            absolute_sl = curr_p * 0.90  # fallback: 현재가 대비 -10%
         
         # 둘 중 '더 높은 가격(손실이 적은 가격)'을 최종 손절선으로 채택!
         stop_loss_price = max(calculated_sl, absolute_sl)
@@ -419,13 +424,17 @@ def get_final_exit_price(ticker, curr_p, pos_info, ohlcv):
     cp = _finite_price(curr_p, 0.0)
     sl_fb = _finite_price(pos_info.get("sl_p"), cp * 0.9 if cp > 0 else 0.0)
 
-    # 1. 톱니바퀴 락 (오늘 샹들리에와 기존 저장된 손절가 중 무조건 높은 값 선택) — NaN 금지
-    raw_chandelier = get_chandelier_exit(curr_p, pos_info, ohlcv)
+    # 1. V8.0 안전 샹들리에:
+    #    current_atr(무결성 검증 센서값) 직결, 없으면 현재가*2%를 ATR 대체로 사용.
+    current_atr = _finite_price(pos_info.get("current_atr"), 0.0)
+    if current_atr <= 0 and cp > 0:
+        current_atr = cp * 0.02  # fallback 노이즈
+    max_price = max(_finite_price(pos_info.get("max_p", cp), cp), cp)
+    raw_chandelier = max_price - (float(current_atr) * 2.5)
     locked_chandelier = max(_finite_price(raw_chandelier, sl_fb), sl_fb)
     
     # 2. 🚨 [수정] 수익률 계산을 '현재가'가 아닌 '최고가(max_p)' 기준으로 변경!
     buy_price = _finite_price(pos_info.get("buy_p", cp), cp)
-    max_price = max(_finite_price(pos_info.get("max_p", cp), cp), cp)
     max_profit_rate = ((max_price - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
 
     # 3. 콘크리트 바닥 (이익 보존 락)

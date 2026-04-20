@@ -1,6 +1,6 @@
 ﻿# c-bot 운영 개요
 
-_업데이트: 2026-04-19 — V7.1(액티브 전용·분할 익절)·`scale_out`·장부 `scale_out_done` 반영; `adjust_capital.py`·`circuit_aux`·텔레그램 보유시간_
+_업데이트: 2026-04-19 — V8.0 동적 변동성 ATR 엔진(`entry_atr`/`current_atr`)·동적 분할 익절·동적 하드스탑/샹들리에 반영; `adjust_capital.py`·`circuit_aux`·텔레그램 보유시간_
 
 **일반 운영:** `run_bot.bat` 또는 `py -3.11 run_gui.py` 로 **GUI만** 쓰면 됩니다.  
 `run_bot.py` 단독(헤드리스)은 콘솔 서버·개발용으로만 쓰는 선택 경로입니다.
@@ -82,6 +82,7 @@ _업데이트: 2026-04-19 — V7.1(액티브 전용·분할 익절)·`scale_out`
   - 매수/매도 판단 로직(규칙·필터).
   - `rules.py`: V5 전략 코어(OHLCV, 시그널, 청산 가격). `yfinance` 재시도·백오프, 국내 6자리는
     KIS 일봉 래퍼(`get_ohlcv_kis_domestic_daily` 등)와 병행.
+  - `indicators.py`: V8.0 지표 유틸. `get_safe_atr(ticker, df)`로 14일 ATR을 무결성 검증(결측치/이상 TR/최소 거래일) 후 계산.
   - `sector_lock.py`: 동일 GICS 섹터 과집중 제한(국·미 각각 한도는
     `max(1, (max_positions_XX + 1) // 2)` 형태로 **올림** 적용).
   - `ai_filter.py`: false-breakout(휩쏘) 필터.
@@ -93,7 +94,7 @@ _업데이트: 2026-04-19 — V7.1(액티브 전용·분할 익절)·`scale_out`
     매도 사유별 `ticker_cooldowns` 만료 시각 설정·조회 유틸. `load_state` 시 `positions[*].scale_out_done` 기본값 보강.
   - `sync_positions.py`: 실계좌↔장부 자동복구/유령정리/평단보정·**보유수량(`qty`) 반영**(평일 API 시드).
   - `order_twap.py`: 분할 매수/매도(TWAP) 슬라이스 계획/실행.
-  - `scale_out.py`: **V7.1 조건부 50% 분할 익절(Scale-Out)** — 조건·수량·최소명목·장부 보정(`post_partial_ledger`)·국·미 수량 TWAP·코인 청크 매도.
+  - `scale_out.py`: **V8.0 동적 50% 분할 익절(Scale-Out)** — `entry_atr*3.0` 목표(부재 시 +30% fallback), 수량·최소명목·장부 보정(`post_partial_ledger`)·국·미 수량 TWAP·코인 청크 매도.
   - `circuit_break.py`: 합산 자산 drawdown 판정 유틸.
 
 - `utils/`
@@ -112,9 +113,14 @@ _업데이트: 2026-04-19 — V7.1(액티브 전용·분할 익절)·`scale_out`
 - **V7.1 액티브 전용:** 코어 자산 예외 목록은 **없음**. 계좌에 있는 모든 종목이 매도·샹들리에·슬롯 카운트 대상이다.
 - **분할 익절(Scale-Out):** `execution/scale_out.py` + `run_bot.py` 매도 루프(국·미·코인).
   - 장부: `positions[티커].scale_out_done` — `false`(또는 없음)이면 미실시, 조건 충족 시 **1회** 분할 매도 성공 후 `true`(이미 분할 익절함·동일 포지션에서 재시도 안 함). 신규 매수로 다시 잡히면 새 항목부터 다시 `false`.
-  - 조건(요약): 수익률 ≥ **30%**, 진입·평가 중 큰 명목(원화) ≥ **300만 원**, `scale_out_done == false`.
+  - 조건(요약): `현재가 >= 매수가 + (entry_atr * 3.0)`(fallback: +30%), 진입·평가 중 큰 명목(원화) ≥ **300만 원**, `scale_out_done == false`.
   - 수량: 국·미 정수 주 `// 2`(1주만 있으면 스킵); 코인은 `0.5×` 후 소수 **truncate**. 최소 매도 명목은 국·미 **1주 시가**, 코인 **5,000원**.
   - 주문: 매도 명목이 `config.json`의 **TWAP 기준**(원화·미장은 USD→원화 환산) 초과 시 분할 시장가, 이하이면 일괄 시장가. 성공 시 장부 `qty`·`buy_p` 등 보정.
+- **V8.0 ATR 센서/저장(백그라운드):** `run_bot.py`가 보유 루프에서 `get_safe_atr`를 호출해 `positions[*].current_atr`를 저장하고,
+  신규 진입 시점 ATR을 `positions[*].entry_atr`로 박제한다.
+  - 무결성 검증 실패 시 `⚠️ [ATR 검증 실패] ...` 로그만 남기고 `None` 반환(봇 중단 없음).
+  - `current_atr`는 샹들리에(`max_price - current_atr*2.5`) 계산에 사용되며, 값 부재 시 `현재가*2%` fallback.
+  - 초기 하드스탑 듀얼 레이어는 `ma20-ATR*1.0` vs `현재가-ATR*2.0`(부재 시 -10% fallback).
 - 코인 먼지 수량 기준: `utils/helpers.py`
   - `COIN_MIN_POSITION_QTY (= 0.0001)`
   - `coin_qty_counts_for_position(qty)`로 실질 보유 여부 통일 판정.
@@ -142,7 +148,7 @@ _업데이트: 2026-04-19 — V7.1(액티브 전용·분할 익절)·`scale_out`
 2. `run_trading_bot()` 주기 실행.
 3. `sync_all_positions()`로 실보유와 장부 정합.
 4. 리스크 체크(MDD/합산서킷/거시/섹터/AI필터).
-5. 매도: **V7.1 분할 익절**(조건 충족 시 최우선) → 타임스탑·하드스탑·샹들리에 전량 등. 이후 신규 매수(시장·시간·슬롯 조건 충족 시).
+5. 매도: **V8.0 동적 분할 익절**(조건 충족 시 최우선) → 타임스탑·하드스탑·샹들리에 전량 등. 이후 신규 매수(시장·시간·슬롯 조건 충족 시).
 6. 체결/상태를 `trade_history.json`, `bot_state.json`에 반영.
 
 ### 4-1) 미장 유니버스 · 국장/미장 스캐너 · 데이터 소스 · 재진입 쿨다운
@@ -298,9 +304,9 @@ py -3.11 adjust_capital.py
 - 기준: `utils/helpers.py`의 `COIN_MIN_POSITION_QTY`.
 - 이 값 이하 수량은 실질 보유로 보지 않아 동기화/집계/장부에서 제외.
 
-### 8-5. V7.1 분할 익절(Scale-Out)을 바꿀 때
+### 8-5. V8.0 동적 분할 익절(Scale-Out)을 바꿀 때
 
-- 로직·상수: `execution/scale_out.py` (`SCALE_OUT_PROFIT_PCT`, `SCALE_OUT_MIN_NOTIONAL_KRW`, `post_partial_ledger` 등).
+- 로직·상수: `execution/scale_out.py` (`scale_out_price_target_hit`, `SCALE_OUT_MIN_NOTIONAL_KRW`, `post_partial_ledger` 등).
 - 호출 순서·브로커 주문: `run_bot.py` 국·미·코인 매도 루프(신규 매수 보호 직후, 타임스탑·샹들리에 전).
 - TWAP 분할 기준: `config.json`의 `twap_krw_threshold`, `twap_usd_threshold`, `twap_enabled`, `twap_slice_delay_sec`.
 
@@ -462,17 +468,17 @@ py -3.11 adjust_capital.py
 ### 10-3. 상태 파일 이해
 
 - `bot_state.json`
-  - 실시간 운용 상태(positions·**qty**·**`scale_out_done`**, cooldown, ticker_cooldowns, 일부 누적 통계,
+  - 실시간 운용 상태(positions·**qty**·**`scale_out_done`**·**`entry_atr`**·**`current_atr`**, cooldown, ticker_cooldowns, 일부 누적 통계,
     **last_kis_display_snapshot**, Phase5용 **`peak_equity_total_krw`** / **`circuit_aux_last_*`** / **`capital_adjustments`** 등).
   - 깨지면 `execution/guard.py`에서 기본 구조로 복구 시도.
 
 - `trade_history.json`
   - append 기록 로그 성격. 전략 회고/검증에 활용.
 
-### 10-4. 슬롯·먼지·분할 익절 요약
+### 10-4. 슬롯·먼지·분할 익절(V8) 요약
 
 - **포지션 슬롯:** `execution/guard.py`의 `can_open_new` — 시장별(국·미·코인) `max_positions`만 적용, **코어 예외 없음**.
-- **분할 익절:** `positions[*].scale_out_done`, 조건·수량·TWAP 연동은 본문 **「3) 현재 핵심 공통 상수/정책」** 및 `execution/scale_out.py` 참고.
+- **분할 익절:** `positions[*].scale_out_done`, 목표는 `entry_atr*3.0`(부재 시 +30% fallback), 수량·최소명목·TWAP 연동은 `execution/scale_out.py` 참고.
 - 코인 최소수량: `utils/helpers.py`의 `COIN_MIN_POSITION_QTY`.
   - 이 값 이하는 장부/집계에서 사실상 제외.
 

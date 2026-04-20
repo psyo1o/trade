@@ -59,6 +59,7 @@ from execution.circuit_break import evaluate_total_account_circuit, estimate_usd
 from execution.scale_out import (
     SCALE_OUT_MIN_NOTIONAL_KRW,
     SCALE_OUT_PROFIT_PCT,
+    scale_out_price_target_hit,
     compute_coin_scale_out_qty,
     compute_stock_scale_out_qty,
     coin_scale_out_min_notional_ok,
@@ -86,6 +87,7 @@ from strategy.rules import (
     get_ohlcv_realtime,
     get_ohlcv_kis_domestic_daily,
 )
+from strategy.indicators import get_safe_atr
 from strategy.sector_lock import allow_kr_sector_entry, allow_us_sector_entry, seed_us_sector_cache
 from strategy.macro_guard import get_macro_guard_snapshot
 from execution.order_twap import plan_krw_slices, plan_usd_slices
@@ -1554,6 +1556,8 @@ def persist_position_registration(state, ticker, position_payload, context="", s
         return False
     position_payload = dict(position_payload)
     position_payload.setdefault("scale_out_done", False)
+    if "entry_atr" not in position_payload:
+        position_payload["entry_atr"] = float(_to_float(position_payload.get("current_atr", 0), 0.0))
     state.setdefault("positions", {})[ticker] = position_payload
     set_cooldown(state, ticker)
 
@@ -1611,6 +1615,7 @@ def _execute_kr_market_buy_twap(
     target_budget: float,
     curr_p: float,
     sl_p: float,
+    entry_atr: float,
     t_name: str,
     s_name: str,
     state: dict,
@@ -1698,7 +1703,16 @@ def _execute_kr_market_buy_twap(
     send_telegram(
         f"🎯 [{t_name} 매수 TWAP] {t}({kr_name})\n가중평단: ~{int(wavg):,}원 × {total_qty}주 | 손절가: {int(sl_p):,}원\n전략: {s_name}"
     )
-    payload = {"buy_p": wavg, "sl_p": sl_p, "max_p": wavg, "tier": t_name, "buy_time": time.time(), "qty": float(total_qty)}
+    payload = {
+        "buy_p": wavg,
+        "sl_p": sl_p,
+        "max_p": wavg,
+        "tier": t_name,
+        "buy_time": time.time(),
+        "qty": float(total_qty),
+        "entry_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
+        "current_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
+    }
     persist_position_registration(state, t, payload, context="KR BUY TWAP")
     try:
         _record_trade_event("KR", t, "BUY", total_qty, price=wavg, profit_rate=None, reason=s_name)
@@ -1714,6 +1728,7 @@ def _execute_us_market_buy_twap(
     target_budget_usd: float,
     curr_p: float,
     sl_p: float,
+    entry_atr: float,
     t_name: str,
     s_name: str,
     state: dict,
@@ -1788,7 +1803,16 @@ def _execute_us_market_buy_twap(
     wavg = total_cost / total_qty if total_qty else fp
     print(f"  ✅ [미장 매수 체결 TWAP] {us_name}({t}) | ~${wavg:.2f} × {total_qty}주 | 손절: ${sl_p:.2f}")
     send_telegram(f"🎯 [S&P500 매수 TWAP] {t}({us_name})\n가중평단: ~${wavg:.2f} × {total_qty}주\n전략: {s_name}")
-    payload = {"buy_p": wavg, "sl_p": sl_p, "max_p": wavg, "tier": t_name, "buy_time": time.time(), "qty": float(total_qty)}
+    payload = {
+        "buy_p": wavg,
+        "sl_p": sl_p,
+        "max_p": wavg,
+        "tier": t_name,
+        "buy_time": time.time(),
+        "qty": float(total_qty),
+        "entry_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
+        "current_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
+    }
     persist_position_registration(state, t, payload, context="US BUY TWAP")
     try:
         _record_trade_event("US", t, "BUY", total_qty, price=wavg, profit_rate=None, reason=s_name)
@@ -1802,6 +1826,7 @@ def _execute_coin_market_buy_twap(
     t: str,
     budget_krw: float,
     sl_p: float,
+    entry_atr: float,
     s_name: str,
     state: dict,
     krw_bal_holder: list,
@@ -1883,7 +1908,16 @@ def _execute_coin_market_buy_twap(
     send_telegram(
         f"🎯 [코인 TWAP 매수] {t}({coin_name})\n평단: {p_fmt}원 × {coin_qty:.4f} | 손절: {sl_fmt}원\n전략: {s_name}"
     )
-    payload = {"buy_p": last_p, "sl_p": sl_p, "max_p": last_p, "tier": s_name, "buy_time": time.time(), "qty": float(coin_qty)}
+    payload = {
+        "buy_p": last_p,
+        "sl_p": sl_p,
+        "max_p": last_p,
+        "tier": s_name,
+        "buy_time": time.time(),
+        "qty": float(coin_qty),
+        "entry_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
+        "current_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
+    }
     persist_position_registration(state, t, payload, context="COIN BUY TWAP")
     try:
         _record_trade_event("COIN", t, "BUY", spent, price=last_p, profit_rate=None, reason=s_name)
@@ -2387,6 +2421,7 @@ def run_trading_bot():
                         'buy_time': time.time(),
                         'buy_date': datetime.now().isoformat(),
                         'scale_out_done': False,
+                        'entry_atr': float(0.0),
                     }
                     state.setdefault("positions", {})[t] = payload
                     save_state(STATE_PATH, state)
@@ -2402,6 +2437,13 @@ def run_trading_bot():
                     continue
 
                 pos_info = state.get("positions", {}).get(t, {})
+                atr_val = get_safe_atr(t, ohlcv)
+                if atr_val is not None:
+                    prev_atr = _to_float(pos_info.get("current_atr", 0), 0.0)
+                    if abs(prev_atr - float(atr_val)) > 1e-9:
+                        pos_info["current_atr"] = float(atr_val)
+                        state.setdefault("positions", {})[t] = pos_info
+                        save_state(STATE_PATH, state)
                 
                 # 🔄 [완전 동기화] GUI가 장부에 공유한 최신 가격을 최우선으로 사용
                 gui_p = pos_info.get('curr_p')
@@ -2444,14 +2486,17 @@ def run_trading_bot():
                 if q_led <= 0:
                     q_led = int(qty)
                 notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), False, usdk)
-                if not position_scale_out_done(pos_info) and float(profit_rate_now) >= SCALE_OUT_PROFIT_PCT:
+                entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
+                so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
+                if not position_scale_out_done(pos_info) and so_hit:
                     if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
+                        mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
                         print(
-                            f"  ℹ️ [KR Scale-Out 스킵] {t}: 수익 {profit_rate_now:+.2f}% ≥ {SCALE_OUT_PROFIT_PCT:.0f}% 이지만 "
+                            f"  ℹ️ [KR Scale-Out 스킵] {t}: 트리거({mode_txt}, 목표 {so_target:,.0f})는 충족했지만 "
                             f"명목 max(매수가×수량, 현재가×수량)={notion_krw_so:,.0f}원 < "
                             f"{SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원 (수량 {q_led}주)"
                         )
-                    elif scale_out_trigger_ok(pos_info, profit_rate_now, notion_krw_so):
+                    elif scale_out_trigger_ok(pos_info, SCALE_OUT_PROFIT_PCT, notion_krw_so):
                         sq = compute_stock_scale_out_qty(int(qty))
                         if not sq:
                             print(
@@ -2756,8 +2801,9 @@ def run_trading_bot():
                             
                             # 매수 주문 (Phase2 TWAP: 대액 시 분할)
                             kr_box = [float(kr_cash)]
+                            entry_atr = float(get_safe_atr(t, ohlcv_200) or 0.0)
                             _execute_kr_market_buy_twap(
-                                t, kr_name, float(target_budget), curr_p, sl_p, t_name, s_name, state, kr_box
+                                t, kr_name, float(target_budget), curr_p, sl_p, entry_atr, t_name, s_name, state, kr_box
                             )
                             kr_cash = int(kr_box[0])
                         except Exception as e:
@@ -2875,6 +2921,7 @@ def run_trading_bot():
                         'buy_time': time.time(),
                         'buy_date': datetime.now().isoformat(),
                         'scale_out_done': False,
+                        'entry_atr': float(0.0),
                     }
                     state.setdefault("positions", {})[t] = payload
                     save_state(STATE_PATH, state)
@@ -2891,6 +2938,13 @@ def run_trading_bot():
                     continue
 
                 pos_info = state.get("positions", {}).get(t, {})
+                atr_val = get_safe_atr(t, ohlcv)
+                if atr_val is not None:
+                    prev_atr = _to_float(pos_info.get("current_atr", 0), 0.0)
+                    if abs(prev_atr - float(atr_val)) > 1e-9:
+                        pos_info["current_atr"] = float(atr_val)
+                        state.setdefault("positions", {})[t] = pos_info
+                        save_state(STATE_PATH, state)
                 
                 # 🔄 [완전 동기화] GUI가 장부에 공유한 최신 가격을 최우선으로 사용
                 gui_p = pos_info.get('curr_p')
@@ -2929,13 +2983,16 @@ def run_trading_bot():
                 if q_led <= 0:
                     q_led = qty_int
                 notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), True, usdk)
-                if not position_scale_out_done(pos_info) and float(profit_rate_now) >= SCALE_OUT_PROFIT_PCT:
+                entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
+                so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
+                if not position_scale_out_done(pos_info) and so_hit:
                     if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
+                        mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
                         print(
-                            f"  ℹ️ [US Scale-Out 스킵] {t}: 수익 {profit_rate_now:+.2f}% ≥ {SCALE_OUT_PROFIT_PCT:.0f}% 이지만 "
+                            f"  ℹ️ [US Scale-Out 스킵] {t}: 트리거({mode_txt}, 목표 {so_target:,.2f})는 충족했지만 "
                             f"명목(원화 환산)={notion_krw_so:,.0f}원 < {SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원 (수량 {qty_int}주)"
                         )
-                    elif scale_out_trigger_ok(pos_info, profit_rate_now, notion_krw_so):
+                    elif scale_out_trigger_ok(pos_info, SCALE_OUT_PROFIT_PCT, notion_krw_so):
                         sq = compute_stock_scale_out_qty(qty_int)
                         if not sq:
                             print(
@@ -3221,12 +3278,14 @@ def run_trading_bot():
 
                                     # 시장가 매수 (Phase2 TWAP: 대액 시 USD 분할, 슬라이스마다 101% 지정가)
                                     us_box = [float(us_cash)]
+                                    entry_atr = float(get_safe_atr(t, ohlcv) or 0.0)
                                     _execute_us_market_buy_twap(
                                         t,
                                         us_name,
                                         float(target_budget),
                                         curr_p,
                                         sl_p,
+                                        entry_atr,
                                         t_name,
                                         s_name,
                                         state,
@@ -3325,6 +3384,13 @@ def run_trading_bot():
                 
             ohlcv = [{'o': row['open'], 'h': row['high'], 'l': row['low'], 'c': row['close'], 'v': row['volume']} for _, row in df_upbit.iterrows()]
             pos_info = state.get("positions", {}).get(t, {})
+            atr_val = get_safe_atr(t, ohlcv)
+            if atr_val is not None:
+                prev_atr = _to_float(pos_info.get("current_atr", 0), 0.0)
+                if abs(prev_atr - float(atr_val)) > 1e-9:
+                    pos_info["current_atr"] = float(atr_val)
+                    state.setdefault("positions", {})[t] = pos_info
+                    save_state(STATE_PATH, state)
             
             # 🔄 [완전 동기화] GUI가 장부에 공유한 최신 가격을 최우선으로 사용
             gui_p = pos_info.get('curr_p')
@@ -3376,14 +3442,17 @@ def run_trading_bot():
             if q_led <= 0:
                 q_led = float(qty)
             notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), False, usdk)
-            if not position_scale_out_done(pos_info) and float(profit_rate_now) >= SCALE_OUT_PROFIT_PCT:
+            entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
+            so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
+            if not position_scale_out_done(pos_info) and so_hit:
                 if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
+                    mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
                     print(
-                        f"  ℹ️ [COIN Scale-Out 스킵] {t}: 수익 {profit_rate_now:+.2f}% ≥ {SCALE_OUT_PROFIT_PCT:.0f}% 이지만 "
+                        f"  ℹ️ [COIN Scale-Out 스킵] {t}: 트리거({mode_txt}, 목표 {so_target:,.0f})는 충족했지만 "
                         f"명목 max(매수가×수량, 현재가×수량)={notion_krw_so:,.0f}원 < "
                         f"{SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원"
                     )
-                elif scale_out_trigger_ok(pos_info, profit_rate_now, notion_krw_so):
+                elif scale_out_trigger_ok(pos_info, SCALE_OUT_PROFIT_PCT, notion_krw_so):
                     sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
                     if not sell_q:
                         print(f"  ℹ️ [COIN Scale-Out 스킵] {t}: 50% 절삼 후 수량 0")
@@ -3647,8 +3716,9 @@ def run_trading_bot():
                                             continue
 
                                     krw_box = [float(krw_bal)]
+                                    entry_atr = float(get_safe_atr(t, ohlcv) or 0.0)
                                     _execute_coin_market_buy_twap(
-                                        t, float(budget), sl_p, s_name, state, krw_box, held_coins
+                                        t, float(budget), sl_p, entry_atr, s_name, state, krw_box, held_coins
                                     )
                                     krw_bal = float(krw_box[0])
                                 else:

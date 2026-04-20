@@ -19,6 +19,7 @@ from execution.order_twap import plan_sell_qty_twap, run_qty_slice_sells
 SCALE_OUT_PROFIT_PCT = 30.0
 SCALE_OUT_MIN_NOTIONAL_KRW = 3_000_000.0
 COIN_DECIMALS = 8
+SCALE_OUT_ENTRY_ATR_MULT = 3.0
 
 
 def position_scale_out_done(pos: dict) -> bool:
@@ -76,6 +77,33 @@ def scale_out_trigger_ok(pos: dict, profit_rate: float, notional_krw: float) -> 
     if float(notional_krw) < SCALE_OUT_MIN_NOTIONAL_KRW:
         return False
     return True
+
+
+def scale_out_price_target_hit(
+    buy_price: float,
+    curr_price: float,
+    entry_atr: float | None,
+    *,
+    fallback_profit_pct: float = SCALE_OUT_PROFIT_PCT,
+    atr_mult: float = SCALE_OUT_ENTRY_ATR_MULT,
+) -> tuple[bool, str, float]:
+    """
+    V8.0 분할 익절 목표가 판정.
+
+    Returns
+        (hit, mode, target_price)
+        - mode: ``entry_atr`` 또는 ``fallback_profit``
+    """
+    bp = float(buy_price or 0)
+    cp = float(curr_price or 0)
+    ea = float(entry_atr or 0)
+    if bp <= 0 or cp <= 0:
+        return False, "fallback_profit", 0.0
+    if ea > 0:
+        target = bp + (ea * float(atr_mult))
+        return cp >= target, "entry_atr", float(target)
+    target = bp * (1.0 + float(fallback_profit_pct) / 100.0)
+    return cp >= target, "fallback_profit", float(target)
 
 
 def post_partial_ledger(pos: dict, sell_qty: float, exec_px: float, qty_before: float) -> dict:
