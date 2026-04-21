@@ -26,6 +26,8 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
   - run_bot 모듈을 import해서 엔진/잔고/수동매도/로그를 UI로 제어.
   - 고점 보정(입출금) 탭: adjust_capital.py와 동일 로직으로 circuit_aux_* 갱신 후
     peak_equity_total_krw 가감 및 capital_adjustments 기록.
+  - KIS 잔고 조회 안정화: OPSQ0008/MCI 응답 시 백오프 재시도, 장외 스냅샷 우선,
+    kr_bal/us_bal 기본 초기화로 UnboundLocalError 방지.
   - 매매는 KST 분기(:00/:15/:30/:45); 텔레그램 생존보고는 기동 즉시 1회 후 KST :00/:30 정렬.
   - KIS 주말 점검 창: 국·미 잔고 API 미호출, last_kis_display_snapshot·장부로 표시.
     보유수량은 positions[티커].qty(평일 동기화/매수 시 기록), 없으면 표시 1 폴백.

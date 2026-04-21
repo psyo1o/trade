@@ -28,6 +28,7 @@ _업데이트: 2026-04-19 — V8.0 동적 변동성 ATR 엔진(`entry_atr`/`curr
   - PyQt5 기반 운영 GUI.
   - `run_bot` 모듈을 import해서 엔진/잔고/수동매도/로그를 UI로 제어.
   - **고점 보정(입출금) 탭**: `adjust_capital.py`와 동일 로직으로 `circuit_aux_*` 갱신 후 `peak_equity_total_krw`를 가산/감산하고, `capital_adjustments`에 기록.
+  - KIS 잔고 조회 안정화: `OPSQ0008/MCI` 계열 응답 시 짧은 백오프 재시도, 장외에는 스냅샷 우선 사용, 파싱 변수 기본 초기화로 `UnboundLocalError` 방지.
   - 매매 타이머는 KST **분기**(`:00/:15/:30/:45`); 텔레그램 heartbeat 는 **기동 즉시 1회**
     뒤 KST **`:00/:30`** 정렬(매매 주기와 별도).
   - KIS 주말 점검 창에는 국·미 **API를 부르지 않고** `last_kis_display_snapshot` + 장부로 상단·테이블을 표시.

@@ -199,6 +199,10 @@ class BalanceUpdaterThread(QThread):
 
     def run(self):
         try:
+            # 아래 테이블 파싱 구간에서 항상 참조하므로 기본값 선초기화
+            kr_bal = {}
+            us_bal = {}
+
             def _with_backoff(fetch_fn, label: str, retries: int = 3, delay_sec: float = 1.2):
                 """OPSQ0008/MCI 계열 일시 장애 완화용 짧은 백오프 재시도."""
                 import time as _t
