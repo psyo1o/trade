@@ -118,7 +118,7 @@ _업데이트: 2026-04-19 — V8.0 동적 변동성 ATR 엔진(`entry_atr`/`curr
   - 주문: 매도 명목이 `config.json`의 **TWAP 기준**(원화·미장은 USD→원화 환산) 초과 시 분할 시장가, 이하이면 일괄 시장가. 성공 시 장부 `qty`·`buy_p` 등 보정.
 - **V8.0 ATR 센서/저장(백그라운드):** `run_bot.py`가 보유 루프에서 `get_safe_atr`를 호출해 `positions[*].current_atr`를 저장하고,
   신규 진입 시점 ATR을 `positions[*].entry_atr`로 박제한다.
-  - 무결성 검증 실패 시 `⚠️ [ATR 검증 실패] ...` 로그만 남기고 `None` 반환(봇 중단 없음).
+  - 무결성 검증 실패 시 원인별 로그(결측/0종가, 비정상 진폭, 데이터 부족, 예외)를 출력하고 `None` 반환(봇 중단 없음).
   - `current_atr`는 샹들리에(`max_price - current_atr*2.5`) 계산에 사용되며, 값 부재 시 `현재가*2%` fallback.
   - 초기 하드스탑 듀얼 레이어는 `ma20-ATR*1.0` vs `현재가-ATR*2.0`(부재 시 -10% fallback).
 - 코인 먼지 수량 기준: `utils/helpers.py`
@@ -490,4 +490,5 @@ py -3.11 adjust_capital.py
 - [ ] 텔레그램 테스트 메시지 수신 확인.
 - [ ] `test_mode` 의도와 실제 운용 모드 일치 확인.
 - [ ] 장부(`bot_state.json`)와 실제 잔고가 동기화되는지 확인.
+
 

@@ -73,7 +73,7 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
 - strategy/
   - 매수/매도 판단 로직(규칙·필터).
   - rules.py: V5 전략 코어(OHLCV, 시그널, 청산 가격). yfinance 재시도; 국내 일봉은 KIS 우선 가능.
-  - indicators.py: V8.0 지표 유틸(get_safe_atr). 결측치/이상 TR/최소 거래일 검증 후 ATR(14) 계산.
+  - indicators.py: V8.0 지표 유틸(get_safe_atr). 결측치/0종가/이상 TR/최소 거래일 검증 후 ATR(14) 계산, 실패 원인 로그 출력.
   - sector_lock.py: 동일 GICS 섹터 과집중 제한
     (한도 = max(1, (max_positions_XX + 1) // 2) 형태로 올림).
   - ai_filter.py: false-breakout(휩쏘) 필터.
@@ -156,4 +156,5 @@ Phase 1~5 (코드·로그 용어, tests/test_lab.py 샌드박스와 대응)
 - TWAP 정책 변경: config.json(twap_*) 우선, 구조 변경 시 execution/order_twap.py 및 execution/scale_out.py 확인.
 - 장부 스키마 변경: execution/guard.py + execution/sync_positions.py + run_bot.py 함께 확인
   (last_kis_display_snapshot, positions 하위 qty, scale_out_done, entry_atr, current_atr, circuit_aux_*, capital_adjustments 등).
+
 

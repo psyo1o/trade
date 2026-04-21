@@ -199,6 +199,27 @@ class BalanceUpdaterThread(QThread):
 
     def run(self):
         try:
+            def _with_backoff(fetch_fn, label: str, retries: int = 3, delay_sec: float = 1.2):
+                """OPSQ0008/MCI 계열 일시 장애 완화용 짧은 백오프 재시도."""
+                import time as _t
+
+                last = None
+                for i in range(retries):
+                    try:
+                        out = fetch_fn()
+                    except Exception:
+                        out = None
+                    last = out
+                    msg = ""
+                    if isinstance(out, dict):
+                        msg = str(out.get("msg1", "") or out.get("MSG1", ""))
+                    if out and "OPSQ0008" not in msg and "MCI" not in msg:
+                        return out
+                    if i < retries - 1:
+                        print(f"  ⚠️ [{label}] 조회 재시도 {i+1}/{retries-1} (잠시 후 재요청)")
+                        _t.sleep(delay_sec)
+                return last
+
             # 1. 무거운 장부 동기화 작업
             if self.sync_first:
                 try:
@@ -236,34 +257,55 @@ class BalanceUpdaterThread(QThread):
                     us_hold_roi = None
                     us_metrics = _calc_us_holdings_metrics({})
             else:
-                kr_bal = get_balance_with_retry() or {}
-                d2_kr = 0
-                if "output2" in kr_bal:
-                    out2 = kr_bal["output2"]
-                    d2_kr = int(
-                        _to_float(
-                            out2[0].get("prvs_rcdl_excc_amt", 0)
-                            if isinstance(out2, list) and out2
-                            else out2.get("prvs_rcdl_excc_amt", 0)
-                        )
-                    )
-                kr_metrics = _calc_kr_holdings_metrics(kr_bal)
-                kr_total = int(d2_kr + float(kr_metrics.get("current", 0.0)))
-                kr_hold_roi = kr_metrics.get("roi")
+                snap = load_last_kis_display_snapshot()
+                kr_part = snap.get("kr") or {}
+                us_part = snap.get("us") or {}
 
-                us_cash = _safe_num(get_us_cash_real(run_bot.broker_us), 0.0)
-                us_bal = get_us_positions_with_retry() or {}
-                us_metrics = _calc_us_holdings_metrics(us_bal)
-                if us_cash <= 0 and isinstance(us_bal, dict):
-                    out2 = us_bal.get("output2", [])
-                    us_cash = _safe_num(
-                        out2[0].get("frcr_dncl_amt_2", out2[0].get("frcr_buy_amt_smtl", 0))
-                        if isinstance(out2, list) and out2
-                        else out2.get("frcr_dncl_amt_2", out2.get("frcr_buy_amt_smtl", 0)),
-                        0.0,
-                    )
-                us_total = us_cash + float(us_metrics.get("current", 0.0) or 0.0)
-                us_hold_roi = us_metrics.get("roi")
+                # [2] 장외에는 조회하지 않고 마지막 스냅샷만 사용
+                if run_bot.is_market_open("KR"):
+                    kr_bal = _with_backoff(get_balance_with_retry, "KR 잔고") or {}
+                    d2_kr = 0
+                    if "output2" in kr_bal:
+                        out2 = kr_bal["output2"]
+                        d2_kr = int(
+                            _to_float(
+                                out2[0].get("prvs_rcdl_excc_amt", 0)
+                                if isinstance(out2, list) and out2
+                                else out2.get("prvs_rcdl_excc_amt", 0)
+                            )
+                        )
+                    kr_metrics = _calc_kr_holdings_metrics(kr_bal)
+                    kr_total = int(d2_kr + float(kr_metrics.get("current", 0.0)))
+                    kr_hold_roi = kr_metrics.get("roi")
+                else:
+                    d2_kr = int(_safe_num(kr_part.get("cash", 0), 0.0)) if isinstance(kr_part, dict) else 0
+                    kr_total = int(_safe_num(kr_part.get("total", 0), 0.0)) if isinstance(kr_part, dict) else 0
+                    kr_hold_roi = kr_part.get("roi") if isinstance(kr_part, dict) else None
+                    kr_metrics = _calc_kr_holdings_metrics({})
+
+                us_cash = 0.0
+                if run_bot.is_market_open("US"):
+                    us_cash = _safe_num(get_us_cash_real(run_bot.broker_us), 0.0)
+                    us_bal = _with_backoff(get_us_positions_with_retry, "US 잔고") or {}
+                    us_metrics = _calc_us_holdings_metrics(us_bal)
+                    if us_cash <= 0 and isinstance(us_bal, dict):
+                        out2 = us_bal.get("output2", [])
+                        out2_row = {}
+                        if isinstance(out2, list):
+                            out2_row = out2[0] if out2 else {}
+                        elif isinstance(out2, dict):
+                            out2_row = out2
+                        us_cash = _safe_num(
+                            out2_row.get("frcr_dncl_amt_2", out2_row.get("frcr_buy_amt_smtl", 0)),
+                            0.0,
+                        )
+                    us_total = us_cash + float(us_metrics.get("current", 0.0) or 0.0)
+                    us_hold_roi = us_metrics.get("roi")
+                else:
+                    us_cash = float(_safe_num(us_part.get("cash", us_cash), us_cash)) if isinstance(us_part, dict) else float(us_cash)
+                    us_total = float(_safe_num(us_part.get("total", us_cash), us_cash)) if isinstance(us_part, dict) else float(us_cash)
+                    us_hold_roi = us_part.get("roi") if isinstance(us_part, dict) else None
+                    us_metrics = _calc_us_holdings_metrics({})
 
                 try:
                     save_last_kis_display_snapshot(
