@@ -5,7 +5,7 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
 특징
     * 잔고·성적표·수동 매도·로그 뷰 등은 ``run_bot`` / ``execution`` / ``utils`` API를 그대로 호출.
     * ``import run_bot`` 시점에 ``config.json`` 이 로드되므로 **설정 변경 후 GUI 재시작** 필요.
-    * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_equity_total_krw``·``capital_adjustments`` 반영 (백그라운드 스레드).
+    * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_total_equity``(및 ``peak_equity_total_krw`` 미러)·``capital_adjustments`` 반영 (백그라운드 스레드).
     * 매매는 기동 1초 후 1회 실행한 뒤, **KST :00 / :15 / :30 / :45**에 `run_trading_bot`을 맞춘다.
     * ``QTimer.singleShot`` 겹침으로 로그가 두 줄씩 나오는 것을 막기 위해 **단일 ``QTimer`` + 실행 중 가드**를 쓴다.
     * 네트워크 감시·생존신고(heartbeat)는 **백그라운드 스레드**에서 돌리고, 텔레는 **기동 직후 1회** 보낸 뒤 **KST :00 / :30** 벽시계에 맞춘다.
@@ -41,6 +41,7 @@ from utils.helpers import (
     seconds_until_next_half_hour,
 )
 from execution.sync_positions import sync_all_positions
+from services.gui_table_adapter import build_rows_data
 from run_bot import (
     get_us_cash_real,
     get_held_stocks_us_detail,
@@ -70,6 +71,9 @@ TRADE_HISTORY_PATH = Path(__file__).resolve().parent / "trade_history.json"
 # Internet watch: GUI exits after consecutive failures so run_bot.bat can relaunch.
 _NET_CHECK_INTERVAL_MS = 12_000
 _NET_FAILS_BEFORE_EXIT = 3
+_KIS_REFRESH_MIN_INTERVAL_SEC = 25.0
+_last_kis_kr_fetch_ts = 0.0
+_last_kis_us_fetch_ts = 0.0
 
 
 def _internet_reachable(timeout=1.0):
@@ -192,10 +196,11 @@ class BalanceUpdaterThread(QThread):
     finished = pyqtSignal()           # 작업 끝남 신호
     error = pyqtSignal(str)           # 에러 신호
 
-    def __init__(self, sync_first=True, dashboard=None):
+    def __init__(self, sync_first=True, dashboard=None, force_kis=False):
         super().__init__()
         self.sync_first = sync_first
         self.dashboard = dashboard  # max_p 업데이트 함수를 쓰기 위해 참조
+        self.force_kis = bool(force_kis)
 
     def run(self):
         try:
@@ -223,6 +228,30 @@ class BalanceUpdaterThread(QThread):
                         print(f"  ⚠️ [{label}] 조회 재시도 {i+1}/{retries-1} (잠시 후 재요청)")
                         _t.sleep(delay_sec)
                 return last
+            def _allow_kis_fetch(market: str) -> bool:
+                """장외 강제 조회/최소 간격(토큰버킷 유사) 보호."""
+                import time as _t
+                global _last_kis_kr_fetch_ts, _last_kis_us_fetch_ts
+                now_ts = _t.time()
+                if self.force_kis:
+                    if market == "KR":
+                        _last_kis_kr_fetch_ts = now_ts
+                    else:
+                        _last_kis_us_fetch_ts = now_ts
+                    return True
+                if market == "KR":
+                    if not run_bot.is_market_open("KR"):
+                        return False
+                    if now_ts - float(_last_kis_kr_fetch_ts) < _KIS_REFRESH_MIN_INTERVAL_SEC:
+                        return False
+                    _last_kis_kr_fetch_ts = now_ts
+                    return True
+                if not run_bot.is_market_open("US"):
+                    return False
+                if now_ts - float(_last_kis_us_fetch_ts) < _KIS_REFRESH_MIN_INTERVAL_SEC:
+                    return False
+                _last_kis_us_fetch_ts = now_ts
+                return True
 
             # 1. 무거운 장부 동기화 작업
             if self.sync_first:
@@ -232,105 +261,27 @@ class BalanceUpdaterThread(QThread):
                 except Exception as e:
                     print(f"⚠️ 장부 동기화 중 오류: {e}")
 
-            # 2. 🇰🇷 국장 / 3. 🇺🇸 미장 (KIS 주말 점검 창에서는 API 미호출 — 직전 저장 스냅샷 표시)
-            if kis_equities_weekend_suppress_window_kst():
-                if not self.sync_first:
-                    print("💤 [주말 점검] 증권사 API 통신을 건너뛰고 기존 장부를 유지합니다.")
-                kr_bal = {}
-                snap = load_last_kis_display_snapshot()
-                kr_part = snap.get("kr") or {}
-                us_part = snap.get("us") or {}
-                if isinstance(kr_part, dict) and "total" in kr_part:
-                    d2_kr = int(kr_part.get("cash", 0))
-                    kr_total = int(kr_part["total"])
-                    kr_hold_roi = kr_part.get("roi")
-                    kr_metrics = _calc_kr_holdings_metrics({})
-                else:
-                    d2_kr = 0
-                    kr_total = 0
-                    kr_hold_roi = None
-                    kr_metrics = _calc_kr_holdings_metrics({})
-                if isinstance(us_part, dict) and "total" in us_part:
-                    us_cash = float(us_part.get("cash", 0))
-                    us_total = float(us_part["total"])
-                    us_hold_roi = us_part.get("roi")
-                    us_metrics = _calc_us_holdings_metrics({})
-                else:
-                    us_cash = 0.0
-                    us_total = 0.0
-                    us_hold_roi = None
-                    us_metrics = _calc_us_holdings_metrics({})
-            else:
-                snap = load_last_kis_display_snapshot()
-                kr_part = snap.get("kr") or {}
-                us_part = snap.get("us") or {}
-
-                # [2] 장외에는 조회하지 않고 마지막 스냅샷만 사용
-                if run_bot.is_market_open("KR"):
-                    kr_bal = _with_backoff(get_balance_with_retry, "KR 잔고") or {}
-                    d2_kr = 0
-                    if "output2" in kr_bal:
-                        out2 = kr_bal["output2"]
-                        d2_kr = int(
-                            _to_float(
-                                out2[0].get("prvs_rcdl_excc_amt", 0)
-                                if isinstance(out2, list) and out2
-                                else out2.get("prvs_rcdl_excc_amt", 0)
-                            )
-                        )
-                    kr_metrics = _calc_kr_holdings_metrics(kr_bal)
-                    kr_total = int(d2_kr + float(kr_metrics.get("current", 0.0)))
-                    kr_hold_roi = kr_metrics.get("roi")
-                else:
-                    d2_kr = int(_safe_num(kr_part.get("cash", 0), 0.0)) if isinstance(kr_part, dict) else 0
-                    kr_total = int(_safe_num(kr_part.get("total", 0), 0.0)) if isinstance(kr_part, dict) else 0
-                    kr_hold_roi = kr_part.get("roi") if isinstance(kr_part, dict) else None
-                    kr_metrics = _calc_kr_holdings_metrics({})
-
-                us_cash = 0.0
-                if run_bot.is_market_open("US"):
-                    us_cash = _safe_num(get_us_cash_real(run_bot.broker_us), 0.0)
-                    us_bal = _with_backoff(get_us_positions_with_retry, "US 잔고") or {}
-                    us_metrics = _calc_us_holdings_metrics(us_bal)
-                    if us_cash <= 0 and isinstance(us_bal, dict):
-                        out2 = us_bal.get("output2", [])
-                        out2_row = {}
-                        if isinstance(out2, list):
-                            out2_row = out2[0] if out2 else {}
-                        elif isinstance(out2, dict):
-                            out2_row = out2
-                        us_cash = _safe_num(
-                            out2_row.get("frcr_dncl_amt_2", out2_row.get("frcr_buy_amt_smtl", 0)),
-                            0.0,
-                        )
-                    us_total = us_cash + float(us_metrics.get("current", 0.0) or 0.0)
-                    us_hold_roi = us_metrics.get("roi")
-                else:
-                    us_cash = float(_safe_num(us_part.get("cash", us_cash), us_cash)) if isinstance(us_part, dict) else float(us_cash)
-                    us_total = float(_safe_num(us_part.get("total", us_cash), us_cash)) if isinstance(us_part, dict) else float(us_cash)
-                    us_hold_roi = us_part.get("roi") if isinstance(us_part, dict) else None
-                    us_metrics = _calc_us_holdings_metrics({})
-
-                try:
-                    save_last_kis_display_snapshot(
-                        int(d2_kr),
-                        int(kr_total),
-                        kr_hold_roi,
-                        float(us_cash),
-                        float(us_total),
-                        us_hold_roi,
-                    )
-                except Exception:
-                    pass
-
-            # 4. 🪙 코인 데이터 계산
-            krw_cash, upbit_bals = 0, []
-            if run_bot.upbit is not None:
-                krw_cash = int(_safe_num(run_bot.upbit.get_balance("KRW"), 0.0))
-                upbit_bals = run_bot.upbit.get_balances() or []
-            coin_metrics = _calc_coin_holdings_metrics(upbit_bals)
-            coin_total = int(krw_cash + float(coin_metrics.get("current", 0.0) or 0.0))
-            coin_hold_roi = coin_metrics.get("roi")
+            # 2~4. KR/US/COIN 스냅샷 공용 fetch (GUI force/쿨다운/백오프 정책 주입)
+            if kis_equities_weekend_suppress_window_kst() and not self.sync_first:
+                print("💤 [주말 점검] 증권사 API 통신을 건너뛰고 기존 장부를 유지합니다.")
+            snap = run_bot.build_account_snapshot_for_report(
+                allow_kis_fetch=_allow_kis_fetch,
+                with_backoff=_with_backoff,
+            )
+            labels = snap.get("labels", {})
+            d2_kr = int(_safe_num((labels.get("kr") or {}).get("cash", 0), 0))
+            kr_total = int(_safe_num((labels.get("kr") or {}).get("total", 0), 0))
+            kr_hold_roi = (labels.get("kr") or {}).get("roi")
+            us_cash = float(_safe_num((labels.get("us") or {}).get("cash", 0.0), 0.0))
+            us_total = float(_safe_num((labels.get("us") or {}).get("total", 0.0), 0.0))
+            us_hold_roi = (labels.get("us") or {}).get("roi")
+            krw_cash = int(_safe_num((labels.get("coin") or {}).get("cash", 0), 0))
+            coin_total = int(_safe_num((labels.get("coin") or {}).get("total", 0), 0))
+            coin_hold_roi = (labels.get("coin") or {}).get("roi")
+            bal_map = snap.get("balances", {}) or {}
+            kr_bal = bal_map.get("kr") if isinstance(bal_map.get("kr"), dict) else {}
+            us_bal = bal_map.get("us") if isinstance(bal_map.get("us"), dict) else {}
+            upbit_bals = bal_map.get("coin") if isinstance(bal_map.get("coin"), list) else []
 
             # 라벨 텍스트 보따리 포장
             labels_data = {
@@ -340,56 +291,23 @@ class BalanceUpdaterThread(QThread):
             }
             self.update_labels.emit(labels_data)
 
-            # 5. 테이블 행 데이터 수집 및 현재가 실시간 통신 (가장 무거운 작업)
-            rows_data = []
-
-            # 국장 파싱
-            if isinstance(kr_bal, dict) and 'output1' in kr_bal and isinstance(kr_bal['output1'], list):
-                for item in kr_bal['output1']:
-                    qty_num = int(_safe_num(item.get('hldg_qty', item.get('ccld_qty_smtl1', 0)), 0))
-                    if qty_num > 0:
-                        code, price, current_p = item.get('pdno', ''), item.get('pchs_avg_prc', item.get('pchs_avg_pric', '0')), item.get('prpr', '0')
-                        name = kr_name_dict.get(code) or get_kr_company_name(code) or code
-                        rows_data.append(self._process_row_data("🇰🇷 국장", name, str(qty_num), price, "KR", code, current_p))
-            elif kis_equities_weekend_suppress_window_kst():
-                try:
-                    st_row = load_state(STATE_PATH)
-                    pos_row = st_row.get("positions") or {}
-                    for inf in get_held_stocks_kr_info():
-                        code = str(inf.get("code") or "").strip()
-                        if not code:
-                            continue
-                        name = inf.get("name") or code
-                        qty_num = max(1, int(_safe_num(inf.get("qty"), 1)))
-                        bp = _safe_num(pos_row.get(code, {}).get("buy_p"), 0.0)
-                        rows_data.append(
-                            self._process_row_data(
-                                "🇰🇷 국장",
-                                name,
-                                str(qty_num),
-                                bp,
-                                "KR",
-                                code,
-                                None,
-                            )
-                        )
-                except Exception as e:
-                    print(f"⚠️ 국장(주말 스냅샷) 테이블 행 구성 실패: {e}")
-
-            # 미장 파싱 (야후 통신 포함)
-            try:
-                us_data = get_held_stocks_us_detail()
-                for item in us_data:
-                    code, qty, avg_price, current_p = item['code'], item['qty'], item['avg_p'], item.get('current_p', 0.0)
-                    name = us_name_dict.get(code, code)
-                    rows_data.append(self._process_row_data("🇺🇸 미장", name, str(qty), f"${avg_price:,.2f}", "US", code, current_p))
-            except Exception as e: print(f"미장 잔고 파싱 에러: {e}")
-
-            # 코인 파싱 (업비트 통신 포함)
-            for coin in upbit_bals:
-                if coin.get('currency') != "KRW" and _safe_num(coin.get('balance'), 0.0) > 0.00000001:
-                    code, qty, price = f"KRW-{coin['currency']}", str(_safe_num(coin.get('balance'), 0.0)), str(_safe_num(coin.get('avg_buy_price', 0), 0.0))
-                    rows_data.append(self._process_row_data("🪙 코인", coin['currency'], qty, price, "COIN", code, None))
+            # 5. 테이블 행 데이터 수집 및 현재가 실시간 통신 (어댑터 모듈)
+            rows_data = build_rows_data(
+                kr_bal=kr_bal,
+                upbit_bals=upbit_bals,
+                is_market_open=run_bot.is_market_open,
+                is_weekend_suppress=kis_equities_weekend_suppress_window_kst,
+                load_state=load_state,
+                state_path=STATE_PATH,
+                get_held_stocks_kr_info=get_held_stocks_kr_info,
+                get_held_stocks_us_info=get_held_stocks_us_info,
+                get_held_stocks_us_detail=get_held_stocks_us_detail,
+                kr_name_dict=kr_name_dict,
+                us_name_dict=us_name_dict,
+                get_kr_company_name=get_kr_company_name,
+                safe_num=_safe_num,
+                process_row_data=self._process_row_data,
+            )
 
             self.update_table.emit(rows_data)
 
@@ -406,23 +324,8 @@ class BalanceUpdaterThread(QThread):
         current_price, roi = buy_p, 0.0
 
         try:
-            if market == "🇰🇷 국장":
-                current_price = _safe_num(current_p_api, buy_p) if current_p_api else buy_p
-            elif market == "🇺🇸 미장":
-                if current_p_api and float(current_p_api) > 0:
-                    current_price = float(current_p_api)
-                else:
-                    import yfinance as yf
-                    try:
-                        t_info = yf.Ticker(ticker_code)
-                        current_price = t_info.fast_info.last_price or t_info.info.get('currentPrice') or float(t_info.history(period='1d')['Close'].iloc[-1])
-                    except:
-                        from strategy.rules import get_ohlcv_yfinance
-                        ohlcv = get_ohlcv_yfinance(ticker_code)
-                        current_price = float(ohlcv[-1]['c']) if ohlcv else buy_p
-            elif market == "🪙 코인":
-                import pyupbit
-                current_price = pyupbit.get_current_price(ticker_code) or buy_p
+            m = "KR" if market_code == "KR" else ("US" if market_code == "US" else "COIN")
+            current_price = run_bot.resolve_display_current_price(m, ticker_code, buy_p, current_p_api)
 
             if current_price > 0 and self.dashboard:
                 self.dashboard.update_max_price_if_higher(ticker_code, current_price)
@@ -482,6 +385,8 @@ class BotDashboard(QMainWindow):
         self._align_trade_timer.setSingleShot(True)
         self._align_trade_timer.timeout.connect(self._aligned_trade_tick)
         self._trade_worker_busy = False
+        self._refresh_inflight = False
+        self._refresh_done_callbacks = []
 
         self._net_fail_count = 0
         self._net_watch_timer = QTimer(self)
@@ -500,8 +405,8 @@ class BotDashboard(QMainWindow):
             print(f"  ⚠️ 브로커 초기화 중 오류: {e}")
             traceback.print_exc()
         
-        # 1초 뒤 매매 사이클에서 점검을 하므로, 시작 시점의 장부 점검은 생략합니다.
-        self.refresh_balance(sync_first=False)
+        # 시작 직후 중복 API를 줄이기 위해 즉시 잔고 갱신은 생략하고,
+        # 1초 후 첫 매매 직전 갱신에서 화면/장부를 함께 맞춥니다.
         # heartbeat는 API 다발이라 메인 스레드에서 돌리지 않음 — 기동 직후 1회 + 이후 KST :00 / :30 정렬
         QTimer.singleShot(0, self.send_heartbeat)
 
@@ -622,6 +527,11 @@ class BotDashboard(QMainWindow):
         btn_refresh.setMinimumHeight(44)
         btn_refresh.clicked.connect(self.refresh_balance)
         top_layout.addWidget(btn_refresh)
+        btn_force_refresh = QPushButton("🏦 KIS 강제 새로고침")
+        btn_force_refresh.setMinimumHeight(44)
+        btn_force_refresh.setStyleSheet("background-color: #34495e; color: white; font-weight: bold;")
+        btn_force_refresh.clicked.connect(self.force_refresh_kis)
+        top_layout.addWidget(btn_force_refresh)
         layout.addLayout(top_layout)
         
         # 👇👇👇 [여기 빈 공간에 복붙해라] 👇👇👇
@@ -718,7 +628,7 @@ class BotDashboard(QMainWindow):
         capital_layout = QVBoxLayout(capital_tab)
         capital_help = QLabel(
             "<b>고점 보정 (수동 입·출금)</b><br>"
-            "예수금만 입금/출금하면 Phase5 합산 고점(<code>peak_equity_total_krw</code>)과 실총액이 어긋날 수 있습니다.<br>"
+            "예수금만 입금/출금하면 Phase5 주차 고점(<code>peak_total_equity</code>, 미러 <code>peak_equity_total_krw</code>)과 실총액이 어긋날 수 있습니다.<br>"
             "실행 시 CLI와 같이 <b>실계좌 스냅샷 갱신</b> 후 고점을 가산/감산하고 <code>capital_adjustments</code>에 기록합니다.<br>"
             "<span style='color:#c0392b'>주말 KIS 점검 구간에는 국·미 스냅샷이 제한될 수 있습니다.</span>"
         )
@@ -1000,7 +910,6 @@ class BotDashboard(QMainWindow):
 
     def _on_trade_worker_finished(self):
         self._trade_worker_busy = False
-        self.refresh_balance(sync_first=False)
 
     def do_trade(self):
         if self._trade_worker_busy:
@@ -1009,22 +918,32 @@ class BotDashboard(QMainWindow):
         self._trade_worker_busy = True
         try:
             print("\n▶️ [시스템] 봇 출동 전, 실시간 최고가(max_p) 사전 갱신 중...")
-            # 1. 👉 [순서 변경] 봇이 돌기 전에 GUI가 먼저 현재가를 긁어와서 최고가(max_p)를 장부에 적어둡니다!
-            self.refresh_balance(sync_first=False)
-            print("\n▶️ [시스템] 최신 최고가가 반영된 장부를 들고 사냥꾼 출동!")
-            self.worker = WorkerThread()
-            self.worker.finished.connect(self._on_trade_worker_finished)
-            self.worker.start()
+            # 매매는 갱신 완료 후 시작해 max_p 반영 정확도를 높입니다.
+            def _launch_trade_worker():
+                print("\n▶️ [시스템] 최신 최고가가 반영된 장부를 들고 사냥꾼 출동!")
+                self.worker = WorkerThread()
+                self.worker.finished.connect(self._on_trade_worker_finished)
+                self.worker.start()
+            self.refresh_balance(sync_first=False, on_finished=_launch_trade_worker)
         except Exception:
             self._trade_worker_busy = False
             raise
 
-    def refresh_balance(self, sync_first=True):
+    def force_refresh_kis(self):
+        """장외/쿨다운 중에도 KIS를 1회 강제 조회."""
+        self.refresh_balance(sync_first=False, force_kis=True)
+
+    def refresh_balance(self, sync_first=True, force_kis=False, on_finished=None):
         """비동기 스레드를 가동하여 화면 멈춤 없이 잔고를 갱신합니다."""
+        if on_finished is not None and callable(on_finished):
+            self._refresh_done_callbacks.append(on_finished)
+        if self._refresh_inflight:
+            return
+        self._refresh_inflight = True
         print("🔄 예수금 및 보유종목 데이터를 갱신합니다... (GUI 백그라운드 처리)")
         
         # 일꾼 고용 및 데이터 받을 창구 연결
-        self.updater_thread = BalanceUpdaterThread(sync_first=sync_first, dashboard=self)
+        self.updater_thread = BalanceUpdaterThread(sync_first=sync_first, dashboard=self, force_kis=force_kis)
         self.updater_thread.update_labels.connect(self._apply_labels_ui)
         self.updater_thread.update_table.connect(self._apply_table_ui)
         
@@ -1087,9 +1006,17 @@ class BotDashboard(QMainWindow):
             self.table.setCellWidget(row, 6, sell_btn)
 
     def _on_refresh_finished(self):
+        self._refresh_inflight = False
         self.refresh_trade_history()
         self.refresh_ledger()
         print("✅ 모든 계좌 정보 및 화면 표시가 최신 상태로 업데이트되었습니다.")
+        callbacks = self._refresh_done_callbacks[:]
+        self._refresh_done_callbacks.clear()
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception as e:
+                print(f"⚠️ 후속 작업 실행 오류: {e}")
 
     
     def update_max_price_if_higher(self, ticker, current_p):

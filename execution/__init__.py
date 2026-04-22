@@ -11,16 +11,19 @@
 - ``execution.circuit_break`` : 합산 자산 고점 대비 드로다운 판정(킬스위치 보조).
 """
 from execution.guard import (
-    load_state,
-    save_state,
-    in_cooldown,
-    set_cooldown,
+    apply_phase5_trailing_week_and_cooldown,
     can_open_new,
     check_mdd_break,
-    in_account_circuit_cooldown,
-    set_account_circuit_cooldown,
-    update_peak_equity_total_krw,
     get_peak_equity_total_krw,
+    get_phase5_peak_total_equity,
+    in_account_circuit_cooldown,
+    in_cooldown,
+    load_state,
+    save_state,
+    set_account_circuit_cooldown,
+    set_cooldown,
+    update_peak_equity_total_krw,
+    week_label_seoul,
 )
 from execution.sync_positions import sync_all_positions
 from execution.circuit_break import drawdown_from_peak_pct, evaluate_total_account_circuit, estimate_usdkrw
@@ -41,6 +44,9 @@ __all__ = [
     "check_mdd_break",
     "in_account_circuit_cooldown",
     "set_account_circuit_cooldown",
+    "apply_phase5_trailing_week_and_cooldown",
+    "get_phase5_peak_total_equity",
+    "week_label_seoul",
     "update_peak_equity_total_krw",
     "get_peak_equity_total_krw",
     "sync_all_positions",

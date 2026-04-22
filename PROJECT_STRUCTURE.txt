@@ -1,5 +1,5 @@
-﻿프로젝트 구조/파일 설명 (2026-04-19 기준)
-  — positions.qty, adjust_capital, circuit_aux, 텔레그램 보유시간 반영
+﻿프로젝트 구조/파일 설명 (2026-04-22 기준)
+  — 모듈화 1~5 + 고도화 1번 + 관측성 + Phase5 월요일 주차 합산 MDD(peak_total_equity 등)
 =====================================
 
 일반 운영: run_bot.bat 또는 py -3.11 run_gui.py 로 GUI만 사용하면 됨.
@@ -13,21 +13,32 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
     strategy/* + execution/* + api/* 모듈을 오케스트레이션.
   - 핵심 루프: run_trading_bot() (동기화 → 매도/리스크 → 신규매수).
   - last_kis_display_snapshot 저장/로드(save_last / load_last_…), 주말 KIS 스킵 시 GUI·텔레 국·미 숫자에 사용.
-  - Phase5 보조: circuit_aux_last_kr_krw / circuit_aux_last_usd_total / circuit_aux_last_coin_krw 갱신.
+  - services/account_snapshot.py 공용 함수로 heartbeat/GUI 조회 규칙을 일원화(현재가·라벨 스냅샷).
+  - run_trading_bot 앞단은 _prepare_cycle_state/_sync_positions_for_cycle/_build_market_context로 분리.
+  - 고도화 1번 반영: run_trading_bot 본문 2차 분리(저위험 helper 추출 중심) 완료.
+    보유시간 계산/로그, GUI 현재가 override, 수익률/하드스탑/타임스탑 조건, 코인 전처리 반복 블록 공용화.
+  - 관측성: 국·미·코인 매수에서 예산/예수/정수주0/TWAP 미체결/BEAR·ADX 스킵 시 [KR|US|COIN …] 태그 로그.
+  - 참고: KR/US/COIN 시장별 루프 통함수(_run_kr_cycle/_run_us_cycle/_run_coin_cycle) 3차 분리는 미적용(선택 과제).
+  - Phase5: circuit_aux_last_* 갱신 + guard.apply_phase5_trailing_week_and_cooldown
+    (월요일 서울 기준 주차 last_reset_week·peak_total_equity 앵커, 쿨다운 만료 후 고점 영점 리셋, 레거시 peak_equity_total_krw 미러).
     refresh_circuit_aux_from_brokers(state, path) — 브로커·업비트만으로 동일 키 재기록(adjust_capital.py 등).
   - heartbeat_report 생존신고·보유종목 줄·수동 매도 텔레: 장부 buy_time/buy_date 기준 보유 기간 접미사.
 
 - adjust_capital.py
-  - 수동 입·출금 시 peak_equity_total_krw(합산 고점) 보정. 실행 시 refresh_circuit_aux_from_brokers 선행.
+  - 수동 입·출금 시 peak_total_equity(및 peak_equity_total_krw 미러) 보정. 실행 시 refresh_circuit_aux_from_brokers 선행.
   - capital_adjustments 이력 append, bot_state.json 저장. config.json 필요.
 
 - run_gui.py
   - PyQt5 기반 운영 GUI.
   - run_bot 모듈을 import해서 엔진/잔고/수동매도/로그를 UI로 제어.
   - 고점 보정(입출금) 탭: adjust_capital.py와 동일 로직으로 circuit_aux_* 갱신 후
-    peak_equity_total_krw 가감 및 capital_adjustments 기록.
+    peak_total_equity 가감 및 capital_adjustments 기록(peak_equity_total_krw 동기).
   - KIS 잔고 조회 안정화: OPSQ0008/MCI 응답 시 백오프 재시도, 장외 스냅샷 우선,
     kr_bal/us_bal 기본 초기화로 UnboundLocalError 방지.
+  - 자동 KIS 조회 최소 간격(약 25초) 보호 + 장외 추정치 유지, 필요 시 KIS 강제 새로고침 버튼으로 1회 호출.
+  - 버튼 차이: "예수금 새로고침"은 일반 정책(장중/쿨다운) 준수, "KIS 강제 새로고침"은 정책을 우회해 KIS 1회 강제 호출.
+  - BalanceUpdaterThread는 공용 build_account_snapshot_for_report를 호출하고,
+    GUI 정책(allow_kis_fetch/with_backoff)을 콜백으로 주입해 기존 동작(백오프/장외 스냅샷/강제조회)을 유지.
   - 매매는 KST 분기(:00/:15/:30/:45); 텔레그램 생존보고는 기동 즉시 1회 후 KST :00/:30 정렬.
   - KIS 주말 점검 창: 국·미 잔고 API 미호출, last_kis_display_snapshot·장부로 표시.
     보유수량은 positions[티커].qty(평일 동기화/매수 시 기록), 없으면 표시 1 폴백.
@@ -51,7 +62,8 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
   - 장부/상태 파일.
   - positions — 티커별 buy_p, sl_p, tier, qty 등. qty는 평일 sync_positions·매수 체결 시 갱신(주말 GUI 수량 표시).
   - cooldown(단기), ticker_cooldowns(매도 후 재진입 쿨다운 ISO 시각), stats.
-  - Phase5: peak_equity_total_krw, account_circuit_cooldown_until,
+  - Phase5: peak_total_equity, last_reset_week(예 2026-W16), account_circuit_peak_reset_pending,
+    account_circuit_cooldown_until, peak_equity_total_krw(미러),
     circuit_aux_last_kr_krw, circuit_aux_last_usd_total(미장 USD 합산), circuit_aux_last_coin_krw.
   - capital_adjustments — adjust_capital.py 입출금·고점 보정 로그(선택).
   - last_kis_display_snapshot — 국·미 예수·총평·수익률 직전 성공값(saved_at 포함). 주말 GUI/텔레 표시용.
@@ -71,6 +83,7 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
   - kis_api.py: 한국투자 토큰/브로커/잔고/주문.
   - upbit_api.py: 업비트 잔고/주문.
   - macro_data.py: VIX, Fear&Greed 원시 지표 수집.
+  - kis_parsers.py: KIS output2(list/dict) 혼합 파싱 공통 함수(예수금/총평가/외화예수금 fallback/수량 추출).
 
 - strategy/
   - 매수/매도 판단 로직(규칙·필터).
@@ -83,7 +96,7 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
 
 - execution/
   - 실행/리스크/동기화 유틸.
-  - guard.py: 장부 I/O, cooldown / ticker_cooldowns, MDD, 합산 서킷, can_open_new(시장별 슬롯, 코어 예외 없음);
+  - guard.py: 장부 I/O, cooldown / ticker_cooldowns, MDD, 합산 서킷(월요일 주차 MDD·쿨다운 후 고점 리셋), can_open_new(시장별 슬롯, 코어 예외 없음);
     load_state 시 positions.scale_out_done 기본값 보강; 매도 사유별 ticker_cooldowns 설정·조회;
     기본 장부에 last_kis_display_snapshot 키 병합.
   - sync_positions.py: 실계좌↔장부 자동복구/유령정리/평단보정·보유수량(qty) 동기화(평일 API).
@@ -92,6 +105,15 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
   - scale_out.py: V8.0 동적 50% 분할 익절(Scale-Out) — entry_atr*3.0 목표(부재 시 +30% fallback),
     조건·수량·최소명목·장부 보정·TWAP 연동 헬퍼.
   - circuit_break.py: 합산 자산 drawdown 판정 유틸.
+
+- services/
+  - account_read_facade.py: KR/US 보유 조회 및 detail/info 공통화(장외/실패 폴백 포함).
+    주말·점검·output1 비어 있음·예외 시 장부 폴백 전에 ⚠️/📌 로그(빈 반환만 하지 않음).
+  - account_snapshot.py: GUI/heartbeat 공용 계좌 스냅샷/현재가 해석 서비스.
+    - resolve_display_current_price: KR(API 우선), US(API→yfinance→OHLCV), COIN(pyupbit) 규칙 통일.
+    - build_account_snapshot_for_report: KR/US/COIN 라벨 + holdings + 원본 balances를 한 번에 구성.
+      주말·allow_kis_fetch 생략·KR/US 조회 예외·스냅샷 저장 실패 시 snapshot 태그 로그·직전 라벨 폴백.
+  - gui_table_adapter.py: GUI 실시간 현황 테이블 행 조립 분리.
 
 - utils/
   - 공통 보조 모듈.
@@ -103,6 +125,7 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
 
 - tests/
   - test_lab.py: Phase 샌드박스/실험 스크립트.
+  - test_kis_parsers.py: KIS 파서 최소 회귀 테스트.
 
 
 3) 현재 핵심 공통 상수/정책
@@ -112,7 +135,7 @@ Phase 1~5 (코드·로그 용어, tests/test_lab.py 샌드박스와 대응)
   - Phase 2: TWAP 분할 — execution/order_twap.py, execution/scale_out.py, run_bot 매수·분할익절 매도 경로
   - Phase 3: AI 휩쏘 필터 — strategy/ai_filter.py
   - Phase 4: 거시 방어막(VIX·FGI 등) — strategy/macro_guard.py, api/macro_data.py
-  - Phase 5: 합산 계좌 서킷 — execution/circuit_break.py, execution/guard.py,
+  - Phase 5: 합산 계좌 서킷(월요일 주차 트레일링 고점) — execution/circuit_break.py, execution/guard.py,
     run_bot(refresh_circuit_aux_from_brokers, circuit_aux_*), 루트 adjust_capital.py(고점 수동 보정)
   - 매도 후 재진입: ticker_cooldowns (guard.py, Phase 번호 없음)
 
@@ -147,7 +170,7 @@ Phase 1~5 (코드·로그 용어, tests/test_lab.py 샌드박스와 대응)
   증권사 주말 점검(KIS): helpers.kis_equities_weekend_suppress_window_kst 참고 — 코인(업비트)만 실시간.
   국·미 예수·총평 등은 last_kis_display_snapshot(평일 마지막 성공 조회). 보유종목 수량은 positions.qty.
   업비트 매수: 가용 KRW×0.999 캡·최소 5000원(run_bot 상수).
-  Phase5 합산 MDD: peak_equity_total_krw + circuit_aux_* (원화 합산 시 환율 estimate_usdkrw).
+  Phase5 합산 MDD: peak_total_equity + last_reset_week + circuit_aux_* (원화 합산 시 환율 estimate_usdkrw).
   수동 입출금 고점 보정: py -3.11 adjust_capital.py (config.json 필요).
 
 

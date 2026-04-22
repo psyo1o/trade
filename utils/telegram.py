@@ -10,6 +10,7 @@
 ``parse_mode`` 는 ``Markdown`` 이므로 메시지 본문에서 해당 문법에 맞춘다.
 """
 import atexit
+import time
 import traceback
 from datetime import datetime
 
@@ -25,17 +26,61 @@ def configure_telegram(config: dict, bot_source_label: str = "run_bot.py"):
     _bot_source_label = bot_source_label
 
 
-def send_telegram(message):
-    """``configure_telegram`` 가 선행되지 않았으면 조용히 로그만 남기고 반환."""
+def send_telegram(message: str) -> bool:
+    """Telegram Bot API 로 전송. 성공 시 ``True``.
+
+    - 본문은 **JSON POST** 로 보냄(URL 쿼리로 긴 생존신고를 실을 때 생기는 불안정 완화).
+    - 연결·읽기 타임아웃·일시 장애는 지수 백오프 재시도.
+    """
     if not _config:
         print("⚠️ 텔레그램: config 미설정 (configure_telegram 호출 필요)")
-        return
-    url = f"https://api.telegram.org/bot{_config['telegram_token']}/sendMessage"
-    params = {"chat_id": _config['telegram_chat_id'], "text": message, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, params=params, timeout=10)
-    except Exception as e:
-        print(f"⚠️ 텔레그램 전송 실패: {e}")
+        return False
+
+    api_url = f"https://api.telegram.org/bot{_config['telegram_token']}/sendMessage"
+    payload = {
+        "chat_id": _config["telegram_chat_id"],
+        "text": message,
+        "parse_mode": "Markdown",
+    }
+
+    max_attempts = 4
+    last_err: Exception | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.post(api_url, json=payload, timeout=(15, 45))
+            if resp.status_code == 429:
+                try:
+                    ra = int(resp.json().get("parameters", {}).get("retry_after", 3))
+                except Exception:
+                    ra = 3
+                print(f"⚠️ 텔레그램 rate limit — {min(ra, 60)}초 후 재시도 ({attempt + 1}/{max_attempts})")
+                time.sleep(min(ra, 60))
+                continue
+
+            try:
+                data = resp.json()
+            except Exception:
+                last_err = RuntimeError(f"HTTP {resp.status_code}, 본문 JSON 아님: {resp.text[:200]}")
+                time.sleep(min(2**attempt, 30))
+                continue
+
+            if resp.status_code == 200 and data.get("ok"):
+                return True
+
+            desc = data.get("description", resp.text[:300])
+            last_err = RuntimeError(f"Telegram API: {desc}")
+            # 잘못된 요청은 재시도해도 동일할 수 있으나 일시 오류 구분이 어려워 1~2회만 백오프
+            time.sleep(min(2**attempt, 20))
+
+        except requests.RequestException as e:
+            last_err = e
+            wait = min(2**attempt, 30)
+            print(f"⚠️ 텔레그램 전송 재시도 ({attempt + 1}/{max_attempts}) … {type(e).__name__}: {e}")
+            time.sleep(wait)
+
+    print(f"⚠️ 텔레그램 전송 실패(최종): {last_err}")
+    return False
 
 
 def shutdown_handler():

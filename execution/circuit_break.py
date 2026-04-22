@@ -39,9 +39,9 @@ def evaluate_total_account_circuit(
     trigger_drawdown_pct: float = 15.0,
 ) -> Dict[str, Any]:
     """
-    고점 대비 자산이 `trigger_drawdown_pct`% 이상 감소하면 발동.
+    주차 트레일링 고점 대비 자산이 ``trigger_drawdown_pct``% 이상 감소하면 발동.
 
-    예: 15% → current < peak * 0.85 이면 triggered.
+    조건: ``(peak - current) / peak * 100 >= thr`` (peak>0). 예: 15% → current < peak * 0.85.
     """
     peak = float(peak_equity)
     cur = float(current_equity)
