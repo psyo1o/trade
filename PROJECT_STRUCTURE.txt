@@ -1,4 +1,4 @@
-﻿프로젝트 구조/파일 설명 (2026-04-22 기준)
+프로젝트 구조/파일 설명 (2026-04-22 기준)
   — 모듈화 1~5 + 고도화 1번 + 관측성 + Phase5 월요일 주차 합산 MDD(peak_total_equity 등)
 =====================================
 
@@ -60,7 +60,9 @@ run_bot.py 단독(헤드리스)은 선택 경로(콘솔·서버용).
 
 - bot_state.json
   - 장부/상태 파일.
-  - positions — 티커별 buy_p, sl_p, tier, qty 등. qty는 평일 sync_positions·매수 체결 시 갱신(주말 GUI 수량 표시).
+  - positions — 티커별 buy_p, sl_p, tier, qty, strategy_type, entry_fib_level 등.
+    qty는 평일 sync_positions·매수 체결 시 갱신(주말 GUI 수량 표시).
+    strategy_type은 TREND_V8/SWING_FIB 매도 분기, entry_fib_level은 스윙 하드스탑 기준.
   - cooldown(단기), ticker_cooldowns(매도 후 재진입 쿨다운 ISO 시각), stats.
   - Phase5: peak_total_equity, last_reset_week(예 2026-W16), account_circuit_peak_reset_pending,
     account_circuit_cooldown_until, peak_equity_total_krw(미러),
@@ -149,6 +151,10 @@ Phase 1~5 (코드·로그 용어, tests/test_lab.py 샌드박스와 대응)
   - 검증 실패 시 경고 로그 + None(봇 중단 없음), 매도 엔진은 fallback 값으로 안전 동작.
   - 샹들리에: max_price - current_atr*2.5 (부재 시 현재가*2% fallback).
   - 초기 하드스탑 듀얼: ma20-ATR*1.0 vs 현재가-ATR*2.0 (ATR 부재 시 -10% fallback).
+- 멀티 전략(최소 통합): run_bot 진입은 V8 우선, 미충족 시 check_swing_entry 보조 평가.
+  - 스윙 체결 장부: strategy_type="SWING_FIB", entry_fib_level 저장.
+  - 스윙 포지션 매도: check_swing_exit 전용(FULL/HALF/HOLD)으로 처리하고 V8 매도 경로는 타지 않음.
+  - 비스윙 포지션은 기존 V8 매도 루프(분할익절/타임스탑/하드스탑/샹들리에) 유지.
 - 코인 먼지 수량 기준: utils/helpers.py
   - COIN_MIN_POSITION_QTY (= 0.0001)
   - coin_qty_counts_for_position(qty)로 실질 보유 여부 통일 판정.

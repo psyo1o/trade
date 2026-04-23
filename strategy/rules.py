@@ -251,10 +251,11 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
 
     progress = f"[{idx}/{total}]" if total > 0 else ""
     display_name = f"{name}({ticker})" if name and name != ticker else ticker
+    _v8 = "[V8] "
 
     # 🚨 신규 상장 코인/주식 타격용 (30일 최소)
     if not ohlcv or len(ohlcv) < 30:
-        print(f"   🔍 {progress} {display_name} ❌ 패스: 데이터 부족 (30일 미만)")
+        print(f"   🔍 {_v8}{progress} {display_name} ❌ 패스: 데이터 부족 (30일 미만)")
         return False, 0.0, "데이터 부족"
 
     df = pd.DataFrame(ohlcv)
@@ -295,24 +296,24 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
 
     # 🛡️ 퀀트 필터 1: 양봉 캔들 필터 (음봉 절대 매수 금지)
     if curr_p <= today['o']:
-        print(f"   🔍 {progress} {display_name} ❌ 패스: 당일 음봉 (시가 이탈)")
+        print(f"   🔍 {_v8}{progress} {display_name} ❌ 패스: 당일 음봉 (시가 이탈)")
         return False, 0.0, "당일 음봉"
 
     # 🛡️ 퀀트 필터 2: 동적 윗꼬리 제한 (종목별 일평균 변동폭 ATR의 50% 초과 시 상투로 간주)
     upper_tail_len = today['h'] - curr_p
     upper_tail_ratio = (upper_tail_len / today_atr) if today_atr > 0 else 0
     if upper_tail_len > (today_atr * 0.5):
-        print(f"   🔍 {progress} {display_name} ❌ 패스: 악성 윗꼬리 발생 (ATR 대비 50% 초과)")
+        print(f"   🔍 {_v8}{progress} {display_name} ❌ 패스: 악성 윗꼬리 발생 (ATR 대비 50% 초과)")
         return False, 0.0, "동적 윗꼬리 과다"
 
     # 🛡️ 퀀트 필터 3: 동적 이격도 과열 (20일선 기준 ATR의 3배 이상 폭등 시 추격 금지)
     if pd.notna(today['ma20']) and curr_p > (today['ma20'] + (today_atr * 3.0)):
-        print(f"   🔍 {progress} {display_name} ❌ 패스: 단기 과열 (20일선 + 3ATR 초과)")
+        print(f"   🔍 {_v8}{progress} {display_name} ❌ 패스: 단기 과열 (20일선 + 3ATR 초과)")
         return False, 0.0, "동적 이격도 과열"
     
     # 체크 1: 20일선 우상향 지지
     if pd.isna(today['ma20']) or curr_p < today['ma20'] or today['ma20'] <= yesterday['ma20']:
-        print(f"   🔍 {progress} {display_name} ❌ 패스: 20일선 하락 또는 이탈")
+        print(f"   🔍 {_v8}{progress} {display_name} ❌ 패스: 20일선 하락 또는 이탈")
         return False, 0.0, "20일선 하락/이탈"
 
     # 체크 2: 장기 추세 필터 (국·미·코인 동일 적용)
@@ -323,7 +324,7 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
         is_golden_trend = bool(curr_p > today["ma50"])
 
     if not is_golden_trend:
-        print(f"   🔍 {progress} {display_name} ❌ 패스: 장기 상승 추세 아님 (역배열 방어막 작동)")
+        print(f"   🔍 {_v8}{progress} {display_name} ❌ 패스: 장기 상승 추세 아님 (역배열 방어막 작동)")
         return False, 0.0, "장기추세 미달"
 
     # 체크 3: 3중 스나이퍼 교차 검증 (수급 + MACD + RSI)
@@ -347,8 +348,8 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
         # 둘 중 '더 높은 가격(손실이 적은 가격)'을 최종 손절선으로 채택!
         stop_loss_price = max(calculated_sl, absolute_sl)
         
-        print(f"   🔥 {progress} {display_name} 🎯 3중 교차검증+상투방지 완료! [{strategy_name}]")
-        print(f"      └ 세부지표: RSI({today['rsi']:.1f}), 윗꼬리({upper_tail_ratio*100:.1f}%), 이격도 적합")
+        print(f"   🔥 {_v8}{progress} {display_name} 🎯 3중 교차검증+상투방지 완료! [{strategy_name}]")
+        print(f"      └ {_v8}세부지표: RSI({today['rsi']:.1f}), 윗꼬리({upper_tail_ratio*100:.1f}%), 이격도 적합")
         return True, stop_loss_price, strategy_name
     else:
         # 🗣️ 왜 패스했는지 속 시원하게 다 불어라!
@@ -357,7 +358,7 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
         if not is_macd_bullish: reason_str.append("MACD데드")
         if not is_rsi_healthy: reason_str.append(f"RSI이탈({today['rsi']:.1f})")
         
-        print(f"   🔍 {progress} {display_name} ❌ 패스: 보조지표 미달 ({', '.join(reason_str)})")
+        print(f"   🔍 {_v8}{progress} {display_name} ❌ 패스: 보조지표 미달 ({', '.join(reason_str)})")
 
     return False, 0.0, "보조지표 교차검증 미달"
 
@@ -477,3 +478,149 @@ def check_pro_exit(ticker, curr_p, pos_info, ohlcv):
         return True, reason
         
     return False, ""
+
+
+def _normalize_ohlcv_df(df: pd.DataFrame) -> pd.DataFrame:
+    """스윙 전용 계산용 컬럼 표준화(OHLCV 소문자)."""
+    out = df.copy()
+    lower_map = {str(c).lower(): c for c in out.columns}
+    rename_map = {}
+    for k in ("o", "h", "l", "c", "v"):
+        if k in lower_map and lower_map[k] != k:
+            rename_map[lower_map[k]] = k
+    if rename_map:
+        out = out.rename(columns=rename_map)
+    return out
+
+
+def _calc_rsi14(close: pd.Series) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def check_swing_entry(df: pd.DataFrame) -> tuple[bool, float, str]:
+    """
+    스윙 매수 타점 판단.
+
+    Returns:
+        (진입여부, 지지받은 피보나치 레벨 가격, 실패 시 사유 문자열 — 성공 시 "")
+    """
+    if df is None or len(df) < 60:
+        return False, 0.0, "봉 부족(60 미만)"
+
+    w = _normalize_ohlcv_df(df)
+    need_cols = {"h", "l", "c"}
+    if not need_cols.issubset(set(w.columns)):
+        return False, 0.0, "OHLC 컬럼 부족"
+
+    w["ma60"] = w["c"].rolling(60).mean()
+    bb_mid = w["c"].rolling(20).mean()
+    bb_std = w["c"].rolling(20).std()
+    w["bb_lower"] = bb_mid - (bb_std * 2.0)
+    w["rsi14"] = _calc_rsi14(w["c"])
+
+    today = w.iloc[-1]
+    prev = w.iloc[-2]
+    close_today = float(today["c"])
+
+    cond1 = pd.notna(today["ma60"]) and close_today > float(today["ma60"])
+    cond2 = pd.notna(today["bb_lower"]) and close_today <= float(today["bb_lower"]) * 1.02
+    cond3 = (
+        pd.notna(prev["rsi14"])
+        and pd.notna(today["rsi14"])
+        and float(prev["rsi14"]) <= 50.0
+        and float(today["rsi14"]) > float(prev["rsi14"])
+    )
+
+    recent60 = w.iloc[-60:]
+    hi60 = float(recent60["h"].max())
+    lo60 = float(recent60["l"].min())
+    if not np.isfinite(hi60) or not np.isfinite(lo60) or hi60 <= lo60:
+        return False, 0.0, "60봉 고저 스팬 무효"
+    span = hi60 - lo60
+    fib_382 = hi60 - (span * 0.382)
+    fib_500 = hi60 - (span * 0.5)
+
+    near_382 = abs(close_today - fib_382) / fib_382 <= 0.02 if fib_382 > 0 else False
+    near_500 = abs(close_today - fib_500) / fib_500 <= 0.02 if fib_500 > 0 else False
+    cond4 = near_382 or near_500
+
+    if cond1 and cond2 and cond3 and cond4:
+        if near_382 and near_500:
+            chosen = fib_382 if abs(close_today - fib_382) <= abs(close_today - fib_500) else fib_500
+        else:
+            chosen = fib_382 if near_382 else fib_500
+        return True, float(chosen), ""
+
+    miss: list[str] = []
+    if not cond1:
+        miss.append("종가≤60MA")
+    if not cond2:
+        miss.append("볼밴하단×1.02 초과")
+    if not cond3:
+        miss.append("RSI14(전≤50·당>전) 미달")
+    if not cond4:
+        miss.append("피보0.382/0.5±2% 미근접")
+    return False, 0.0, " · ".join(miss) if miss else "조건 미충족"
+
+
+def check_swing_exit(pos_info: dict, df: pd.DataFrame) -> tuple[str, str]:
+    """
+    스윙 매도 타점 판단.
+
+    Returns:
+        ("FULL"|"HALF"|"HOLD", 사유)
+    """
+    if df is None or len(df) < 60:
+        return "HOLD", ""
+
+    w = _normalize_ohlcv_df(df)
+    need_cols = {"h", "l", "c"}
+    if not need_cols.issubset(set(w.columns)):
+        return "HOLD", ""
+
+    w["rsi14"] = _calc_rsi14(w["c"])
+    bb_mid = w["c"].rolling(20).mean()
+    bb_std = w["c"].rolling(20).std()
+    w["bb_upper"] = bb_mid + (bb_std * 2.0)
+
+    # 일목균형표 (9, 26, 52)
+    tenkan = (w["h"].rolling(9).max() + w["l"].rolling(9).min()) / 2.0
+    kijun = (w["h"].rolling(26).max() + w["l"].rolling(26).min()) / 2.0
+    w["senkou_a"] = ((tenkan + kijun) / 2.0).shift(26)
+    w["senkou_b"] = ((w["h"].rolling(52).max() + w["l"].rolling(52).min()) / 2.0).shift(26)
+
+    today = w.iloc[-1]
+    prev = w.iloc[-2]
+
+    entry_fib = float((pos_info or {}).get("entry_fib_level", 0.0) or 0.0)
+    scale_out = bool((pos_info or {}).get("scale_out_done", False))
+    close_today = float(today["c"])
+    high_today = float(today["h"])
+
+    # 1) 하드스탑
+    fib_break = entry_fib > 0 and close_today < entry_fib
+    cloud_floor = np.nan
+    if pd.notna(today["senkou_a"]) and pd.notna(today["senkou_b"]):
+        cloud_floor = min(float(today["senkou_a"]), float(today["senkou_b"]))
+    cloud_break = np.isfinite(cloud_floor) and close_today < float(cloud_floor)
+    if fib_break or cloud_break:
+        return "FULL", "스윙 하드스탑 이탈"
+
+    # 2) 볼밴 상단 1차 익절
+    if pd.notna(today["bb_upper"]) and high_today >= float(today["bb_upper"]) and not scale_out:
+        return "HALF", "볼밴 상단 1차 익절"
+
+    # 3) RSI 과매수 데드크로스
+    if (
+        pd.notna(prev["rsi14"])
+        and pd.notna(today["rsi14"])
+        and float(prev["rsi14"]) > 70.0
+        and float(today["rsi14"]) < 70.0
+    ):
+        return "FULL", "RSI 과매수 데드크로스"
+
+    return "HOLD", ""
