@@ -26,6 +26,8 @@ tests/ai_keys*.txt
 *.pem
 
 # Runtime Data / State
+# 국장 스크리너 출력 — 매 실행·스캔마다 변하므로 저장소에 포함하지 않음
+kr_targets.json
 bot_state.json
 bot_state_backup_*.json
 trade_history.json
