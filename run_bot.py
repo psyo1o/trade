@@ -813,11 +813,15 @@ def save_last_kis_display_snapshot(
     us_cash: float,
     us_total: float,
     us_hold_roi,
+    *,
+    force: bool = False,
 ) -> None:
     """
     KIS 조회가 성공한 직후 호출 — 주말 창에서는 덮어쓰지 않음(직전 평일 값 유지).
+
+    ``force=True`` (GUI ``KIS 강제 새로고침`` 등) 이면 점검 창에서도 스냅샷을 갱신한다.
     """
-    if kis_equities_weekend_suppress_window_kst():
+    if kis_equities_weekend_suppress_window_kst() and not force:
         return
     st = load_state(STATE_PATH)
     st["last_kis_display_snapshot"] = {
@@ -1933,6 +1937,71 @@ def _holding_duration_suffix(pos: dict) -> str:
     return f" | 보유 {d}" if d else ""
 
 
+def _holding_duration_clause(pos: dict) -> str:
+    """보유시간 표시 문구. SWING_FIB 포지션은 숨김."""
+    if not isinstance(pos, dict):
+        return ""
+    stype = str(pos.get("strategy_type", "") or "").upper()
+    if stype == "SWING_FIB":
+        return ""
+    try:
+        anchor = pos.get("buy_time")
+        if anchor is None:
+            anchor = pos.get("ts")
+        if anchor is None:
+            return ""
+        held_hours = max(0.0, (float(_time.time()) - float(anchor)) / 3600.0)
+        return f" 보유시간:{int(held_hours)}시간"
+    except Exception:
+        return ""
+
+
+def _fmt_price_for_heartbeat(market: str, price: float) -> str:
+    p = float(_to_float(price, 0.0))
+    if market == "US":
+        return f"${p:,.2f}"
+    if market == "COIN" and 0 < p < 100:
+        return f"{p:,.4f}원"
+    return f"{int(p):,}원"
+
+
+def _format_holding_line(
+    market: str,
+    ticker: str,
+    name: str,
+    buy_p: float,
+    curr_p: float,
+    roi: float,
+    pos: dict,
+    *,
+    source_tag: str = "",
+) -> str:
+    p = pos if isinstance(pos, dict) else {}
+    max_p = float(_to_float(p.get("max_p", 0), 0.0))
+    if max_p <= 0:
+        max_p = float(curr_p if float(curr_p) > 0 else buy_p)
+    sl_p = float(_to_float(p.get("sl_p", 0), 0.0))
+    sl_txt = _fmt_price_for_heartbeat(market, sl_p) if sl_p > 0 else "-"
+    buy_ref = float(_to_float(buy_p, 0.0))
+    if buy_ref > 0:
+        max_pct = (float(max_p) / buy_ref - 1.0) * 100.0
+        max_txt = f"{_fmt_price_for_heartbeat(market, max_p)}({max_pct:+.2f}%)"
+    else:
+        max_txt = _fmt_price_for_heartbeat(market, max_p)
+    if sl_p > 0 and buy_ref > 0:
+        sl_pct = (float(sl_p) / buy_ref - 1.0) * 100.0
+        sl_txt = f"{_fmt_price_for_heartbeat(market, sl_p)}({sl_pct:+.2f}%)"
+    dur_txt = _holding_duration_clause(p)
+    tag_txt = f" {source_tag}" if source_tag else ""
+    return (
+        f"  {ticker}({name}): "
+        f"매수가:{_fmt_price_for_heartbeat(market, buy_p)} "
+        f"현재가:{_fmt_price_for_heartbeat(market, curr_p)}({roi:+.2f}%) "
+        f"최고가:{max_txt} "
+        f"매도선:{sl_txt}{dur_txt}{tag_txt}"
+    )
+
+
 def resolve_display_current_price(market: str, ticker: str, buy_p: float, current_p_api=None) -> float:
     return _resolve_display_current_price(
         market,
@@ -1944,7 +2013,9 @@ def resolve_display_current_price(market: str, ticker: str, buy_p: float, curren
     )
 
 
-def build_account_snapshot_for_report(*, allow_kis_fetch=None, with_backoff=None) -> dict:
+def build_account_snapshot_for_report(
+    *, allow_kis_fetch=None, with_backoff=None, force_kis_labels: bool = False
+) -> dict:
     deps = {
         "get_real_weather": get_real_weather,
         "broker_kr": kis_api.broker_kr,
@@ -1970,7 +2041,28 @@ def build_account_snapshot_for_report(*, allow_kis_fetch=None, with_backoff=None
         deps=deps,
         allow_kis_fetch=allow_kis_fetch,
         with_backoff=with_backoff,
+        force_kis_labels=force_kis_labels,
     )
+
+
+def _telegram_sl_clause(market: str, curr_p: float, pos: dict) -> str:
+    """생존신고·보유 한 줄에 붙이는 매도선(sl_p) vs 현재가 여유(%p). 없으면 빈 문자열."""
+    if not isinstance(pos, dict):
+        return ""
+    sl = _to_float(pos.get("sl_p", 0), 0.0)
+    if sl <= 0 or curr_p <= 0:
+        return ""
+    try:
+        pct = (float(curr_p) / float(sl) - 1.0) * 100.0
+    except Exception:
+        return ""
+    if market == "KR":
+        return f" · 매도선 {int(sl):,}원 (vs {pct:+.1f}%p)"
+    if market == "US":
+        return f" · 매도선 ${sl:.2f} (vs {pct:+.1f}%p)"
+    if float(sl) < 100:
+        return f" · 매도선 {sl:,.4f}원 (vs {pct:+.1f}%p)"
+    return f" · 매도선 {int(sl):,}원 (vs {pct:+.1f}%p)"
 
 
 def get_kr_holdings_with_roi():
@@ -1994,9 +2086,17 @@ def get_kr_holdings_with_roi():
                     pass
                 roi = ((curr_p - buy_p) / buy_p) * 100
                 kr_name = get_kr_company_name(code)
-                suf = _holding_duration_suffix(pos)
                 holdings.append(
-                    f"  {code}({kr_name}): {int(curr_p):,}원 | {roi:+.2f}% (주말·yfinance){suf}"
+                    _format_holding_line(
+                        "KR",
+                        code,
+                        kr_name,
+                        float(buy_p),
+                        float(curr_p),
+                        float(roi),
+                        pos,
+                        source_tag="(주말·yfinance)",
+                    )
                 )
             return holdings
         bal = ensure_dict(get_balance_with_retry())
@@ -2021,8 +2121,17 @@ def get_kr_holdings_with_roi():
                 
             roi = ((curr_p - buy_p) / buy_p) * 100
             kr_name = get_kr_company_name(code)
-            suf = _holding_duration_suffix(pos)
-            holdings.append(f"  {code}({kr_name}): {int(curr_p):,}원 | {roi:+.2f}%{suf}")
+            holdings.append(
+                _format_holding_line(
+                    "KR",
+                    code,
+                    kr_name,
+                    float(buy_p),
+                    float(curr_p),
+                    float(roi),
+                    pos,
+                )
+            )
         
         return holdings
     except:
@@ -2038,22 +2147,36 @@ def get_us_holdings_with_roi():
             return []
         
         holdings = []
+        is_weekend = bool(kis_equities_weekend_suppress_window_kst())
         for item in us_data:
             ticker = normalize_ticker(item['code'])
             qty = item['qty']
-            buy_p = item['avg_p']
+            buy_p = _to_float(item.get('avg_p', 0), 0.0)
             
             if buy_p <= 0:
                 continue
             
             # 현재가: 공용 해석 함수
-            curr_p = resolve_display_current_price("US", ticker, buy_p, item.get("current_p"))
+            cp_api = _to_float(item.get("current_p", 0), 0.0)
+            # 주말 장부 폴백값(current=avg)일 때는 yfinance 종가로 보정해 ROI 0% 고정 방지
+            if is_weekend and cp_api > 0 and abs(cp_api - buy_p) < 1e-9:
+                cp_api = 0.0
+            curr_p = resolve_display_current_price("US", ticker, buy_p, cp_api if cp_api > 0 else None)
             
             roi = ((curr_p - buy_p) / buy_p) * 100
             us_name = get_us_company_name(ticker)
             pos_u = state.get("positions", {}).get(ticker, {})
-            suf = _holding_duration_suffix(pos_u if isinstance(pos_u, dict) else {})
-            holdings.append(f"  {ticker}({us_name}): ${curr_p:.2f} | {roi:+.2f}%{suf}")
+            holdings.append(
+                _format_holding_line(
+                    "US",
+                    ticker,
+                    us_name,
+                    float(buy_p),
+                    float(curr_p),
+                    float(roi),
+                    pos_u if isinstance(pos_u, dict) else {},
+                )
+            )
         
         return holdings
     except Exception as e:
@@ -2090,8 +2213,17 @@ def get_coin_holdings_with_roi():
 
             roi = ((curr_p - buy_p) / buy_p) * 100
             coin_name = get_coin_name(ticker)
-            suf = _holding_duration_suffix(pos)
-            holdings.append(f"  {ticker}({coin_name}): {curr_p:,.0f}원 | {roi:+.2f}%{suf}")
+            holdings.append(
+                _format_holding_line(
+                    "COIN",
+                    ticker,
+                    coin_name,
+                    float(buy_p),
+                    float(curr_p),
+                    float(roi),
+                    pos,
+                )
+            )
 
         return holdings
     except Exception as e:
