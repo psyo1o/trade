@@ -74,11 +74,13 @@ def build_account_snapshot_for_report(
     deps: dict,
     allow_kis_fetch: Callable[[str], bool] | None = None,
     with_backoff: Callable[[Callable[[], Any], str], Any] | None = None,
+    force_kis_labels: bool = False,
 ) -> dict:
     """heartbeat / GUI 상단 라벨·보유 테이블 입력용 스냅샷.
 
     흐름
         1. ``is_weekend_suppress`` 이면 API 없이 ``last_kis_display_snapshot`` 만 사용.
+           단, ``force_kis_labels=True`` (GUI KIS 강제 새로고침) 이면 억제를 무시하고 KIS 재조회.
         2. 평일이면 ``allow_kis_fetch`` 가 참인 시장만 KIS/브로커 재조회 후 스냅샷 갱신 시도.
         3. 코인은 항상 업비트 잔고로 라벨·metrics 계산.
 
@@ -101,7 +103,7 @@ def build_account_snapshot_for_report(
     us_total = 0.0
     us_roi = None
 
-    if deps["is_weekend_suppress"]():
+    if deps["is_weekend_suppress"]() and not force_kis_labels:
         kr_part = snap.get("kr") or {}
         us_part = snap.get("us") or {}
         print("  📌 [snapshot] 주말·점검 억제 — 국·미 라벨은 last_kis_display_snapshot 만 사용")
@@ -118,6 +120,9 @@ def build_account_snapshot_for_report(
         else:
             print("  ⚠️ [snapshot US] 주말 스냅샷에 total 없음 — 미장 라벨 0·ROI 없음")
     else:
+        if deps["is_weekend_suppress"]() and force_kis_labels:
+            print("  📌 [snapshot] force_kis_labels — 주말·점검 창에서도 KIS 국·미 라벨 재조회 후 스냅샷 저장 시도")
+
         kr_part = snap.get("kr") or {}
         us_part = snap.get("us") or {}
 
@@ -177,6 +182,7 @@ def build_account_snapshot_for_report(
                 float(us_cash),
                 float(us_total),
                 us_roi,
+                force=force_kis_labels,
             )
         except Exception as e:
             print(f"  ⚠️ [snapshot] last_kis_display_snapshot 저장 실패(라벨은 메모리 값 유지): {type(e).__name__}: {e}")

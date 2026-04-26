@@ -1,6 +1,6 @@
 # c-bot — 국·미·코인 자동매매 봇
 
-_문서 갱신: 2026-04-23 — 구조·용어·실행 순서 + **GUI(`run_gui.py`) 화면 설명** 을 처음 보는 분도 따라갈 수 있게 정리했습니다._
+_문서 갱신: 2026-04-26 — 타임스탑·TWAP 청산 설계, GUI/텔레그램 현재가 공통화 등 최근 운영 변경을 반영했습니다._
 
 ---
 
@@ -87,7 +87,7 @@ py -3.11 adjust_capital.py
 ### 매매·알림 시계 (GUI = 헤드리스와 같은 매매 리듬)
 
 - **매매 엔진:** 기동 직후 `do_trade()` 1회, 이후 KST **`:00` / `:15` / `:30` / `:45`** 분기마다 다음 사이클.
-- **텔레그램 생존신고(heartbeat):** 기동 직후 1회, 이후 KST **`:00` / `:30`** (매매 주기와 별도).
+- **텔레그램 생존신고(heartbeat):** 기동 직후 1회, 이후 KST **`:00` / `:30`** (매매 주기와 별도). 보유 한 줄은 **매수가·현재가(수익률)·최고가·매도선·보유기간** 형식이며, 주말 미장은 `normalize_us_current_p_api_for_display` 로 장부 폴백 시에도 **yfinance 종가**를 쓰도록 GUI와 동일 전처리를 맞춥니다.
 
 ---
 
@@ -253,8 +253,24 @@ flowchart TD
 
 ### 청산 (매도)
 
-- 장부 **`strategy_type`** 이 **`SWING_FIB`** 이면 **`check_swing_exit` 만** 사용합니다 (`FULL` / `HALF` / `HOLD`). 로그에는 **`[SWING-SELL]`** 가 붙습니다.
-- 그 외(`TREND_V8` 또는 예전 장부)는 **기존 V8 매도 루프**(분할 익절, 타임스탑, 하드스탑, 샹들리에 등)를 그대로 탑니다.
+- 장부 **`strategy_type`** 이 **`SWING_FIB`** 이면 먼저 **`check_swing_exit`** (`FULL` / `HALF` / `HOLD`)를 봅니다. **`HALF`·`FULL`** 이 나오면 스윙 규칙으로 부분·전량 매도 후 해당 사이클은 종료하고, **`HOLD`** 이면 그 아래 **분할 익절 → 타임스탑·하드스탑·샹들리에** 를 **같이** 탑니다 (스윙만 있다가 타임스탑에 걸리지 않도록 한 동작).
+- 그 외(`TREND_V8` 또는 예전 장부)는 **V8 매도 루프**(분할 익절 → 타임스탑 → 하드스탑 → 샹들리에 순)를 탑니다.
+
+#### 타임스탑 (보유 시간 `buy_date` 우선, 없으면 `buy_time`)
+
+| 전략·시장 | 보유 기준 | 수익률 검사 | 유예(타임스탑 무효) |
+|-----------|------------|-------------|---------------------|
+| V8 주식 (KR·US) | **7일**(168h) | **+4% 미만**이면 전량 | **≥ +4%** |
+| V8 코인 | **3일**(72h) | 동일 | **≥ +4%** |
+| SWING 주식 (KR·US) | **10일**(240h) | **+2% 미만**이면 전량 | **≥ +2%** |
+| SWING 코인 | **5일**(120h) | 동일 | **≥ +2%** |
+
+매도 **`reason`**·로그에는 **`[V8_TIME_STOP_KR]`**, **`[V8_TIME_STOP_US]`**, **`[V8_TIME_STOP_COIN]`**, **`[SWING_TIME_STOP_KR]`** 등 태그가 붙습니다. `execution/guard.py` 의 **`ticker_cooldowns`** 도 이 문자열을 인식해 타임스탑 계열 쿨다운을 적용합니다.
+
+#### TWAP(`twap_*`)과 전량 청산 (의도된 설계)
+
+- **`config.json`의 `twap_*`** 로 **나눠 치는 것**은 **매수 TWAP**와 **분할 익절(Scale-Out) 매도**에 붙습니다 (`execution/order_twap.py`, `execution/scale_out.py`, `run_bot.py` 연동).
+- **타임스탑·하드스탑·샹들리에로 나가는 전량 청산**은 시장가 **한 번에 전량 주문**(실패 시 재시도)입니다. 금액이 커도 이 경로에서는 **TWAP 분할을 쓰지 않습니다.**
 
 ---
 
@@ -265,7 +281,7 @@ flowchart TD
 | Phase | 역할 | 주요 위치 |
 |-------|------|-----------|
 | **1** | 같은 GICS **섹터** 과다 보유 방지 | `strategy/sector_lock.py` |
-| **2** | **TWAP** 분할 매수·매도, 분할 익절에도 동일 임계 | `execution/order_twap.py`, `execution/scale_out.py`, `run_bot.py` |
+| **2** | **TWAP** 분할 매수·**분할 익절 매도**(전량 청산 타임스탑/하드스탑 경로는 단일 주문) | `execution/order_twap.py`, `execution/scale_out.py`, `run_bot.py` |
 | **3** | **AI 휩쏘** 필터 | `strategy/ai_filter.py`, `config.json` 의 `ai_false_breakout_*` |
 | **4** | **거시 방어막** (VIX·Fear&Greed 등) | `strategy/macro_guard.py`, `api/macro_data.py` |
 | **5** | **합산 계좌 서킷** — 월요일(서울) **주차별 고점** 리셋 후 트레일링 MDD, 쿨다운 후 고점 1회 리셋 | `execution/circuit_break.py`, `execution/guard.py`, `run_bot`, `adjust_capital.py` |

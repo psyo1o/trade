@@ -263,6 +263,8 @@ def sell_reason_cooldown_hours(reason: str, profit_rate: float | None = None) ->
     * ``수동`` 이 포함되면: ``profit_rate < 0`` 이면 120h, 아니면 48h
     """
     r = reason or ""
+    if "V8_TIME_STOP" in r or "SWING_TIME_STOP" in r:
+        return 120.0
     if "타임" in r and "스탑" in r:
         return 120.0
     if "타임스탑" in r:

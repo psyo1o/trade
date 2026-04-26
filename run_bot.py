@@ -1938,22 +1938,14 @@ def _holding_duration_suffix(pos: dict) -> str:
 
 
 def _holding_duration_clause(pos: dict) -> str:
-    """보유시간 표시 문구. SWING_FIB 포지션은 숨김."""
+    """보유시간 표시 문구. 예전 형식(보유 N일 N시간) 유지."""
     if not isinstance(pos, dict):
         return ""
     stype = str(pos.get("strategy_type", "") or "").upper()
     if stype == "SWING_FIB":
         return ""
-    try:
-        anchor = pos.get("buy_time")
-        if anchor is None:
-            anchor = pos.get("ts")
-        if anchor is None:
-            return ""
-        held_hours = max(0.0, (float(_time.time()) - float(anchor)) / 3600.0)
-        return f" 보유시간:{int(held_hours)}시간"
-    except Exception:
-        return ""
+    d = _holding_duration_human(pos)
+    return f" | 보유 {d}" if d else ""
 
 
 def _fmt_price_for_heartbeat(market: str, price: float) -> str:
@@ -2011,6 +2003,31 @@ def resolve_display_current_price(market: str, ticker: str, buy_p: float, curren
         to_float=_to_float,
         get_ohlcv_yfinance=get_ohlcv_yfinance,
     )
+
+
+def normalize_us_current_p_api_for_display(
+    buy_p: float,
+    current_p_api,
+    *,
+    is_weekend: bool | None = None,
+):
+    """
+    US 표시 현재가 전처리(텔레그램/GUI 공용).
+    - 유효한 API 현재가가 없으면 None
+    - 주말·점검 창에서 장부 폴백값(current_p==avg_p)은 None으로 내려 yfinance 경로를 강제
+    """
+    cp = float(_to_float(current_p_api, 0.0))
+    bp = float(_to_float(buy_p, 0.0))
+    if cp <= 0:
+        return None
+    if is_weekend is None:
+        is_weekend = bool(kis_equities_weekend_suppress_window_kst())
+    if is_weekend and bp > 0:
+        # 숫자 직렬화/반올림 차이를 고려한 허용오차
+        tol = max(0.01, abs(bp) * 1e-4)
+        if abs(cp - bp) <= tol:
+            return None
+    return cp
 
 
 def build_account_snapshot_for_report(
@@ -2157,11 +2174,12 @@ def get_us_holdings_with_roi():
                 continue
             
             # 현재가: 공용 해석 함수
-            cp_api = _to_float(item.get("current_p", 0), 0.0)
-            # 주말 장부 폴백값(current=avg)일 때는 yfinance 종가로 보정해 ROI 0% 고정 방지
-            if is_weekend and cp_api > 0 and abs(cp_api - buy_p) < 1e-9:
-                cp_api = 0.0
-            curr_p = resolve_display_current_price("US", ticker, buy_p, cp_api if cp_api > 0 else None)
+            cp_api = normalize_us_current_p_api_for_display(
+                buy_p,
+                item.get("current_p", 0),
+                is_weekend=is_weekend,
+            )
+            curr_p = resolve_display_current_price("US", ticker, buy_p, cp_api)
             
             roi = ((curr_p - buy_p) / buy_p) * 100
             us_name = get_us_company_name(ticker)
@@ -2701,14 +2719,60 @@ def _calc_hard_stop(pos_info: dict, buy_p: float) -> float:
     return float(pos_info.get("sl_p", buy_p * 0.9))
 
 
-def _should_trigger_time_stop(hours_held: float, profit_rate_now: float, *, min_hours: float) -> bool:
-    """타임스탑 발동 여부만 판정(기존 임계식 동일)."""
-    return bool(hours_held >= float(min_hours) and profit_rate_now < 10.0)
+# 타임스탑
+#   V8 주식(KR/US): 7일(168h) + 수익 < +4% 전량 / ≥4% 유예
+#   V8 코인: 3일(72h) + 수익 < +4% 전량 / ≥4% 유예
+#   SWING 주식(KR/US): 10일(240h) + 수익 < +2% 전량 / ≥2% 유예
+#   SWING 코인: 5일(120h) + 수익 < +2% 전량 / ≥2% 유예
+# (보유시간은 buy_date 우선, 없으면 buy_time — 캘린더 경과시간)
+V8_TIME_STOP_HOURS_EQUITY = 7.0 * 24.0
+V8_TIME_STOP_HOURS_COIN = 3.0 * 24.0
+V8_TIME_STOP_EXEMPT_PROFIT_PCT = 4.0
+SWING_TIME_STOP_HOURS_EQUITY = 10.0 * 24.0
+SWING_TIME_STOP_HOURS_COIN = 5.0 * 24.0
+SWING_TIME_STOP_EXEMPT_PROFIT_PCT = 2.0
 
 
-def _build_time_stop_reason(hours_held: float, profit_rate_now: float) -> str:
-    """타임스탑 사유 문자열 생성(기존 포맷 동일)."""
-    return f"타임 스탑 발동 (보유 {hours_held:.1f}시간 / 수익률 {profit_rate_now:+.2f}%)"
+def _time_stop_params(market: str, strategy_type: str) -> tuple[str, float, float]:
+    """(로그 태그, 최소 보유 시간(시간), 유예 수익률 임계 %)."""
+    m = (market or "").upper()
+    st = (strategy_type or "TREND_V8").upper()
+    if st == "SWING_FIB":
+        if m == "KR":
+            return "[SWING_TIME_STOP_KR]", SWING_TIME_STOP_HOURS_EQUITY, SWING_TIME_STOP_EXEMPT_PROFIT_PCT
+        if m == "US":
+            return "[SWING_TIME_STOP_US]", SWING_TIME_STOP_HOURS_EQUITY, SWING_TIME_STOP_EXEMPT_PROFIT_PCT
+        return "[SWING_TIME_STOP_COIN]", SWING_TIME_STOP_HOURS_COIN, SWING_TIME_STOP_EXEMPT_PROFIT_PCT
+    if m == "COIN":
+        return "[V8_TIME_STOP_COIN]", V8_TIME_STOP_HOURS_COIN, V8_TIME_STOP_EXEMPT_PROFIT_PCT
+    if m == "KR":
+        return "[V8_TIME_STOP_KR]", V8_TIME_STOP_HOURS_EQUITY, V8_TIME_STOP_EXEMPT_PROFIT_PCT
+    return "[V8_TIME_STOP_US]", V8_TIME_STOP_HOURS_EQUITY, V8_TIME_STOP_EXEMPT_PROFIT_PCT
+
+
+def _evaluate_time_stop(
+    *,
+    market: str,
+    strategy_type: str,
+    hours_held: float,
+    profit_rate_now: float,
+) -> tuple[bool, str, bool]:
+    """
+    (전량 청산 여부, 사유 문자열, 유예 로그 출력 여부)
+    유예: 보유시간은 임계 초과였으나 수익률이 유예 기준 이상.
+    """
+    tag, min_h, exempt_pct = _time_stop_params(market, strategy_type)
+    hh = float(hours_held)
+    pr = float(profit_rate_now)
+    if hh < float(min_h):
+        return False, "", False
+    if pr >= float(exempt_pct):
+        return False, "", True
+    reason = (
+        f"{tag} 타임스탑 — 보유 {hh:.1f}h (≥{min_h:.0f}h), 수익률 {pr:+.2f}% "
+        f"< 유예 {exempt_pct:.1f}% → 전량 매도"
+    )
+    return True, reason, False
 
 
 def _new_buy_protection_remaining_sec(buy_time) -> int:
@@ -2849,8 +2913,6 @@ def run_trading_bot():
                 strategy_type = str(pos_info.get("strategy_type", "TREND_V8") or "TREND_V8").upper()
                 if strategy_type == "SWING_FIB":
                     sw_action, sw_reason = check_swing_exit(pos_info, pd.DataFrame(ohlcv))
-                    if sw_action == "HOLD":
-                        continue
                     if sw_action == "HALF":
                         sq = compute_stock_scale_out_qty(int(qty))
                         if not sq:
@@ -2869,22 +2931,23 @@ def run_trading_bot():
                         else:
                             print(f"  ❌ [SWING-SELL] {kr_name}({t}) HALF 실패: {(r_half or {}).get('msg1', '응답 없음')}")
                         continue
-                    # FULL
-                    qty_full = int(_to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
-                    if qty_full <= 0:
+                    if sw_action == "FULL":
+                        # 스윙 전량 청산 시그널
+                        qty_full = int(_to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
+                        if qty_full <= 0:
+                            continue
+                        r_full = create_market_sell_order_kis(t, qty_full, is_us=False, curr_price=float(curr_p))
+                        if isinstance(r_full, dict) and r_full.get("rt_cd") == "0":
+                            p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
+                            _record_trade_event("KR", t, "SELL", qty_full, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
+                            print(f"  ✅ [SWING-SELL] {kr_name}({t}) FULL | {sw_reason}")
+                            del state["positions"][t]
+                            set_cooldown(state, t)
+                            set_ticker_cooldown_after_sell(state, t, sw_reason)
+                            save_state(STATE_PATH, state)
+                        else:
+                            print(f"  ❌ [SWING-SELL] {kr_name}({t}) FULL 실패: {(r_full or {}).get('msg1', '응답 없음')}")
                         continue
-                    r_full = create_market_sell_order_kis(t, qty_full, is_us=False, curr_price=float(curr_p))
-                    if isinstance(r_full, dict) and r_full.get("rt_cd") == "0":
-                        p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
-                        _record_trade_event("KR", t, "SELL", qty_full, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
-                        print(f"  ✅ [SWING-SELL] {kr_name}({t}) FULL | {sw_reason}")
-                        del state["positions"][t]
-                        set_cooldown(state, t)
-                        set_ticker_cooldown_after_sell(state, t, sw_reason)
-                        save_state(STATE_PATH, state)
-                    else:
-                        print(f"  ❌ [SWING-SELL] {kr_name}({t}) FULL 실패: {(r_full or {}).get('msg1', '응답 없음')}")
-                    continue
 
                 # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
                 usdk = float(estimate_usdkrw())
@@ -2950,15 +3013,22 @@ def run_trading_bot():
                 now_str, hours_held, buy_time_log = _compute_holding_time_info(pos_info)
                 _print_position_hold_status(now_str, t, buy_time_log, hours_held)
 
-                # 168시간(7일) 경과 & 수익률 10% 미만일 경우
-                if hours_held >= 168:
-                    if _should_trigger_time_stop(float(hours_held), float(profit_rate_now), min_hours=168):
-                        is_exit = True
-                        reason = _build_time_stop_reason(float(hours_held), float(profit_rate_now))
-                    else:
-                        # 수익률이 10% 이상이라 홀딩할 때의 로그
-                        print(f"   ✅ {hours_held:.1f}시간 경과했으나 수익률 양호({profit_rate_now:+.2f}%) ➔ 홀딩 유지")
-                        
+                ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
+                    market="KR",
+                    strategy_type=strategy_type,
+                    hours_held=float(hours_held),
+                    profit_rate_now=float(profit_rate_now),
+                )
+                if ts_exit:
+                    is_exit = True
+                    reason = ts_reason
+                    print(f"  ⏰ {reason}")
+                elif ts_exempt:
+                    _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("KR", strategy_type)
+                    print(
+                        f"   ✅ 타임스탑 유예 {_ts_tag} — 보유 {hours_held:.1f}h (≥{_ts_min_h:.0f}h), "
+                        f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
+                    )
 
                 # 2. 하드스탑 체크 (타임스탑이 발동되지 않았을 때만)
                 if not is_exit and profit_rate_now < 0:
@@ -3368,8 +3438,6 @@ def run_trading_bot():
                 strategy_type = str(pos_info.get("strategy_type", "TREND_V8") or "TREND_V8").upper()
                 if strategy_type == "SWING_FIB":
                     sw_action, sw_reason = check_swing_exit(pos_info, pd.DataFrame(ohlcv))
-                    if sw_action == "HOLD":
-                        continue
                     if sw_action == "HALF":
                         sq = compute_stock_scale_out_qty(int(float(qty_holding)))
                         if not sq:
@@ -3389,22 +3457,23 @@ def run_trading_bot():
                         else:
                             print(f"  ❌ [SWING-SELL] {us_name}({t}) HALF 실패: {(r_half or {}).get('msg1', '응답 없음')}")
                         continue
-                    qty_full = int(float(qty_holding))
-                    if qty_full <= 0:
+                    if sw_action == "FULL":
+                        qty_full = int(float(qty_holding))
+                        if qty_full <= 0:
+                            continue
+                        sp_full = round(float(curr_p) * 0.98, 2)
+                        r_full = execute_us_order_direct(kis_api.broker_us, "sell", t, qty_full, sp_full)
+                        if isinstance(r_full, dict) and r_full.get("rt_cd") == "0":
+                            p_full = ((float(sp_full) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
+                            _record_trade_event("US", t, "SELL", qty_full, price=float(sp_full), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
+                            print(f"  ✅ [SWING-SELL] {us_name}({t}) FULL | {sw_reason}")
+                            del state["positions"][t]
+                            set_cooldown(state, t)
+                            set_ticker_cooldown_after_sell(state, t, sw_reason)
+                            save_state(STATE_PATH, state)
+                        else:
+                            print(f"  ❌ [SWING-SELL] {us_name}({t}) FULL 실패: {(r_full or {}).get('msg1', '응답 없음')}")
                         continue
-                    sp_full = round(float(curr_p) * 0.98, 2)
-                    r_full = execute_us_order_direct(kis_api.broker_us, "sell", t, qty_full, sp_full)
-                    if isinstance(r_full, dict) and r_full.get("rt_cd") == "0":
-                        p_full = ((float(sp_full) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
-                        _record_trade_event("US", t, "SELL", qty_full, price=float(sp_full), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
-                        print(f"  ✅ [SWING-SELL] {us_name}({t}) FULL | {sw_reason}")
-                        del state["positions"][t]
-                        set_cooldown(state, t)
-                        set_ticker_cooldown_after_sell(state, t, sw_reason)
-                        save_state(STATE_PATH, state)
-                    else:
-                        print(f"  ❌ [SWING-SELL] {us_name}({t}) FULL 실패: {(r_full or {}).get('msg1', '응답 없음')}")
-                    continue
 
                 # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
                 usdk = float(estimate_usdkrw())
@@ -3470,14 +3539,22 @@ def run_trading_bot():
                 now_str, hours_held, buy_time_log = _compute_holding_time_info(pos_info)
                 _print_position_hold_status(now_str, t, buy_time_log, hours_held, line_prefix="  ")
 
-                # 🛑 [매도 로직 1] 타임스탑 (7일(168시간) 경과 & 수익률 10% 미만)
-                if hours_held >= 168:
-                    if _should_trigger_time_stop(float(hours_held), float(profit_rate_now), min_hours=168):
-                        is_exit = True
-                        reason = _build_time_stop_reason(float(hours_held), float(profit_rate_now))
-                        print(f"  ⏰ [타임스탑 발동] {t} - 장기 보유 및 모멘텀 상실. 강제 청산!")
-                    else:
-                        print(f"     ✅ {hours_held:.1f}시간 경과했으나 수익률 양호({profit_rate_now:+.2f}%) ➔ 홀딩 유지")
+                ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
+                    market="US",
+                    strategy_type=strategy_type,
+                    hours_held=float(hours_held),
+                    profit_rate_now=float(profit_rate_now),
+                )
+                if ts_exit:
+                    is_exit = True
+                    reason = ts_reason
+                    print(f"  ⏰ {reason}")
+                elif ts_exempt:
+                    _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("US", strategy_type)
+                    print(
+                        f"     ✅ 타임스탑 유예 {_ts_tag} — 보유 {hours_held:.1f}h (≥{_ts_min_h:.0f}h), "
+                        f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
+                    )
 
                 # 🛑 [매도 로직 2] 하드스탑 (손실 구간 방어)
                 if not is_exit and profit_rate_now < 0:
@@ -3875,8 +3952,6 @@ def run_trading_bot():
             strategy_type = str(pos_info.get("strategy_type", "TREND_V8") or "TREND_V8").upper()
             if strategy_type == "SWING_FIB":
                 sw_action, sw_reason = check_swing_exit(pos_info, pd.DataFrame(ohlcv))
-                if sw_action == "HOLD":
-                    continue
                 if sw_action == "HALF":
                     sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
                     if not sell_q:
@@ -3895,18 +3970,19 @@ def run_trading_bot():
                     else:
                         print(f"  ❌ [SWING-SELL] {t} HALF 실패: 업비트 응답 없음")
                     continue
-                r_full = upbit_api.upbit.sell_market_order(t, qty)
-                if r_full:
-                    p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
-                    _record_trade_event("COIN", t, "SELL", qty, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
-                    print(f"  ✅ [SWING-SELL] {t} FULL | {sw_reason}")
-                    del state["positions"][t]
-                    set_cooldown(state, t)
-                    set_ticker_cooldown_after_sell(state, t, sw_reason)
-                    save_state(STATE_PATH, state)
-                else:
-                    print(f"  ❌ [SWING-SELL] {t} FULL 실패: 업비트 응답 없음")
-                continue
+                if sw_action == "FULL":
+                    r_full = upbit_api.upbit.sell_market_order(t, qty)
+                    if r_full:
+                        p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
+                        _record_trade_event("COIN", t, "SELL", qty, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
+                        print(f"  ✅ [SWING-SELL] {t} FULL | {sw_reason}")
+                        del state["positions"][t]
+                        set_cooldown(state, t)
+                        set_ticker_cooldown_after_sell(state, t, sw_reason)
+                        save_state(STATE_PATH, state)
+                    else:
+                        print(f"  ❌ [SWING-SELL] {t} FULL 실패: 업비트 응답 없음")
+                    continue
 
             # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
             usdk = float(estimate_usdkrw())
@@ -3970,15 +4046,23 @@ def run_trading_bot():
             now_str, hours_held, buy_time_log = _compute_holding_time_info(pos_info)
             _print_position_hold_status(now_str, t, buy_time_log, hours_held)
 
-            # 72시간(3일) 경과 & 수익률 10% 미만일 경우
-            if hours_held >= 72:
-                if _should_trigger_time_stop(float(hours_held), float(profit_rate_now), min_hours=72):
-                    is_exit = True
-                    reason = _build_time_stop_reason(float(hours_held), float(profit_rate_now))
-                else:
-                    # 수익률이 10% 이상이라 홀딩할 때의 로그
-                    print(f"   ✅ {hours_held:.1f}시간 경과했으나 수익률 양호({profit_rate_now:+.2f}%) ➔ 홀딩 유지")
-                    
+            ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
+                market="COIN",
+                strategy_type=strategy_type,
+                hours_held=float(hours_held),
+                profit_rate_now=float(profit_rate_now),
+            )
+            if ts_exit:
+                is_exit = True
+                reason = ts_reason
+                print(f"  ⏰ {reason}")
+            elif ts_exempt:
+                _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("COIN", strategy_type)
+                print(
+                    f"   ✅ 타임스탑 유예 {_ts_tag} — 보유 {hours_held:.1f}h (≥{_ts_min_h:.0f}h), "
+                    f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
+                )
+
             # 2. 하드스탑 체크 (타임스탑이 발동되지 않았을 때만)
             if not is_exit and profit_rate_now < 0:
                 if curr_p <= hard_stop:

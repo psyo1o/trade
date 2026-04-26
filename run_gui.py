@@ -229,7 +229,14 @@ class BalanceUpdaterThread(QThread):
                         _t.sleep(delay_sec)
                 return last
             def _allow_kis_fetch(market: str) -> bool:
-                """장외 강제 조회/최소 간격(토큰버킷 유사) 보호."""
+                """KIS 재조회 허용 여부.
+
+                국·미 예수금·총평 라벨은 **해외/국내 장 마감 후에도** KIS가 잔고를 줄 수 있다.
+                ``is_market_open`` 으로 막으면 장중엔 실조회로 맞다가, 장 후에는
+                ``last_kis_display_snapshot`` 폴백만 쓰게 되어 **매수 전 달러 예수**처럼 옛 값이
+                보일 수 있다. KR/US 각각 **최소 간격(_KIS_REFRESH_MIN_INTERVAL_SEC)** 과
+                ``force_kis`` 만으로 호출 수를 제한한다.
+                """
                 import time as _t
                 global _last_kis_kr_fetch_ts, _last_kis_us_fetch_ts
                 now_ts = _t.time()
@@ -240,18 +247,16 @@ class BalanceUpdaterThread(QThread):
                         _last_kis_us_fetch_ts = now_ts
                     return True
                 if market == "KR":
-                    if not run_bot.is_market_open("KR"):
-                        return False
                     if now_ts - float(_last_kis_kr_fetch_ts) < _KIS_REFRESH_MIN_INTERVAL_SEC:
                         return False
                     _last_kis_kr_fetch_ts = now_ts
                     return True
-                if not run_bot.is_market_open("US"):
-                    return False
-                if now_ts - float(_last_kis_us_fetch_ts) < _KIS_REFRESH_MIN_INTERVAL_SEC:
-                    return False
-                _last_kis_us_fetch_ts = now_ts
-                return True
+                if market == "US":
+                    if now_ts - float(_last_kis_us_fetch_ts) < _KIS_REFRESH_MIN_INTERVAL_SEC:
+                        return False
+                    _last_kis_us_fetch_ts = now_ts
+                    return True
+                return False
 
             # 1. 무거운 장부 동기화 작업
             if self.sync_first:
@@ -267,6 +272,7 @@ class BalanceUpdaterThread(QThread):
             snap = run_bot.build_account_snapshot_for_report(
                 allow_kis_fetch=_allow_kis_fetch,
                 with_backoff=_with_backoff,
+                force_kis_labels=self.force_kis,
             )
             labels = snap.get("labels", {})
             d2_kr = int(_safe_num((labels.get("kr") or {}).get("cash", 0), 0))
@@ -325,7 +331,14 @@ class BalanceUpdaterThread(QThread):
 
         try:
             m = "KR" if market_code == "KR" else ("US" if market_code == "US" else "COIN")
-            current_price = run_bot.resolve_display_current_price(m, ticker_code, buy_p, current_p_api)
+            cp_api = current_p_api
+            if m == "US":
+                cp_api = run_bot.normalize_us_current_p_api_for_display(
+                    buy_p,
+                    current_p_api,
+                    is_weekend=bool(kis_equities_weekend_suppress_window_kst()),
+                )
+            current_price = run_bot.resolve_display_current_price(m, ticker_code, buy_p, cp_api)
 
             if current_price > 0 and self.dashboard:
                 self.dashboard.update_max_price_if_higher(ticker_code, current_price)

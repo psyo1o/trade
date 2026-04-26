@@ -7,7 +7,9 @@
     2. ``register_telegram_atexit()`` 로 ``atexit`` 에 ``shutdown_handler`` 등록.
     3. 비정상 종료(스택이 남는 경우) 시 짧은 요약을 ``send_telegram`` 으로 밀어 넣는다.
 
-``parse_mode`` 는 ``Markdown`` 이므로 메시지 본문에서 해당 문법에 맞춘다.
+메시지 본문은 **기본적으로 일반 텍스트**로 보냅니다. 예전처럼 ``Markdown`` 을 쓰면
+종목명·사유 등에 ``_`` · ``*`` · ``[`` 가 섞일 때 Telegram이
+``can't parse entities`` 로 전체 전송을 거부하는 경우가 많아 기본값에서 제외했습니다.
 """
 import atexit
 import time
@@ -31,6 +33,7 @@ def send_telegram(message: str) -> bool:
 
     - 본문은 **JSON POST** 로 보냄(URL 쿼리로 긴 생존신고를 실을 때 생기는 불안정 완화).
     - 연결·읽기 타임아웃·일시 장애는 지수 백오프 재시도.
+    - ``parse_mode`` 미사용: 보유 종목 줄·사유 등에 특수문자가 섞여도 전송 실패하지 않음.
     """
     if not _config:
         print("⚠️ 텔레그램: config 미설정 (configure_telegram 호출 필요)")
@@ -40,7 +43,6 @@ def send_telegram(message: str) -> bool:
     payload = {
         "chat_id": _config["telegram_chat_id"],
         "text": message,
-        "parse_mode": "Markdown",
     }
 
     max_attempts = 4
