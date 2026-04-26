@@ -1938,11 +1938,8 @@ def _holding_duration_suffix(pos: dict) -> str:
 
 
 def _holding_duration_clause(pos: dict) -> str:
-    """보유시간 표시 문구. 예전 형식(보유 N일 N시간) 유지."""
+    """생존신고 보유 한 줄 접미사. 예전 형식(| 보유 N일 N시간 등). SWING도 동일."""
     if not isinstance(pos, dict):
-        return ""
-    stype = str(pos.get("strategy_type", "") or "").upper()
-    if stype == "SWING_FIB":
         return ""
     d = _holding_duration_human(pos)
     return f" | 보유 {d}" if d else ""
