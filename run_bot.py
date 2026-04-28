@@ -3267,12 +3267,6 @@ def run_trading_bot():
                         if t in held_kr:
                             print(f"  ⏭️ {kr_name}({t}): 이미 보유중 (패스)")
                             continue
-                        if not can_open_new(t, state, max_positions=MAX_POSITIONS_KR):
-                            print(
-                                f"  ⏭️ {kr_name}({t}): [MAX_POSITIONS:KR] "
-                                f"국장 한도 {MAX_POSITIONS_KR}개 도달 (패스)"
-                            )
-                            continue
                         sector_ok_kr, sector_msg_kr = allow_kr_sector_entry(
                             t,
                             state.get("positions", {}),
@@ -3376,6 +3370,13 @@ def run_trading_bot():
                                     print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
                                     continue
                             
+                            if not can_open_new(t, state, max_positions=MAX_POSITIONS_KR):
+                                print(
+                                    f"  ⏭️ {kr_name}({t}): [MAX_POSITIONS:KR] "
+                                    f"국장 한도 {MAX_POSITIONS_KR}개 도달 (패스)"
+                                )
+                                continue
+
                             # 🚨 [추가 수술] 국장 전용 시가 갭(Gap) 과다 상승 필터 (5%)
                             try:
                                 if ohlcv_200 and len(ohlcv_200) >= 2:
@@ -4346,9 +4347,6 @@ def run_trading_bot():
                                 if t in held_coins:
                                     print(f"  ⏭️ {get_coin_name(t)}({t}): 이미 보유중 (패스)")
                                     continue
-                                if not can_open_new(t, state, max_positions=MAX_POSITIONS_COIN):
-                                    print(f"  ⏭️ {t}: 포지션 개수 초과 ({MAX_POSITIONS_COIN}개) (패스)")
-                                    continue
                                 df_upbit = pyupbit.get_ohlcv(t, interval="day", count=250)
                                 if df_upbit is None or len(df_upbit) < 20:
                                     print(f"  ⏭️ {t}: OHLCV 데이터 부족 (패스)")
@@ -4437,6 +4435,10 @@ def run_trading_bot():
                                         _disp = f"{_cn}({t})" if _cn and _cn != t else t
                                         print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
                                         continue
+
+                                if not can_open_new(t, state, max_positions=MAX_POSITIONS_COIN):
+                                    print(f"  ⏭️ {t}: 포지션 개수 초과 ({MAX_POSITIONS_COIN}개) (패스)")
+                                    continue
 
                                 if budget < coin_min_budget:
                                     print(
