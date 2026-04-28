@@ -1,6 +1,6 @@
 # c-bot — 국·미·코인 자동매매 봇
 
-_문서 갱신: 2026-04-26 — 타임스탑·TWAP 청산 설계, GUI/텔레그램 현재가 공통화 등 최근 운영 변경을 반영했습니다._
+_문서 갱신: 2026-04-28 — Layer2 `ticker_cooldowns` 전략·시장 매트릭스, 수동 매도(부분/전량·장부·동기화), GUI 수동매도 수량 입력란을 반영했습니다._
 
 ---
 
@@ -99,7 +99,7 @@ py -3.11 adjust_capital.py
 
 | 요소 | 설명 |
 |------|------|
-| **성적표 라벨** | `bot_state.json` 의 `stats`(승/패, 누적 수익률 합)와, 마지막으로 갱신된 **국·미·코인 보유 수익률**을 보여 줍니다. 약 **3초마다** 텍스트만 다시 그립니다. |
+| **성적표 라벨** | `bot_state.stats` 의 **승/패·누적 수익률 합**(전량 청산 기준)·마지막 보유 ROI. 수동 부분 매도 분(`manual_partial_total_profit_pct`)은 **JSON에는 누적**되지만 성적표 한 줄에는 아직 표시하지 않습니다. 약 **3초마다** 갱신합니다. |
 | **🇰🇷 🇺🇸 🪙 세 칸** | 시장별 **예수금·총평가·보유 수익률**. 숫자는 백그라운드 스레드(`BalanceUpdaterThread`)가 브로커·스냅샷 규칙에 맞춰 채웁니다. |
 | **🔄 예수금 새로고침** | 일반 갱신: 장중/쿨다운 등 **정책을 지키며** KIS·업비트 조회. 조건이 안 맞으면 저장된 **`last_kis_display_snapshot`** 등으로 맞춥니다. |
 | **🏦 KIS 강제 새로고침** | 장외·쿨다운 중에도 **KIS를 한 번 강제로** 호출해 국·미 숫자를 바로 확인할 때 사용합니다. (남용하면 증권사 쪽 부담·제한에 걸릴 수 있어, 자동 갱신에는 **최소 간격(약 25초)** 이 있습니다.) |
@@ -109,8 +109,8 @@ py -3.11 adjust_capital.py
 ### 탭 구성 (위에서 아래 순)
 
 1. **실시간 현황**  
-   - 보유 종목 **테이블**: 시장, 종목명(코드), 수량, 매수단가, 현재가, 수익률, **수동 매도** 버튼.  
-   - 수동 매도는 확인 창 후 `run_bot.manual_sell` 로 주문합니다.  
+   - 보유 종목 **테이블**: 시장, 종목명(코드), 수량, 매수단가, 현재가, 수익률, **매도수량 입력 + 매도** (기본값은 해당 행 보유 전량; 칸을 비우면 전량 매도).  
+   - 확인 창 후 `run_bot.manual_sell` 로 주문합니다. 국·미장은 정수 주, 코인은 소수 수량 입력 가능합니다.  
    - 아래 **검은 콘솔**은 `print` / 로그가 모이는 곳입니다. 같은 내용이 **`logs/bot.log`** 등 파일 로거로도 이어질 수 있습니다(`RedirectText`).  
    - 잔고 갱신 시 `build_account_snapshot_for_report`·`gui_table_adapter` 경로로 행이 만들어집니다.
 
@@ -192,6 +192,7 @@ flowchart TD
 - **국장(KR) / 미장(US) / 코인(COIN)** 통합 엔진.
 - 읽고 쓰는 대표 파일: `config.json`, `bot_state.json`, `trade_history.json`.
 - **Phase 5** 합산 서킷용으로 브로커에서 가져온 국·미·코인 평가액을 **`circuit_aux_last_*`** 에 넣고, **`peak_total_equity` / `last_reset_week`** 로 **월요일(서울) 주차별 트레일링 MDD** 를 관리합니다.
+- **매도 후 Layer2:** 전량 청산 시 `set_ticker_cooldown_after_sell`(전략·시장·사유 매트릭스). 수동 매도는 `_apply_manual_sell_state_update`·`_run_manual_sell_position_sync` 경로.
 - **관측성:** 예산·예수·TWAP·시장별 스킵은 `[KR …]`, `[US …]`, `[COIN …]` 등 태그 로그로 남깁니다. 모듈 상단 docstring에 grep용 태그 요약이 있습니다.
 
 ### `run_gui.py`
@@ -199,6 +200,7 @@ flowchart TD
 - PyQt5 GUI. `run_bot` 을 import 해서 **같은 엔진**을 돌립니다.
 - 잔고 표시는 **`services/account_snapshot.py`** 와 동일 규칙으로 맞춥니다.
 - **KIS 주말 점검** 구간에는 국·미 API를 덜 부르고, 저장된 **`last_kis_display_snapshot`** 과 장부 **`positions[*].qty`** 로 화면을 채웁니다.
+- **수동 매도 UI:** 보유 행마다 **수량 `QLineEdit`(기본=해당 행 보유 전량) + 매도 버튼**. 빈 칸은 전량, 국·미는 정수 주, 코인은 소수 입력. `_on_manual_sell_click` 에서 보유 초과·형식 검증.
 - **버튼·탭·타이머** 등 화면 구성은 위 **[GUI 사용 안내](#gui-사용-안내)** 절을 보세요.
 
 ### `screener.py` / `us_screener.py`
@@ -221,6 +223,7 @@ flowchart TD
 | 키/영역 | 한 줄 설명 |
 |---------|------------|
 | `positions[티커]` | 매수가·손절·수량 `qty`·ATR·분할익절 여부 `scale_out_done`·**`strategy_type`**·**`entry_fib_level`** 등 |
+| `stats` | `wins` / `losses` / `total_profit` 은 **전량 청산**(자동·수동) 시만 반영. 수동 **부분** 매도 실현분은 **`manual_partial_total_profit_pct`** 에만 가중 누적 |
 | `cooldown` / `ticker_cooldowns` | 단기 쿨다운, 매도 후 **재진입 금지** 시각 |
 | `peak_total_equity`, `last_reset_week` | Phase5 **월요일 앵커** 이후 이번 주 합산 고점·주차 라벨 |
 | `circuit_aux_last_*` | 국·미·코인 합산용 최근 스냅샷 |
@@ -265,7 +268,32 @@ flowchart TD
 | SWING 주식 (KR·US) | **10일**(240h) | **+2% 미만**이면 전량 | **≥ +2%** |
 | SWING 코인 | **5일**(120h) | 동일 | **≥ +2%** |
 
-매도 **`reason`**·로그에는 **`[V8_TIME_STOP_KR]`**, **`[V8_TIME_STOP_US]`**, **`[V8_TIME_STOP_COIN]`**, **`[SWING_TIME_STOP_KR]`** 등 태그가 붙습니다. `execution/guard.py` 의 **`ticker_cooldowns`** 도 이 문자열을 인식해 타임스탑 계열 쿨다운을 적용합니다.
+매도 **`reason`**·로그에는 **`[V8_TIME_STOP_KR]`**, **`[V8_TIME_STOP_US]`**, **`[V8_TIME_STOP_COIN]`**, **`[SWING_TIME_STOP_KR]`** 등 태그가 붙습니다.
+
+#### Layer 2: `ticker_cooldowns` (매도 후 재매수 금지, 시간 단위)
+
+전량 청산 시에만 장부 **`strategy_type`** (`TREND_V8` / `SWING_FIB`), 시장 (**KR** / **US** / **COIN**), 매도 **`reason`**·**`profit_rate`** 로 **손절·타임스탑 vs 정상 익절** 을 나눠 시간을 적용합니다. **분할 익절 후 잔여 수량이 있으면** (`remaining_qty > 0`) 쿨다운을 **부여하지 않습니다**.
+
+| 전략 | 구분 | KR·US | COIN |
+|------|------|-------|------|
+| **TREND_V8** | 정상 익절 등 | 72h (3일) | 24h (1일) |
+| **TREND_V8** | 손절·타임스탑 | 168h (7일) | 72h (3일) |
+| **SWING_FIB** | 정상 익절 등 | 480h (20일) | 168h (7일) |
+| **SWING_FIB** | 손절·타임스탑·지하실/좀비화 등 | 720h (30일) | 240h (10일) |
+
+구현·로그: `execution/guard.py` 의 `compute_ticker_cooldown_hours` / `set_ticker_cooldown_after_sell`, 매도 루프는 `run_bot.py` (전량 청산 직전 `strategy_type`·시장·`profit_rate` 전달). 발동 시 `[쿨다운 적용] …`, 분할 익절 잔량 시 `[쿨다운 패스] …`.
+
+**건드리지 않는 레이어:** 같은 파일의 Layer1 공용 매수 후 `cooldown`(분 단위), Phase5 계좌 서킷, 신규 매수 후 **15분** 매도 보호 등은 기존대로 유지합니다.
+
+#### 수동 매도 (`run_bot.manual_sell`)
+
+| 항목 | 동작 |
+|------|------|
+| **호출 경로** | GUI **매도수량 입력 + 매도** 또는 코드에서 `manual_sell(market, code, quantity)` |
+| **부분 vs 전량** | 장부 `positions[*].qty` 와 주문 수량 비교. 부분이면 `execution/scale_out.post_partial_ledger`(수동 경로는 `set_scale_out_done=False` 로 자동 분할익절 플래그와 충돌 없음) |
+| **통계** | **전량 청산** 시에만 `wins`·`losses`·`total_profit` 반영. **부분**만 `stats.manual_partial_total_profit_pct` 에 가중 누적 |
+| **Layer2 쿨다운** | **전량**만 `ticker_cooldowns` 적용; 부분 매도 후 잔량 있으면 미부여 |
+| **동기화** | 체결 반영 후 국·미·코인 실보유 조회가 **모두 성공**할 때만 `sync_all_positions` 로 재동기화(실패 시 다음 자동 사이클에 위임) |
 
 #### TWAP(`twap_*`)과 전량 청산 (의도된 설계)
 

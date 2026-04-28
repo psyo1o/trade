@@ -25,7 +25,7 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QTextEdit, QTableWidget, QTableWidgetItem,
                              QHeaderView, QTabWidget, QMessageBox, QSpinBox, QLineEdit, QRadioButton,
-                             QButtonGroup)
+                             QButtonGroup, QSizePolicy)
 from PyQt5.QtCore import QTimer, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont
 from pathlib import Path
@@ -584,9 +584,12 @@ class BotDashboard(QMainWindow):
         dashboard_layout = QVBoxLayout(dashboard_tab)
         
         self.table = QTableWidget(0, 7) # 현재가, 수익률 컬럼 추가
-        self.table.setHorizontalHeaderLabels(["시장", "종목명(코드)", "보유수량", "매수단가", "현재가", "수익률", "수동매도"])
+        self.table.setHorizontalHeaderLabels(
+            ["시장", "종목명(코드)", "보유수량", "매수단가", "현재가", "수익률", "수량·수동매도"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setColumnWidth(4, 80) # 매도 버튼 컬럼 폭 조절
+        self.table.setColumnWidth(4, 80)
+        self.table.setColumnWidth(6, 220)
         self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.horizontalHeader().setMinimumHeight(30)
 
@@ -713,27 +716,100 @@ class BotDashboard(QMainWindow):
         else:
             QMessageBox.warning(self, "고점 보정 실패", msg.replace("\n", "<br>"))
 
-    def handle_manual_sell(self, market, ticker, qty, name):
-        """수동 매도 버튼 클릭 시 호출되는 함수"""
-        reply = QMessageBox.question(self, '매도 확인', f"<b>[{name} ({ticker})]</b><br><br>수량: {qty}주<br><br>정말로 매도하시겠습니까?",
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        
-        if reply == QMessageBox.Yes:
-            print(f"▶️ [{name} ({ticker})] 사용자가 수동 매도를 요청했습니다...")
-            result = manual_sell(market, ticker, qty)
+    def _qty_max_numeric(self, row: dict) -> float:
+        """보유 행의 최대 매도 가능 수량(표시 qty와 동일 기준)."""
+        try:
+            return float(str(row.get("qty", "0")).replace(",", "").strip())
+        except ValueError:
+            return 0.0
 
-            if isinstance(result, dict):
-                if result.get("success"):
-                    QMessageBox.information(self, "매도 성공", result.get("message", "매도 주문이 성공적으로 전송되었습니다."))
-                else:
-                    QMessageBox.warning(self, "매도 실패", result.get("message", "매도 주문에 실패했습니다."))
+    def _default_manual_sell_qty_text(self, row: dict) -> str:
+        """수량 입력란 기본값 문자열 (보유 전량)."""
+        is_coin = row.get("market") == "🪙 코인"
+        qm = self._qty_max_numeric(row)
+        if qm <= 0:
+            return ""
+        if is_coin:
+            s = f"{qm:.8f}".rstrip("0").rstrip(".")
+            return s if s else ""
+        return str(int(round(qm)))
+
+    def _on_manual_sell_click(self, row: dict, qty_edit: QLineEdit):
+        """수량 입력 후 수동 매도 확인·주문 (빈 칸 = 보유 전량)."""
+        market = row["m_code"]
+        ticker = row["t_code"]
+        name = row["name"]
+        is_coin = row.get("market") == "🪙 코인"
+        qty_max = self._qty_max_numeric(row)
+        if qty_max <= 0:
+            QMessageBox.warning(self, "매도 불가", "표시된 보유 수량이 없습니다.")
+            return
+
+        raw = (qty_edit.text() or "").strip().replace(",", "")
+        if not raw:
+            qty_use = qty_max
+        else:
+            try:
+                qty_use = float(raw)
+            except ValueError:
+                QMessageBox.warning(self, "입력 오류", "매도 수량은 숫자로 입력해 주세요.")
+                return
+
+        tol = 1e-8 if is_coin else 1e-6
+        if qty_use <= 0:
+            QMessageBox.warning(self, "입력 오류", "매도 수량은 0보다 커야 합니다.")
+            return
+        if qty_use > qty_max + tol:
+            QMessageBox.warning(self, "입력 오류", f"보유 수량을 초과했습니다. (최대 {qty_max:g})")
+            return
+
+        if not is_coin:
+            if abs(qty_use - round(qty_use)) > 1e-6:
+                QMessageBox.warning(self, "입력 오류", "국장·미장은 정수 주 단위만 매도할 수 있습니다.")
+                return
+            qty_final = int(round(qty_use))
+        else:
+            qty_final = float(qty_use)
+
+        qty_label = str(qty_final)
+        reply = QMessageBox.question(
+            self,
+            "매도 확인",
+            f"<b>[{name} ({ticker})]</b><br><br>"
+            f"매도 수량: <b>{qty_label}</b><br>"
+            f"(표시 보유 최대 <b>{qty_max:g}</b>)<br><br>"
+            "정말 매도하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        unit = "" if is_coin else "주"
+        print(f"▶️ [{name} ({ticker})] 사용자 수동 매도 요청 — 수량 {qty_label}{unit}")
+        result = manual_sell(market, ticker, qty_final)
+
+        if isinstance(result, dict):
+            if result.get("success"):
+                QMessageBox.information(
+                    self,
+                    "매도 성공",
+                    result.get("message", "매도 주문이 성공적으로 전송되었습니다."),
+                )
             else:
-                if bool(result):
-                    QMessageBox.information(self, "매도 성공", "매도 주문이 성공적으로 전송되었습니다.")
-                else:
-                    QMessageBox.warning(self, "매도 실패", "매도 주문에 실패했습니다.")
-            
-            self.refresh_balance()
+                QMessageBox.warning(
+                    self,
+                    "매도 실패",
+                    result.get("message", "매도 주문에 실패했습니다."),
+                )
+        else:
+            if bool(result):
+                QMessageBox.information(self, "매도 성공", "매도 주문이 성공적으로 전송되었습니다.")
+            else:
+                QMessageBox.warning(self, "매도 실패", "매도 주문에 실패했습니다.")
+
+        self.refresh_balance()
 
     def refresh_trade_history(self):
         """trade_history.json을 읽어 매매 내역 탭을 업데이트합니다."""
@@ -1013,10 +1089,25 @@ class BotDashboard(QMainWindow):
             self.table.setItem(row, 4, QTableWidgetItem(curr_str))
             self.table.setItem(row, 5, QTableWidgetItem(f"{d['roi']:+.2f}%"))
 
-            # 매도 버튼 부착
+            cell = QWidget()
+            row_lay = QHBoxLayout(cell)
+            row_lay.setContentsMargins(4, 2, 4, 2)
+            row_lay.setSpacing(6)
+            qty_edit = QLineEdit()
+            qty_edit.setPlaceholderText("비우면 전량")
+            qty_edit.setText(self._default_manual_sell_qty_text(d))
+            qty_edit.setMinimumWidth(80)
+            qty_edit.setMaximumWidth(160)
+            qty_edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             sell_btn = QPushButton("매도")
-            sell_btn.clicked.connect(lambda _, m=d['m_code'], t=d['t_code'], q=d['qty'], n=d['name']: self.handle_manual_sell(m, t, q, n))
-            self.table.setCellWidget(row, 6, sell_btn)
+            sell_btn.setMinimumWidth(56)
+            row_lay.addWidget(qty_edit)
+            row_lay.addWidget(sell_btn)
+            row_copy = dict(d)
+            sell_btn.clicked.connect(
+                lambda _checked=False, rp=row_copy, ed=qty_edit: self._on_manual_sell_click(rp, ed)
+            )
+            self.table.setCellWidget(row, 6, cell)
 
     def _on_refresh_finished(self):
         self._refresh_inflight = False

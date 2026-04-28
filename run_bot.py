@@ -1056,29 +1056,102 @@ def get_safe_balance(data, key=None, default=0):
     return default
 
 
-def _apply_manual_sell_state_update(ticker, exec_price):
-    """수동 매도 체결 후 bot_state의 포지션/승패/누적수익률 반영"""
+def _manual_sell_remaining_display(market: str, remaining_qty: float) -> str:
+    """로그·텔레그램용 잔여 수량 문자열."""
+    rq = float(remaining_qty or 0.0)
+    if market == "COIN":
+        s = f"{rq:.8f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    return str(int(round(rq)))
+
+
+def _run_manual_sell_position_sync() -> None:
+    """수동 매도 직후 실계좌 시드와 장부 재동기화(국·미·코인 조회가 모두 성공할 때만)."""
+    state = load_state(STATE_PATH)
+    held_kr = get_held_stocks_kr()
+    held_us = get_held_stocks_us()
+    held_coins = get_held_coins()
+    if held_kr is None or held_us is None or held_coins is None:
+        print(
+            "  ⚠️ [수동 매도 후 동기화 건너뜀] 실보유 조회 실패 — 다음 자동 사이클에서 재동기화됩니다."
+        )
+        return
+    sync_all_positions(state, held_kr, held_us, held_coins, STATE_PATH)
+
+
+def _apply_manual_sell_state_update(ticker: str, exec_price: float, market: str, sold_qty: float) -> dict:
+    """수동 매도 체결 후 장부 반영. 전량 청산 시에만 승패·total_profit·티커 쿨다운(Layer2) 종결."""
     state = load_state(STATE_PATH)
     positions = state.setdefault("positions", {})
-    pos_info = positions.get(ticker, {})
+    pos_info = positions.get(ticker, {}) or {}
+    strategy_st = pos_info.get("strategy_type")
     buy_p = _to_float(pos_info.get("buy_p", 0), 0.0)
+    exec_px = _to_float(exec_price, 0.0)
+
+    qty_before = _to_float(pos_info.get("qty", 0), 0.0)
+    sold_eff = float(sold_qty)
+    if qty_before > 0:
+        sold_eff = min(sold_eff, qty_before)
+
+    eps = 1e-8 if market == "COIN" else 1e-6
+    if qty_before <= 0:
+        remaining = 0.0
+        full_exit = True
+    else:
+        remaining = max(0.0, qty_before - sold_eff)
+        full_exit = remaining <= eps
 
     profit_rate = None
-    if buy_p > 0 and _to_float(exec_price, 0.0) > 0:
-        profit_rate = ((_to_float(exec_price) - buy_p) / buy_p) * 100
-        stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
-        if profit_rate > 0:
-            stats["wins"] = int(stats.get("wins", 0) or 0) + 1
-        else:
-            stats["losses"] = int(stats.get("losses", 0) or 0) + 1
-        stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
+    if buy_p > 0 and exec_px > 0:
+        profit_rate = ((exec_px - buy_p) / buy_p) * 100.0
+
+    stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
+
+    if full_exit:
+        if profit_rate is not None:
+            if profit_rate > 0:
+                stats["wins"] = int(stats.get("wins", 0) or 0) + 1
+            else:
+                stats["losses"] = int(stats.get("losses", 0) or 0) + 1
+            stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
+    else:
+        if profit_rate is not None and qty_before > 0:
+            stats.setdefault("manual_partial_total_profit_pct", 0.0)
+            w = float(sold_eff) / float(qty_before)
+            stats["manual_partial_total_profit_pct"] = float(stats["manual_partial_total_profit_pct"]) + float(
+                profit_rate
+            ) * w
 
     if ticker in positions:
-        del positions[ticker]
+        if full_exit:
+            del positions[ticker]
+        elif qty_before > 0 and remaining > eps:
+            positions[ticker] = post_partial_ledger(
+                dict(pos_info),
+                float(sold_eff),
+                float(exec_px),
+                float(qty_before),
+                set_scale_out_done=False,
+            )
+
     set_cooldown(state, ticker)
-    set_ticker_cooldown_after_sell(state, ticker, "수동 매도", profit_rate=profit_rate)
+    set_ticker_cooldown_after_sell(
+        state,
+        ticker,
+        "수동 매도",
+        profit_rate=profit_rate,
+        strategy_type=strategy_st,
+        market=market,
+        remaining_qty=float(remaining) if not full_exit else 0.0,
+    )
+
     save_state(STATE_PATH, state)
-    return profit_rate
+    return {
+        "profit_rate": profit_rate,
+        "full_exit": full_exit,
+        "remaining_qty": float(remaining) if not full_exit else 0.0,
+        "sold_qty": float(sold_eff),
+    }
 
 def manual_sell(market, code, quantity):
     """수동 매도
@@ -1104,12 +1177,27 @@ def manual_sell(market, code, quantity):
                 pos0 = (st0.get("positions") or {}).get(code, {})
                 hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
                 exec_price = curr_p
-                profit_rate = _apply_manual_sell_state_update(code, exec_price)
+                meta = _apply_manual_sell_state_update(code, exec_price, "KR", float(int(qty)))
+                profit_rate = meta.get("profit_rate")
+                full_exit = bool(meta.get("full_exit", True))
+                rem_q = float(meta.get("remaining_qty") or 0.0)
                 _record_trade_event("KR", code, "SELL", int(qty), price=exec_price if exec_price > 0 else None, profit_rate=profit_rate, reason="MANUAL")
                 kr_name = get_kr_company_name(code)
                 profit_str = f"{profit_rate:+.2f}%" if profit_rate is not None else "N/A"
-                print(f"  ✅ [국장 수동매도 체결] {kr_name}({code}) {int(qty)}주 | 수익률: {profit_str}")
-                send_telegram(f"✅ [KR] {code}({kr_name}) {int(qty)}주 수동 매도 완료{hold_note}")
+                if full_exit:
+                    print(
+                        f"  ✅ [국장 수동매도 체결] {kr_name}({code}) {int(qty)}주 (전량) | 수익률: {profit_str}"
+                    )
+                    send_telegram(f"✅ [KR] {code}({kr_name}) {int(qty)}주 수동 매도 완료 (전량 청산){hold_note}")
+                else:
+                    rem_disp = _manual_sell_remaining_display("KR", rem_q)
+                    print(
+                        f"  ✅ [국장 수동매도 체결] {kr_name}({code}) 부분 {int(qty)}주 | 잔여 약 {rem_disp}주 | 구간수익률: {profit_str}"
+                    )
+                    send_telegram(
+                        f"✅ [KR] {code}({kr_name}) 부분 매도 {int(qty)}주 완료 · 장부 잔여 약 {rem_disp}주{hold_note}"
+                    )
+                _run_manual_sell_position_sync()
                 return {"success": True, "message": msg}
             return {"success": False, "message": msg}
 
@@ -1140,12 +1228,27 @@ def manual_sell(market, code, quantity):
                 st0 = load_state(STATE_PATH)
                 pos0 = (st0.get("positions") or {}).get(code, {})
                 hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
-                profit_rate = _apply_manual_sell_state_update(code, current_price)
+                meta = _apply_manual_sell_state_update(code, current_price, "US", float(int(qty)))
+                profit_rate = meta.get("profit_rate")
+                full_exit = bool(meta.get("full_exit", True))
+                rem_q = float(meta.get("remaining_qty") or 0.0)
                 _record_trade_event("US", code, "SELL", int(qty), price=current_price, profit_rate=profit_rate, reason="MANUAL")
                 us_name = get_us_company_name(code)
                 profit_str = f"{profit_rate:+.2f}%" if profit_rate is not None else "N/A"
-                print(f"  ✅ [미장 수동매도 체결] {us_name}({code}) {int(qty)}주 | 수익률: {profit_str}")
-                send_telegram(f"✅ [US] {code}({us_name}) {int(qty)}주 수동 매도 완료{hold_note}")
+                if full_exit:
+                    print(
+                        f"  ✅ [미장 수동매도 체결] {us_name}({code}) {int(qty)}주 (전량) | 수익률: {profit_str}"
+                    )
+                    send_telegram(f"✅ [US] {code}({us_name}) {int(qty)}주 수동 매도 완료 (전량 청산){hold_note}")
+                else:
+                    rem_disp = _manual_sell_remaining_display("US", rem_q)
+                    print(
+                        f"  ✅ [미장 수동매도 체결] {us_name}({code}) 부분 {int(qty)}주 | 잔여 약 {rem_disp}주 | 구간수익률: {profit_str}"
+                    )
+                    send_telegram(
+                        f"✅ [US] {code}({us_name}) 부분 매도 {int(qty)}주 완료 · 장부 잔여 약 {rem_disp}주{hold_note}"
+                    )
+                _run_manual_sell_position_sync()
                 return {"success": True, "message": msg}
             return {"success": False, "message": msg}
 
@@ -1156,11 +1259,24 @@ def manual_sell(market, code, quantity):
                 st0 = load_state(STATE_PATH)
                 pos0 = (st0.get("positions") or {}).get(code, {})
                 hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
-                profit_rate = _apply_manual_sell_state_update(code, current_p)
+                meta = _apply_manual_sell_state_update(code, current_p, "COIN", float(qty))
+                profit_rate = meta.get("profit_rate")
+                full_exit = bool(meta.get("full_exit", True))
+                rem_q = float(meta.get("remaining_qty") or 0.0)
                 _record_trade_event("COIN", code, "SELL", qty, price=current_p if current_p > 0 else None, profit_rate=profit_rate, reason="MANUAL")
                 profit_str = f"{profit_rate:+.2f}%" if profit_rate is not None else "N/A"
-                print(f"  ✅ [코인 수동매도 체결] {code} {qty} | 수익률: {profit_str}")
-                send_telegram(f"✅ [COIN] {code} {qty} 수동 매도 완료{hold_note}")
+                if full_exit:
+                    print(f"  ✅ [코인 수동매도 체결] {code} {qty} (전량) | 수익률: {profit_str}")
+                    send_telegram(f"✅ [COIN] {code} {qty} 수동 매도 완료 (전량 청산){hold_note}")
+                else:
+                    rem_disp = _manual_sell_remaining_display("COIN", rem_q)
+                    print(
+                        f"  ✅ [코인 수동매도 체결] {code} 부분 {qty} | 잔여 약 {rem_disp} | 구간수익률: {profit_str}"
+                    )
+                    send_telegram(
+                        f"✅ [COIN] {code} 부분 매도 {qty} 완료 · 장부 잔여 약 {rem_disp}{hold_note}"
+                    )
+                _run_manual_sell_position_sync()
                 return {"success": True, "message": "코인 시장가 매도 요청 완료"}
             return {"success": False, "message": "코인 매도 응답 없음"}
 
@@ -2940,7 +3056,15 @@ def run_trading_bot():
                             print(f"  ✅ [SWING-SELL] {kr_name}({t}) FULL | {sw_reason}")
                             del state["positions"][t]
                             set_cooldown(state, t)
-                            set_ticker_cooldown_after_sell(state, t, sw_reason)
+                            set_ticker_cooldown_after_sell(
+                                state,
+                                t,
+                                sw_reason,
+                                profit_rate=float(p_full),
+                                strategy_type="SWING_FIB",
+                                market="KR",
+                                remaining_qty=0.0,
+                            )
                             save_state(STATE_PATH, state)
                         else:
                             print(f"  ❌ [SWING-SELL] {kr_name}({t}) FULL 실패: {(r_full or {}).get('msg1', '응답 없음')}")
@@ -3073,7 +3197,15 @@ def run_trading_bot():
                         send_telegram(f"🚨 [국장 추세종료 매도] {t}({kr_name})\n사유: {reason}\n최종 수익률: {profit_rate:.2f}%")
                         del state["positions"][t]
                         set_cooldown(state, t)
-                        set_ticker_cooldown_after_sell(state, t, reason)
+                        set_ticker_cooldown_after_sell(
+                            state,
+                            t,
+                            reason,
+                            profit_rate=float(profit_rate),
+                            strategy_type=strategy_type,
+                            market="KR",
+                            remaining_qty=0.0,
+                        )
                         save_state(STATE_PATH, state)
                     else:
                         print(f"  ❌ {kr_name}({t}) 매도 최종 실패 ({retry_count}회 시도): {resp.get('msg1', 'API 오류') if resp else '응답 없음'}")
@@ -3466,7 +3598,15 @@ def run_trading_bot():
                             print(f"  ✅ [SWING-SELL] {us_name}({t}) FULL | {sw_reason}")
                             del state["positions"][t]
                             set_cooldown(state, t)
-                            set_ticker_cooldown_after_sell(state, t, sw_reason)
+                            set_ticker_cooldown_after_sell(
+                                state,
+                                t,
+                                sw_reason,
+                                profit_rate=float(p_full),
+                                strategy_type="SWING_FIB",
+                                market="US",
+                                remaining_qty=0.0,
+                            )
                             save_state(STATE_PATH, state)
                         else:
                             print(f"  ❌ [SWING-SELL] {us_name}({t}) FULL 실패: {(r_full or {}).get('msg1', '응답 없음')}")
@@ -3605,7 +3745,15 @@ def run_trading_bot():
                         send_telegram(f"🚨 [미장 추세종료 매도] {t}({us_name})\n사유: {reason}\n최종 수익률: {profit_rate:.2f}%")
                         del state["positions"][t]
                         set_cooldown(state, t)
-                        set_ticker_cooldown_after_sell(state, t, reason)
+                        set_ticker_cooldown_after_sell(
+                            state,
+                            t,
+                            reason,
+                            profit_rate=float(profit_rate),
+                            strategy_type=strategy_type,
+                            market="US",
+                            remaining_qty=0.0,
+                        )
                         save_state(STATE_PATH, state)
                     else:
                         print(f"  ❌ {us_name}({t}) 매도 최종 실패 ({retry_count}회 시도): {resp.get('msg1', 'API 오류') if resp else '응답 없음'}")
@@ -3975,7 +4123,15 @@ def run_trading_bot():
                         print(f"  ✅ [SWING-SELL] {t} FULL | {sw_reason}")
                         del state["positions"][t]
                         set_cooldown(state, t)
-                        set_ticker_cooldown_after_sell(state, t, sw_reason)
+                        set_ticker_cooldown_after_sell(
+                            state,
+                            t,
+                            sw_reason,
+                            profit_rate=float(p_full),
+                            strategy_type="SWING_FIB",
+                            market="COIN",
+                            remaining_qty=0.0,
+                        )
                         save_state(STATE_PATH, state)
                     else:
                         print(f"  ❌ [SWING-SELL] {t} FULL 실패: 업비트 응답 없음")
@@ -4110,7 +4266,15 @@ def run_trading_bot():
                     # 장부 업데이트 및 저장
                     del state["positions"][t]
                     set_cooldown(state, t)
-                    set_ticker_cooldown_after_sell(state, t, reason)
+                    set_ticker_cooldown_after_sell(
+                        state,
+                        t,
+                        reason,
+                        profit_rate=float(profit_rate),
+                        strategy_type=strategy_type,
+                        market="COIN",
+                        remaining_qty=0.0,
+                    )
                     save_state(STATE_PATH, state)
                     
                 else: # 3번 모두 실패했다면

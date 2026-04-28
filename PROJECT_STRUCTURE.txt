@@ -1,5 +1,5 @@
 ================================================================================
-  c-bot 프로젝트 구조 / 파일 설명 (2026-04-26)
+  c-bot 프로젝트 구조 / 파일 설명 (2026-04-28)
   — 처음 보는 분도 따라갈 수 있게: 무엇이 어디에 있고, 무엇을 Git에 올리지 않는지까지 정리
 ================================================================================
 
@@ -41,6 +41,8 @@
 run_bot.py
   - 국장(KR) / 미장(US) / 코인(COIN) 통합 매매 엔진.
   - 읽기/쓰기: config.json, bot_state.json, trade_history.json
+  - manual_sell → _apply_manual_sell_state_update(부분/전량 장부·통계·Layer2) → _run_manual_sell_position_sync
+    (국·미·코인 조회 모두 성공 시 sync_all_positions)
   - 핵심 함수: run_trading_bot() = 동기화 → 리스크 → 매도 → 매수
   - 앞단 단계화: _prepare_cycle_state, _sync_positions_for_cycle, _build_market_context
   - 본문은 저위험 helper 추출로 2차 분리 완료. 시장별 통함수(_run_*_cycle) 3차 분리는 선택 과제.
@@ -55,6 +57,8 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
   - 상단: stats 라벨(약 3초 주기), 국/미/코인 예수·총평·보유수익률.
   - "예수금 새로고침" = 일반 정책 조회 / "KIS 강제 새로고침" = KIS 1회 강제(자동 조회 최소 간격 약 25초).
   - 스핀: 국·미·코인 max_positions + "설정 실시간 적용" → run_bot.MAX_* 즉시 + bot_state settings 저장.
+  - 실시간 현황 보유표 마지막 열: 수량 QLineEdit(기본=행 보유 전량, 비우면 전량) + 매도 버튼 → _on_manual_sell_click
+    (보유 초과·정수 주/코인 소수 검증) → run_bot.manual_sell.
   - 탭: 실시간 현황(보유표·수동매도·로그), 매매 내역(trade_history), 장부(positions, 마지막 열은 tier),
     고점 보정(입출금, adjust_capital 동일·CapitalAdjustThread).
   - 매매: 기동 약 1초 후 run_trading_bot 1회 → 이후 KST :00/:15/:30/:45 (중복 실행 가드).
@@ -87,7 +91,8 @@ config.json
 bot_state.json
   - positions: buy_p, sl_p, qty, scale_out_done, entry_atr, current_atr,
     strategy_type(TREND_V8 | SWING_FIB), entry_fib_level(스윙 하드스탑 기준) …
-  - cooldown, ticker_cooldowns, stats
+  - cooldown, ticker_cooldowns, stats (wins/losses/total_profit=전량 청산 누적,
+    manual_partial_total_profit_pct=수동 부분 매도 가중 누적)
   - Phase5: peak_total_equity, last_reset_week(예 2026-W16),
     account_circuit_peak_reset_pending, account_circuit_cooldown_until,
     peak_equity_total_krw(미러), circuit_aux_last_*
@@ -122,10 +127,13 @@ strategy/
   macro_guard.py … Phase4 거시
 
 execution/
-  guard.py … load/save_state, cooldown, MDD, Phase5, can_open_new
+  guard.py … load/save_state, cooldown, MDD, Phase5, can_open_new,
+    compute_ticker_cooldown_hours / set_ticker_cooldown_after_sell (Layer2 ticker_cooldowns:
+    전략·시장·사유 매트릭스(h), 분할 잔량 시 미부여)
   sync_positions.py … 실계좌↔장부, qty 동기화(평일). 주말 국·미 시드 스킵 로그
   order_twap.py … Phase2 TWAP
-  scale_out.py … V8 분할 익절(Scale-Out)
+  scale_out.py … V8 분할 익절(Scale-Out); post_partial_ledger(..., set_scale_out_done=True 기본),
+    수동 부분 매도는 False로 자동 분할익절 플래그와 분리
   circuit_break.py … 합산 드로다운 판정
 
 services/
@@ -167,7 +175,7 @@ tests/
   Phase 3 … ai_filter.py
   Phase 4 … macro_guard.py, macro_data.py
   Phase 5 … circuit_break.py, guard.py, run_bot circuit_aux_*, adjust_capital.py
-  (별도 번호 없음) ticker_cooldowns … 매도 후 재진입 쿨다운
+  (별도 번호 없음) ticker_cooldowns … 매도 후 재진입 쿨다운 (전략·시장·사유 매트릭스, 분할 익절 잔량 시 미부여 / guard.py + run_bot 매도 루프)
 
 
 --------------------------------------------------------------------------------

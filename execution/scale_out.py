@@ -106,8 +106,15 @@ def scale_out_price_target_hit(
     return cp >= target, "fallback_profit", float(target)
 
 
-def post_partial_ledger(pos: dict, sell_qty: float, exec_px: float, qty_before: float) -> dict:
-    """부분 매도 후 ``buy_p``·``qty``·``max_p``·``sl_p``·``scale_out_done`` 보정."""
+def post_partial_ledger(
+    pos: dict,
+    sell_qty: float,
+    exec_px: float,
+    qty_before: float,
+    *,
+    set_scale_out_done: bool = True,
+) -> dict:
+    """부분 매도 후 ``buy_p``·``qty``·``max_p``·``sl_p`` 보정. 수동 부분 매도 등에서는 ``scale_out_done`` 을 건드리지 않도록 할 수 있다."""
     out = dict(pos) if isinstance(pos, dict) else {}
     bp = float(out.get("buy_p") or 0)
     px = float(exec_px or 0)
@@ -131,7 +138,8 @@ def post_partial_ledger(pos: dict, sell_qty: float, exec_px: float, qty_before: 
         out["sl_p"] = float(new_bp * (old_sl / bp))
     old_max = float(out.get("max_p") or px)
     out["max_p"] = max(old_max, px)
-    out["scale_out_done"] = True
+    if set_scale_out_done:
+        out["scale_out_done"] = True
     return out
 
 
