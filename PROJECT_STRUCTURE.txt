@@ -123,7 +123,7 @@ strategy/
              get_chandelier_exit, get_final_exit_price 등
   indicators.py … get_safe_atr (V8 ATR 무결성)
   sector_lock.py … Phase1 섹터 과다 방지
-  ai_filter.py … Phase3 휩쏘
+  ai_filter.py … Phase3 휩쏘, LLM 점수 루브릭(_FALSE_BREAKOUT_SCORE_RUBRIC)으로 0~100과 봇 임계 정렬
   macro_guard.py … Phase4 거시
 
 execution/

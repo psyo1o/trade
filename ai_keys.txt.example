@@ -1,0 +1,6 @@
+# 프로젝트 루트에 ai_keys.txt 로 복사한 뒤 값만 채우세요. (git 추적 안 함)
+# 우선순위: 환경변수 > config.json > 이 파일
+# tests/ai_keys.txt 와 같은 형식이면 복사만 해도 됩니다.
+
+GOOGLE_API_KEY=
+OPENAI_API_KEY=

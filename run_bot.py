@@ -93,6 +93,8 @@ from strategy.ai_filter import (
     get_orderbook_summary_for_coin,
     get_orderbook_summary_from_broker,
     get_recent_15m_ohlcv,
+    get_recent_daily_ohlcv,
+    summarize_ai_rationale,
 )
 from strategy.rules import (
     calculate_pro_signals,
@@ -2895,6 +2897,49 @@ def _new_buy_protection_remaining_sec(buy_time) -> int:
     return remain if remain > 0 else 0
 
 
+def _ai_false_breakout_buy_gate(
+    ticker: str,
+    market_tag: str,
+    strategy_type: str,
+    orderbook: dict,
+    threshold: int,
+    log_label: str,
+) -> bool:
+    """Phase 3 가짜 돌파·스윙 함정 필터. True = 통과(매수 진행), False = 차단."""
+    if not AI_FALSE_BREAKOUT_ENABLED:
+        return True
+    st = str(strategy_type or "TREND_V8").upper()
+    if st == "SWING_FIB":
+        rows = get_recent_daily_ohlcv(ticker, market=market_tag, count=15)
+    else:
+        rows = get_recent_15m_ohlcv(ticker, market=market_tag, count=10)
+    ai_eval = evaluate_false_breakout_filter(
+        ticker=ticker,
+        candles=rows,
+        orderbook=orderbook,
+        threshold=int(threshold),
+        use_ai=True,
+        ai_provider=AI_FALSE_BREAKOUT_PROVIDER,
+        config=config,
+        strategy_type=strategy_type,
+    )
+    prob = int(ai_eval.get("false_breakout_prob", 0) or 0)
+    eng = str(ai_eval.get("evaluation_engine", "?"))
+    if ai_eval.get("openai_fallback_used"):
+        eng = f"{eng} (Gemini→OpenAI 폴백)"
+    summ = summarize_ai_rationale(str(ai_eval.get("rationale", "")))
+    if ai_eval.get("blocked"):
+        print(
+            f"  ⏭️ {log_label}: [AI FILTER] 위험도 {prob}% ≥ {int(threshold)}% | "
+            f"전략: {st} | 산출: {eng} | 사유: {summ}"
+        )
+        return False
+    print(
+        f"  [AI PASS] {ticker} - 전략: {st} | 위험도: {prob}점 | 산출: {eng} | 사유: {summ}"
+    )
+    return True
+
+
 def run_trading_bot():
     """
     한 번의 **트레이딩 사이클**을 수행한다 (스케줄러가 주기적으로 호출).
@@ -3407,25 +3452,17 @@ def run_trading_bot():
                                 )
                                 continue
 
-                            # Phase 3: 모든 필터 통과 후 "매수 직전" AI 휩쏘 게이트
-                            if AI_FALSE_BREAKOUT_ENABLED:
-                                candles_15m = get_recent_15m_ohlcv(t, market="KR", count=10)
-                                orderbook = get_orderbook_summary_from_broker(kis_api.broker_kr, t)
-                                ai_eval = evaluate_false_breakout_filter(
-                                    ticker=t,
-                                    candles_15m_10=candles_15m,
-                                    orderbook=orderbook,
-                                    threshold=AI_FALSE_BREAKOUT_THRESHOLD,
-                                    use_ai=True,
-                                    ai_provider=AI_FALSE_BREAKOUT_PROVIDER,
-                                    config=config,
-                                )
-                                if ai_eval.get("blocked"):
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [AI FILTER] 가짜돌파 {ai_eval.get('false_breakout_prob')}% "
-                                        f"> {AI_FALSE_BREAKOUT_THRESHOLD}% ({ai_eval.get('provider')}) - 패스"
-                                    )
-                                    continue
+                            # Phase 3: 매수 직전 AI 필터 (V8=15m+호가, 스윙=일봉+호가)
+                            orderbook_ai = get_orderbook_summary_from_broker(kis_api.broker_kr, t)
+                            if not _ai_false_breakout_buy_gate(
+                                t,
+                                "KR",
+                                strategy_type,
+                                orderbook_ai,
+                                AI_FALSE_BREAKOUT_THRESHOLD,
+                                f"{kr_name}({t})",
+                            ):
+                                continue
                             
                             # 매수 주문 (Phase2 TWAP: 대액 시 분할)
                             kr_box = [float(kr_cash)]
@@ -3942,25 +3979,16 @@ def run_trading_bot():
                                         f"(총자산 ${total_us_equity:.2f}, 비중캡 후 ratio={ratio:.4f}, macro×{macro_mult:.2f}, 예수금 ${us_cash:.2f})"
                                     )
                                     continue
-                                # Phase 3: 모든 필터 통과 후 "매수 직전" AI 휩쏘 게이트
-                                if AI_FALSE_BREAKOUT_ENABLED:
-                                    candles_15m = get_recent_15m_ohlcv(t, market="US", count=10)
-                                    orderbook = get_orderbook_summary_from_broker(kis_api.broker_us, t)
-                                    ai_eval = evaluate_false_breakout_filter(
-                                        ticker=t,
-                                        candles_15m_10=candles_15m,
-                                        orderbook=orderbook,
-                                        threshold=AI_FALSE_BREAKOUT_THRESHOLD,
-                                        use_ai=True,
-                                        ai_provider=AI_FALSE_BREAKOUT_PROVIDER,
-                                        config=config,
-                                    )
-                                    if ai_eval.get("blocked"):
-                                        print(
-                                            f"  ⏭️ {us_name}({t}): [AI FILTER] 가짜돌파 {ai_eval.get('false_breakout_prob')}% "
-                                            f"> {AI_FALSE_BREAKOUT_THRESHOLD}% ({ai_eval.get('provider')}) - 패스"
-                                        )
-                                        continue
+                                orderbook_ai = get_orderbook_summary_from_broker(kis_api.broker_us, t)
+                                if not _ai_false_breakout_buy_gate(
+                                    t,
+                                    "US",
+                                    strategy_type,
+                                    orderbook_ai,
+                                    AI_FALSE_BREAKOUT_THRESHOLD,
+                                    f"{us_name}({t})",
+                                ):
+                                    continue
 
                                 # 시장가 매수 (Phase2 TWAP: 대액 시 USD 분할, 슬라이스마다 101% 지정가)
                                 us_box = [float(us_cash)]
@@ -4446,25 +4474,16 @@ def run_trading_bot():
                                     )
                                     continue
 
-                                # Phase 3: 코인도 "매수 직전 마지막 게이트" 적용
-                                if AI_FALSE_BREAKOUT_ENABLED:
-                                    candles_15m = get_recent_15m_ohlcv(t, market="COIN", count=10)
-                                    orderbook = get_orderbook_summary_for_coin(t)
-                                    ai_eval = evaluate_false_breakout_filter(
-                                        ticker=t,
-                                        candles_15m_10=candles_15m,
-                                        orderbook=orderbook,
-                                        threshold=AI_FALSE_BREAKOUT_THRESHOLD_COIN,
-                                        use_ai=True,
-                                        ai_provider=AI_FALSE_BREAKOUT_PROVIDER,
-                                        config=config,
-                                    )
-                                    if ai_eval.get("blocked"):
-                                        print(
-                                            f"  ⏭️ {t}: [AI FILTER] 가짜돌파 {ai_eval.get('false_breakout_prob')}% "
-                                            f"> {AI_FALSE_BREAKOUT_THRESHOLD_COIN}% ({ai_eval.get('provider')}) - 패스"
-                                        )
-                                        continue
+                                orderbook_ai = get_orderbook_summary_for_coin(t)
+                                if not _ai_false_breakout_buy_gate(
+                                    t,
+                                    "COIN",
+                                    strategy_type,
+                                    orderbook_ai,
+                                    AI_FALSE_BREAKOUT_THRESHOLD_COIN,
+                                    f"{get_coin_name(t)}({t})",
+                                ):
+                                    continue
 
                                 krw_box = [float(krw_bal)]
                                 entry_atr = float(get_safe_atr(t, ohlcv) or 0.0)

@@ -314,6 +314,19 @@ flowchart TD
 | **4** | **거시 방어막** (VIX·Fear&Greed 등) | `strategy/macro_guard.py`, `api/macro_data.py` |
 | **5** | **합산 계좌 서킷** — 월요일(서울) **주차별 고점** 리셋 후 트레일링 MDD, 쿨다운 후 고점 1회 리셋 | `execution/circuit_break.py`, `execution/guard.py`, `run_bot`, `adjust_capital.py` |
 
+**Phase 3 — LLM 점수 루브릭 (`_FALSE_BREAKOUT_SCORE_RUBRIC`):** Gemini/OpenAI 프롬프트에 주입되는 **0~100 위험도 절대 기준**이다. 숫자가 클수록 위험하며, 봇의 매수 차단 임계와 맞추기 위해 다음 구간 정의를 따른다.
+
+| 구간 | 의미 (요약) |
+|------|-------------|
+| **0~30** | 안전 — 진짜 돌파 또는 찐 바닥 다지기 등 |
+| **31~69** | 보통 — 노이즈·약한 윗꼬리 있으나 추세 유지 → 기본 설정에서 **통과 구간** |
+| **70~79** | 경고 — 휩소 징후 뚜렷 → **국장·미장** 기본 임계(70)에서 매수 차단 |
+| **80~100** | 치명 — 펌프·설거지·칼날 등 → **코인** 기본 임계(80)에서도 차단 |
+
+매수 게이트: `false_breakout_prob >= ai_false_breakout_threshold`(국장·미장 기본 70) 또는 `>= ai_false_breakout_threshold_coin`(코인 기본 80) 이면 차단. 루브릭은 모델이 **임계선 근처에서의 채점 흔들림**을 줄이도록 돕는다(API 실패 시에는 동일 점수 필드로 **룰베이스** 폴백).
+
+**Gemini → OpenAI 폴백:** `ai_false_breakout_provider` 가 `gemini`(기본)일 때, Gemini가 키 없음·API 오류·JSON 실패 등으로 **LLM 점수를 내지 못하면**, `OPENAI_API_KEY`가 있고 `ai_false_breakout_openai_fallback` 이 `false`가 아니면(기본: 폴백 **켜짐**) **한 번** OpenAI를 호출한다. 로그 산출에 `openai (Gemini→OpenAI 폴백)` 이 붙는다. OpenAI 모델명은 `ai_false_breakout_openai_model`(기본 `gpt-4o-mini`). **OpenAI API는 “영구 무료”가 아니라** 신규 계정에 소액 무료 크레딧이 있을 수 있고, 소진 후에는 **종량제**다. 장기 무료에 가깝게 쓰려면 Google AI Studio(Gemini) 쪽이 유리한 경우가 많다.
+
 **MDD(시장·종목 단위)** 와 **매도 후 재진입 `ticker_cooldowns`** 는 Phase 번호 없이 `execution/guard.py` 쪽과 연동됩니다.
 
 ---
@@ -451,7 +464,7 @@ flowchart TD
 - **`twap_*`:** 주문 금액이 임계를 넘으면 분할, 슬라이스 간 `twap_slice_delay_sec` 초 대기.
 - **`buy_window_minutes_before_close`:** 장 마감 N분 전만 신규 매수 허용.
 - **`account_circuit_*`:** 합산 계좌 서킷 on/off, MDD 임계(%), 쿨다운 시간(시간).
-- **`ai_false_breakout_*`:** 매수 직전 AI 휩쏘 게이트.
+- **`ai_false_breakout_*`:** 매수 직전 AI 휩쏘 게이트. LLM에는 `strategy/ai_filter.py` 의 **0~100 절대 루브릭**이 프롬프트에 포함되며, 점수가 임계 이상이면 차단(위 표·Phase 3 절 참고). **API 키**는 환경 변수 `GOOGLE_API_KEY` / `OPENAI_API_KEY`, 또는 `config.json` 동명 키, 또는 **프로젝트 루트 `ai_keys.txt`**(`KEY=value`, `ai_keys.txt.example` 참고) 순으로 조회된다. 선택 키: `ai_false_breakout_openai_fallback`(Gemini 실패 시 OpenAI 재시도, 기본 켜짐), `ai_false_breakout_openai_model`(OpenAI 호출 시 모델, 기본 `gpt-4o-mini`).
 - **`macro_*`:** VIX/FGI 기반 예산 조절·차단.
 
 ---

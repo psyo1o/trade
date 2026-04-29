@@ -21,6 +21,7 @@ token.dat
 config.json
 tests/ai_keys.txt
 tests/ai_keys*.txt
+ai_keys.txt
 .env
 .env.*
 *.pem

@@ -32,7 +32,8 @@ Phase 1 샌드박스 — 동적 섹터 쏠림 방지 (MDD 1차 방어)
   LAB_AI_PROVIDER=openai|gemini|both|auto : Phase 3 AI 제공자 선택(기본 auto).
   LAB_USE_AI=1          : 룰베이스 대신 AI 호출 시도.
   OPENAI_API_KEY / GOOGLE_API_KEY : 선택한 AI 제공자 키.
-  tests/ai_keys.txt               : 메모장 키 파일(환경변수 없을 때 사용).
+  tests/ai_keys.txt               : 이 샌드박스 전용(환경변수 없을 때). 운영 run_bot 은
+                                    config.json 동일 키 또는 루트 ``ai_keys.txt`` (``strategy/ai_filter._get_secret``).
   LAB_VIX=27.5          : Phase 4 테스트용 VIX 값(미지정 시 실조회 시도).
   LAB_FGI=82            : Phase 4 테스트용 Fear&Greed 값(0~100).
 """
