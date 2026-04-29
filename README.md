@@ -86,7 +86,7 @@ py -3.11 adjust_capital.py
 
 ### 매매·알림 시계 (GUI = 헤드리스와 같은 매매 리듬)
 
-- **매매 엔진:** 기동 직후 `do_trade()` 1회, 이후 KST **`:00` / `:15` / `:30` / `:45`** 분기마다 다음 사이클.
+- **매매 엔진:** GUI 기동 직후 즉시 실행은 하지 않고, KST **`:00` / `:15` / `:30` / `:45`** 분기 스케줄에서만 사이클을 실행합니다.
 - **텔레그램 생존신고(heartbeat):** 기동 직후 1회, 이후 KST **`:00` / `:30`** (매매 주기와 별도). 보유 한 줄은 **매수가·현재가(수익률)·최고가·매도선·보유기간** 형식이며, 주말 미장은 `normalize_us_current_p_api_for_display` 로 장부 폴백 시에도 **yfinance 종가**를 쓰도록 GUI와 동일 전처리를 맞춥니다.
 
 ---
@@ -129,7 +129,7 @@ py -3.11 adjust_capital.py
 
 | 동작 | 설명 |
 |------|------|
-| **매매 엔진** | 기동 **약 1초 후** `run_trading_bot()` **1회**, 이후 **KST `:00` / `:15` / `:30` / `:45`** 마다 다시 실행. 이미 한 사이클이 돌고 있으면 중복 호출은 건너뜁니다. |
+| **매매 엔진** | 기동 직후 즉시 실행 없이, **KST `:00` / `:15` / `:30` / `:45`** 마다 `run_trading_bot()` 실행. 이미 한 사이클이 돌고 있으면 중복 호출은 건너뜁니다. |
 | **매매 직전** | `do_trade()` 안에서 잔고 갱신(`refresh_balance`)으로 **최신 `max_p` 등**을 맞춘 뒤 `WorkerThread`에서 실제 `run_trading_bot()` 을 돌립니다. |
 | **텔레그램 heartbeat** | 기동 직후 1회, 이후 **KST `:00` / `:30`** — UI 스레드를 막지 않도록 **별도 스레드**에서 `heartbeat_report()` 호출. |
 | **스캐너 스케줄** | GUI가 `run_bot` 을 불러올 때 `start_scanner_scheduler()` 가 한 번 붙습니다(국·미 스캔 시각은 README 앞부분·`PROJECT_STRUCTURE.txt` 참고). |
@@ -192,6 +192,8 @@ flowchart TD
 - **국장(KR) / 미장(US) / 코인(COIN)** 통합 엔진.
 - 읽고 쓰는 대표 파일: `config.json`, `bot_state.json`, `trade_history.json`.
 - **Phase 5** 합산 서킷용으로 브로커에서 가져온 국·미·코인 평가액을 **`circuit_aux_last_*`** 에 넣고, **`peak_total_equity` / `last_reset_week`** 로 **월요일(서울) 주차별 트레일링 MDD** 를 관리합니다.
+- US 스냅샷(`services/account_snapshot.py`)은 미장 예수금/총평가가 간헐적으로 튈 때 직전 `last_kis_display_snapshot.us`로 폴백해 텔레그램/GUI 표시를 안정화합니다.
+- KR/US 잔고 정책: **장중에만 KIS 실조회**, **장외(휴장/점검)에는 `last_kis_display_snapshot` 고정값 사용**. 코인은 기존대로 실조회합니다.
 - **매도 후 Layer2:** 전량 청산 시 `set_ticker_cooldown_after_sell`(전략·시장·사유 매트릭스). 수동 매도는 `_apply_manual_sell_state_update`·`_run_manual_sell_position_sync` 경로.
 - **관측성:** 예산·예수·TWAP·시장별 스킵은 `[KR …]`, `[US …]`, `[COIN …]` 등 태그 로그로 남깁니다. 모듈 상단 docstring에 grep용 태그 요약이 있습니다.
 
@@ -211,7 +213,7 @@ flowchart TD
 
 ### `adjust_capital.py`
 
-- 예수금 입출금만으로 총자산이 바뀌면 Phase5 고점이 왜곡될 수 있어, **`peak_total_equity`** (및 미러 `peak_equity_total_krw`) 를 수동으로 맞출 때 사용합니다.
+- 예수금 입출금만으로 총자산이 바뀌면 Phase5 고점이 왜곡될 수 있어, **`peak_total_equity`** 를 수동으로 맞출 때 사용합니다.
 - 실행 시 **`refresh_circuit_aux_from_brokers`** 로 스냅샷을 맞춘 뒤 금액을 입력합니다.
 
 ### `config.json`

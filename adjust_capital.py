@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-수동 입·출금 반영 → Phase 5 합산 MDD용 고점(`peak_total_equity`, 레거시 미러 `peak_equity_total_krw`) 보정.
+수동 입·출금 반영 → Phase 5 합산 MDD용 고점(`peak_total_equity`) 보정.
 
 메인 봇은 `execution.guard.apply_phase5_trailing_week_and_cooldown` 등으로 주차 고점을 관리하며,
 현금만 입출금하면 평가금이 변해 고점 대비 드로다운이 왜곡될 수 있다.
@@ -24,7 +24,6 @@ if str(ROOT) not in sys.path:
 
 from execution.circuit_break import estimate_usdkrw  # noqa: E402
 from execution.guard import (  # noqa: E402
-    PEAK_EQUITY_TOTAL_KRW_KEY,
     PEAK_TOTAL_EQUITY_KEY,
     load_state,
     save_state,
@@ -99,7 +98,7 @@ def apply_capital_peak_adjustment(
     source_label: str = "adjust_capital.py",
 ) -> tuple[bool, str]:
     """
-    ``circuit_aux_*`` 갱신 후 ``peak_total_equity``(및 레거시 미러) 입·출금 보정 및 ``capital_adjustments`` 기록.
+    ``circuit_aux_*`` 갱신 후 ``peak_total_equity`` 입·출금 보정 및 ``capital_adjustments`` 기록.
 
     Returns
         ``(True, 요약 메시지)`` 또는 ``(False, 오류 메시지)``.
@@ -113,8 +112,6 @@ def apply_capital_peak_adjustment(
     state = load_state(path)
     current_total = portfolio_total_krw_estimated(state)
     old_peak = float(state.get(PEAK_TOTAL_EQUITY_KEY, 0.0) or 0.0)
-    if old_peak <= 0.0:
-        old_peak = float(state.get(PEAK_EQUITY_TOTAL_KRW_KEY, 0.0) or 0.0)
     peak_was_missing = old_peak <= 0.0
 
     if old_peak <= 0.0:
@@ -139,7 +136,7 @@ def apply_capital_peak_adjustment(
         )
 
     state[PEAK_TOTAL_EQUITY_KEY] = float(new_peak)
-    state[PEAK_EQUITY_TOTAL_KRW_KEY] = float(new_peak)
+    state.pop("peak_equity_total_krw", None)
 
     entry = {
         "ts": datetime.now().isoformat(timespec="seconds"),

@@ -54,7 +54,6 @@ from execution.guard import (
     ACCOUNT_CIRCUIT_COOLDOWN_KEY,
     ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY,
     LAST_RESET_WEEK_KEY,
-    PEAK_EQUITY_TOTAL_KRW_KEY,
     PEAK_TOTAL_EQUITY_KEY,
     apply_phase5_trailing_week_and_cooldown,
     can_open_new,
@@ -1339,42 +1338,76 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
             result["us_ok"] = True
     else:
         try:
-            bal = ensure_dict(get_balance_with_retry())
-            kr_balance_data = bal.get("output2", [])
-            _, total_kr_equity = parse_kr_cash_total(kr_balance_data, _to_float)
-            result["kr_ok"] = True
+            if is_market_open("KR"):
+                bal = ensure_dict(get_balance_with_retry())
+                kr_balance_data = bal.get("output2", [])
+                _, total_kr_equity = parse_kr_cash_total(kr_balance_data, _to_float)
+                result["kr_ok"] = True
+            else:
+                snap = load_last_kis_display_snapshot()
+                kr_d = snap.get("kr") or {}
+                if isinstance(kr_d, dict) and kr_d.get("total") is not None:
+                    total_kr_equity = float(kr_d["total"])
+                    result["kr_ok"] = True
+                print("  📌 [circuit_aux 갱신] 국장 비장중 — last_kis_display_snapshot 사용")
         except Exception as e:
             print(f"  ⚠️ [circuit_aux 갱신] 국장 조회 실패: {e}")
 
         try:
-            us_cash = float(get_us_cash_real(kis_api.broker_us) or 0.0)
-            us_bal = ensure_dict(get_us_positions_with_retry())
-            out2 = safe_get(us_bal, "output2", {})
-            if us_cash <= 0.0 and out2:
-                try:
-                    us_cash = float(parse_us_cash_fallback(out2, _to_float))
-                except Exception:
-                    pass
-            us_output1 = ensure_list(us_bal.get("output1", []))
-            if isinstance(out2, list) and out2:
-                us_stock_value = _to_float(out2[0].get("ovrs_stck_evlu_amt", 0))
-            elif isinstance(out2, dict):
-                us_stock_value = _to_float(out2.get("ovrs_stck_evlu_amt", 0))
+            if is_market_open("US"):
+                us_cash = float(get_us_cash_real(kis_api.broker_us) or 0.0)
+                us_bal = ensure_dict(get_us_positions_with_retry())
+                out2 = safe_get(us_bal, "output2", {})
+                if us_cash <= 0.0 and out2:
+                    try:
+                        us_cash = float(parse_us_cash_fallback(out2, _to_float))
+                    except Exception:
+                        pass
+                us_output1 = ensure_list(us_bal.get("output1", []))
+                if isinstance(out2, list) and out2:
+                    us_stock_value = _to_float(out2[0].get("ovrs_stck_evlu_amt", 0))
+                elif isinstance(out2, dict):
+                    us_stock_value = _to_float(out2.get("ovrs_stck_evlu_amt", 0))
+                else:
+                    us_stock_value = 0.0
+                if us_stock_value <= 0 and us_output1:
+                    manual_stock_eval = 0.0
+                    for s in us_output1:
+                        val = _to_float(s.get("frcr_evlu_amt2", 0))
+                        if val <= 0:
+                            price = _to_float(s.get("ovrs_now_prc2", 0))
+                            qty = _to_float(s.get("ovrs_cblc_qty", s.get("hldg_qty", 0)))
+                            val = price * qty
+                        manual_stock_eval += val
+                    if manual_stock_eval > 0:
+                        us_stock_value = manual_stock_eval
+                total_us_equity = us_cash + us_stock_value
+                # KIS 해외 잔고 API가 간헐적으로 0/누락을 돌려줄 수 있어 비정상 하락은 실패로 간주.
+                prev_us_equity = float(state.get("circuit_aux_last_usd_total", 0) or 0)
+                suspicious_zero = (total_us_equity <= 0.0) and (
+                    prev_us_equity > 0.0 or bool(us_output1)
+                )
+                suspicious_drop = (
+                    prev_us_equity > 0.0
+                    and total_us_equity > 0.0
+                    and total_us_equity < prev_us_equity * 0.35
+                )
+                if suspicious_zero or suspicious_drop:
+                    result["us_ok"] = False
+                    total_us_equity = prev_us_equity
+                    print(
+                        "  ⚠️ [circuit_aux 갱신] 미장 값 비정상(미수금/총평가 누락 추정) — "
+                        "이번 루프는 직전 US 스냅샷 유지, Phase5 판정에서 제외"
+                    )
+                else:
+                    result["us_ok"] = True
             else:
-                us_stock_value = 0.0
-            if us_stock_value <= 0 and us_output1:
-                manual_stock_eval = 0.0
-                for s in us_output1:
-                    val = _to_float(s.get("frcr_evlu_amt2", 0))
-                    if val <= 0:
-                        price = _to_float(s.get("ovrs_now_prc2", 0))
-                        qty = _to_float(s.get("ovrs_cblc_qty", s.get("hldg_qty", 0)))
-                        val = price * qty
-                    manual_stock_eval += val
-                if manual_stock_eval > 0:
-                    us_stock_value = manual_stock_eval
-            total_us_equity = us_cash + us_stock_value
-            result["us_ok"] = True
+                snap = load_last_kis_display_snapshot()
+                us_d = snap.get("us") or {}
+                if isinstance(us_d, dict) and us_d.get("total") is not None:
+                    total_us_equity = float(us_d["total"])
+                    result["us_ok"] = True
+                print("  📌 [circuit_aux 갱신] 미장 비장중 — last_kis_display_snapshot 사용")
         except Exception as e:
             print(f"  ⚠️ [circuit_aux 갱신] 미장 조회 실패: {e}")
 
@@ -1392,6 +1425,22 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
         result["coin_ok"] = True
     except Exception as e:
         print(f"  ⚠️ [circuit_aux 갱신] 코인 조회 실패: {e}")
+
+    # 장외에는 KR/US를 표시 스냅샷 기준으로 고정해 불안정한 야간 KIS 응답을 차단.
+    try:
+        disp = load_last_kis_display_snapshot()
+        kr_d = disp.get("kr") if isinstance(disp.get("kr"), dict) else {}
+        us_d = disp.get("us") if isinstance(disp.get("us"), dict) else {}
+        snap_kr_total = float(_to_float(kr_d.get("total", 0), 0.0))
+        snap_us_total = float(_to_float(us_d.get("total", 0), 0.0))
+        if (not is_market_open("KR")) and snap_kr_total > 0:
+            total_kr_equity = snap_kr_total
+            result["kr_ok"] = True
+        if (not is_market_open("US")) and snap_us_total > 0:
+            total_us_equity = snap_us_total
+            result["us_ok"] = True
+    except Exception:
+        pass
 
     state["circuit_aux_last_kr_krw"] = float(total_kr_equity)
     state["circuit_aux_last_usd_total"] = float(total_us_equity)
@@ -1440,8 +1489,8 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
             print(f"  ⚠️ [TEST_MODE] 청산 시뮬 요약 실패: {e}")
         return
 
-    # KR
-    if not kis_equities_weekend_suppress_window_kst():
+    # KR (정규장일 때만 실주문)
+    if not kis_equities_weekend_suppress_window_kst() and is_market_open("KR"):
         try:
             bal = ensure_dict(get_balance_with_retry())
             for stock in ensure_list(bal.get("output1")):
@@ -1452,9 +1501,11 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
                 manual_sell("KR", code, qty)
         except Exception as e:
             print(f"  ⚠️ [Phase5] 국장 전량 청산 루프 예외: {e}")
+    else:
+        print("  ⏸️ [Phase5] 국장 비장중/점검 구간 — KR 청산은 장 개시 후 재시도")
 
-    # US
-    if not kis_equities_weekend_suppress_window_kst():
+    # US (정규장일 때만 실주문)
+    if not kis_equities_weekend_suppress_window_kst() and is_market_open("US"):
         try:
             us_bal = ensure_dict(get_us_positions_with_retry())
             for item in ensure_list(us_bal.get("output1")):
@@ -1465,6 +1516,8 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
                 manual_sell("US", c, q)
         except Exception as e:
             print(f"  ⚠️ [Phase5] 미장 전량 청산 루프 예외: {e}")
+    else:
+        print("  ⏸️ [Phase5] 미장 비장중/점검 구간 — US 청산은 장 개시 후 재시도")
 
     # COIN
     try:
@@ -1480,10 +1533,53 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
         print(f"  ⚠️ [Phase5] 코인 전량 청산 루프 예외: {e}")
 
 
+def _phase5_pending_positions_exist(state: dict) -> bool:
+    """장부 기준 미청산 포지션 존재 여부."""
+    pos = state.get("positions", {}) if isinstance(state, dict) else {}
+    return isinstance(pos, dict) and len(pos) > 0
+
+
+def _phase5_try_pending_liquidation() -> None:
+    """
+    서킷 발동 후 비장중으로 미체결된 시장을 장 개시 시점에 재시도.
+    cooldown 중에도 실행하여 '나중에라도 전량 청산'을 보장한다.
+    """
+    st = load_state(STATE_PATH)
+    if not bool(st.get("phase5_pending_liquidation")):
+        return
+    if not _phase5_pending_positions_exist(st):
+        st["phase5_pending_liquidation"] = False
+        save_state(STATE_PATH, st)
+        return
+
+    print("  🔁 [Phase5] 대기 청산 재시도 — 장 개시 시장부터 전량 청산 시도")
+    _phase5_emergency_liquidate_all(st)
+    st2 = load_state(STATE_PATH)
+    if not _phase5_pending_positions_exist(st2):
+        st2["phase5_pending_liquidation"] = False
+        save_state(STATE_PATH, st2)
+        print("  ✅ [Phase5] 대기 청산 완료 — 모든 포지션 정리됨")
+        try:
+            send_telegram("✅ [Phase5] 대기 청산 완료 — 시장 재개 후 미체결 포지션까지 정리되었습니다.")
+        except Exception:
+            pass
+
+
 def _maybe_run_account_circuit(state: dict) -> None:
     """매 루프 시작부: 월요일 주차 고점·쿨다운 후 리셋 → 합산 MDD 서킷 → (옵션) 전량 청산 + 쿨다운."""
     if not ACCOUNT_CIRCUIT_ENABLED:
         return
+    aux_meta = state.get("_phase5_aux_sync") if isinstance(state.get("_phase5_aux_sync"), dict) else {}
+    if aux_meta:
+        kr_ok = bool(aux_meta.get("kr_ok"))
+        us_ok = bool(aux_meta.get("us_ok"))
+        coin_ok = bool(aux_meta.get("coin_ok"))
+        if not (kr_ok and us_ok and coin_ok):
+            print(
+                "  ⚠️ [Phase5 서킷] circuit_aux 동기화 불완전("
+                f"KR={kr_ok}, US={us_ok}, COIN={coin_ok}) — 이번 루프 서킷 판정은 건너뜀(오발동 방지)"
+            )
+            return
     total = _portfolio_total_krw_from_aux(state)
     if total <= 0:
         return
@@ -1495,13 +1591,13 @@ def _maybe_run_account_circuit(state: dict) -> None:
         PEAK_TOTAL_EQUITY_KEY,
         LAST_RESET_WEEK_KEY,
         ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY,
-        PEAK_EQUITY_TOTAL_KRW_KEY,
         ACCOUNT_CIRCUIT_COOLDOWN_KEY,
     ):
         if _k in st:
             state[_k] = st[_k]
 
     if in_account_circuit_cooldown(st):
+        _phase5_try_pending_liquidation()
         print(
             f"  🛡️ [Phase5 서킷] 계좌 단위 쿨다운 중 — 신규 매수는 쿨다운 종료까지 차단 "
             f"(until={st.get('account_circuit_cooldown_until', '')})"
@@ -1521,8 +1617,12 @@ def _maybe_run_account_circuit(state: dict) -> None:
         f"🚨 [Phase5 계좌 서킷 발동]\n{ev['reason']}\n전량 청산을 시도합니다. "
         f"(TEST_MODE={TEST_MODE})"
     )
+    state["phase5_pending_liquidation"] = True
+    save_state(STATE_PATH, state)
     _phase5_emergency_liquidate_all(state)
     st2 = load_state(STATE_PATH)
+    if not _phase5_pending_positions_exist(st2):
+        st2["phase5_pending_liquidation"] = False
     set_account_circuit_cooldown(st2, STATE_PATH, ACCOUNT_CIRCUIT_COOLDOWN_H)
 
 
@@ -2124,20 +2224,50 @@ def normalize_us_current_p_api_for_display(
     buy_p: float,
     current_p_api,
     *,
+    is_market_open_now: bool | None = None,
     is_weekend: bool | None = None,
 ):
     """
     US 표시 현재가 전처리(텔레그램/GUI 공용).
     - 유효한 API 현재가가 없으면 None
-    - 주말·점검 창에서 장부 폴백값(current_p==avg_p)은 None으로 내려 yfinance 경로를 강제
+    - 비장중/주말·점검 창에서 장부 폴백값(current_p==avg_p)은 None으로 내려 yfinance 경로를 강제
     """
+    return normalize_equity_current_p_api_for_display(
+        market="US",
+        buy_p=buy_p,
+        current_p_api=current_p_api,
+        is_market_open_now=is_market_open_now,
+        is_weekend=is_weekend,
+    )
+
+
+def normalize_equity_current_p_api_for_display(
+    market: str,
+    buy_p: float,
+    current_p_api,
+    *,
+    is_market_open_now: bool | None = None,
+    is_weekend: bool | None = None,
+):
+    """
+    KR/US 표시 현재가 전처리(텔레그램/GUI 공용).
+    - 유효한 API 현재가가 없으면 None
+    - KR/US 비장중(프리·애프터·점검·주말)에서 장부 폴백값(current_p==avg_p)은
+      None으로 내려 외부 시세(yfinance) 경로를 강제
+    """
+    m = str(market or "").strip().upper()
     cp = float(_to_float(current_p_api, 0.0))
     bp = float(_to_float(buy_p, 0.0))
     if cp <= 0:
         return None
+    if m not in ("KR", "US"):
+        return cp
     if is_weekend is None:
         is_weekend = bool(kis_equities_weekend_suppress_window_kst())
-    if is_weekend and bp > 0:
+    if is_market_open_now is None:
+        is_market_open_now = bool(is_market_open(m))
+    # 숫자 직렬화/반올림 차이를 고려한 허용오차
+    if (is_weekend or (not is_market_open_now)) and bp > 0:
         # 숫자 직렬화/반올림 차이를 고려한 허용오차
         tol = max(0.01, abs(bp) * 1e-4)
         if abs(cp - bp) <= tol:
@@ -2168,6 +2298,7 @@ def build_account_snapshot_for_report(
         "get_kr_holdings_with_roi": get_kr_holdings_with_roi,
         "get_us_holdings_with_roi": get_us_holdings_with_roi,
         "get_coin_holdings_with_roi": get_coin_holdings_with_roi,
+        "is_market_open": is_market_open,
     }
     return _build_account_snapshot_for_report(
         deps=deps,
@@ -2248,8 +2379,14 @@ def get_kr_holdings_with_roi():
             if buy_p <= 0:
                 continue
             
-            # 현재가: 공용 해석 함수
-            curr_p = resolve_display_current_price("KR", code, buy_p, stock.get("prpr"))
+            cp_api = normalize_equity_current_p_api_for_display(
+                market="KR",
+                buy_p=buy_p,
+                current_p_api=stock.get("prpr"),
+                is_market_open_now=is_market_open("KR"),
+                is_weekend=bool(kis_equities_weekend_suppress_window_kst()),
+            )
+            curr_p = resolve_display_current_price("KR", code, buy_p, cp_api)
                 
             roi = ((curr_p - buy_p) / buy_p) * 100
             kr_name = get_kr_company_name(code)
@@ -2280,6 +2417,7 @@ def get_us_holdings_with_roi():
         
         holdings = []
         is_weekend = bool(kis_equities_weekend_suppress_window_kst())
+        is_us_open = bool(is_market_open("US"))
         for item in us_data:
             ticker = normalize_ticker(item['code'])
             qty = item['qty']
@@ -2292,6 +2430,7 @@ def get_us_holdings_with_roi():
             cp_api = normalize_us_current_p_api_for_display(
                 buy_p,
                 item.get("current_p", 0),
+                is_market_open_now=is_us_open,
                 is_weekend=is_weekend,
             )
             curr_p = resolve_display_current_price("US", ticker, buy_p, cp_api)
@@ -2486,6 +2625,20 @@ def _build_market_context(state: dict) -> tuple[dict, float, str]:
         )
     else:
         print(f"  🛡️ [Phase4 거시] 비활성 | {macro_reason}")
+
+    # Phase5 합산 DD는 직전 캐시(circuit_aux_*)가 아니라, 가능하면 이번 루프 시작 시점 값으로 재동기화
+    try:
+        aux_info = refresh_circuit_aux_from_brokers(state, STATE_PATH)
+        if isinstance(aux_info, dict):
+            state["_phase5_aux_sync"] = {
+                "kr_ok": bool(aux_info.get("kr_ok")),
+                "us_ok": bool(aux_info.get("us_ok")),
+                "coin_ok": bool(aux_info.get("coin_ok")),
+                "weekend_kis_skip": bool(aux_info.get("weekend_kis_skip")),
+            }
+    except Exception as e:
+        state["_phase5_aux_sync"] = {"kr_ok": False, "us_ok": False, "coin_ok": False}
+        print(f"  ⚠️ [Phase5 보조값] circuit_aux 갱신 실패 — 이번 루프 서킷 판정은 건너뜀: {type(e).__name__}: {e}")
 
     _maybe_run_account_circuit(state)
     return weather, macro_mult, macro_reason

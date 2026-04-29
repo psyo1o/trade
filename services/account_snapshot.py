@@ -93,6 +93,15 @@ def build_account_snapshot_for_report(
 
     weather = deps["get_real_weather"](deps["broker_kr"], deps["broker_us"])
     snap = deps["load_last_kis_display_snapshot"]()
+    is_market_open_fn = deps.get("is_market_open")
+
+    def _is_open(market: str) -> bool:
+        try:
+            if callable(is_market_open_fn):
+                return bool(is_market_open_fn(market))
+        except Exception:
+            pass
+        return True
 
     kr_bal: dict = {}
     us_bal: dict = {}
@@ -126,7 +135,7 @@ def build_account_snapshot_for_report(
         kr_part = snap.get("kr") or {}
         us_part = snap.get("us") or {}
 
-        if allow_kis_fetch("KR"):
+        if allow_kis_fetch("KR") and _is_open("KR"):
             try:
                 kr_bal = with_backoff(deps["get_balance_with_retry"], "KR 잔고") or {}
                 out2 = kr_bal.get("output2", []) if isinstance(kr_bal, dict) else []
@@ -143,13 +152,16 @@ def build_account_snapshot_for_report(
                     kr_total = int(deps["safe_num"](kr_part.get("total", 0), 0.0))
                     kr_roi = kr_part.get("roi")
         else:
-            print("  📌 [snapshot KR] allow_kis_fetch=False — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
+            if not _is_open("KR"):
+                print("  📌 [snapshot KR] 비장중 — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
+            else:
+                print("  📌 [snapshot KR] allow_kis_fetch=False — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
             if isinstance(kr_part, dict):
                 kr_cash = int(deps["safe_num"](kr_part.get("cash", 0), 0.0))
                 kr_total = int(deps["safe_num"](kr_part.get("total", 0), 0.0))
                 kr_roi = kr_part.get("roi")
 
-        if allow_kis_fetch("US"):
+        if allow_kis_fetch("US") and _is_open("US"):
             try:
                 us_cash = deps["safe_num"](deps["get_us_cash_real"](deps["broker_us"]), 0.0)
                 us_bal = with_backoff(deps["get_us_positions_with_retry"], "US 잔고") or {}
@@ -159,6 +171,27 @@ def build_account_snapshot_for_report(
                     us_cash = deps["safe_num"](parse_us_cash_fallback(out2, deps["to_float"]), 0.0)
                 us_total = float(us_cash + float(us_m.get("current", 0.0) or 0.0))
                 us_roi = us_m.get("roi")
+
+                # KIS 해외 예수금/총평이 간헐적으로 튀는 구간 방어(표시·텔레그램 안정화)
+                prev_us_total = float(deps["safe_num"]((us_part or {}).get("total", 0.0), 0.0))
+                prev_us_cash = float(deps["safe_num"]((us_part or {}).get("cash", 0.0), 0.0))
+                us_rows = us_bal.get("output1", []) if isinstance(us_bal, dict) else []
+                has_us_rows = isinstance(us_rows, list) and len(us_rows) > 0
+                suspicious_zero = us_total <= 0.0 and (prev_us_total > 0.0 or has_us_rows)
+                suspicious_drop = (
+                    prev_us_total > 0.0 and has_us_rows and us_total > 0.0 and us_total < prev_us_total * 0.45
+                )
+                suspicious_cash_glitch = prev_us_cash > 50.0 and us_cash <= 0.0 and has_us_rows
+                if suspicious_zero or suspicious_drop or suspicious_cash_glitch:
+                    print(
+                        "  ⚠️ [snapshot US] 미장 라벨 값 급변 감지(일시 API 이상 추정) — "
+                        f"직전 스냅샷 유지 (new cash=${us_cash:.2f}, total=${us_total:.2f} / "
+                        f"prev cash=${prev_us_cash:.2f}, total=${prev_us_total:.2f})"
+                    )
+                    if isinstance(us_part, dict):
+                        us_cash = float(deps["safe_num"](us_part.get("cash", 0.0), 0.0))
+                        us_total = float(deps["safe_num"](us_part.get("total", us_cash), us_cash))
+                        us_roi = us_part.get("roi")
             except Exception as e:
                 print(
                     f"  ⚠️ [snapshot US] 라벨용 잔고 조회 실패 — 직전 스냅샷으로 폴백: {type(e).__name__}: {e}"
@@ -168,7 +201,10 @@ def build_account_snapshot_for_report(
                     us_total = float(deps["safe_num"](us_part.get("total", us_cash), us_cash))
                     us_roi = us_part.get("roi")
         else:
-            print("  📌 [snapshot US] allow_kis_fetch=False — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
+            if not _is_open("US"):
+                print("  📌 [snapshot US] 비장중 — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
+            else:
+                print("  📌 [snapshot US] allow_kis_fetch=False — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
             if isinstance(us_part, dict):
                 us_cash = float(deps["safe_num"](us_part.get("cash", 0.0), 0.0))
                 us_total = float(deps["safe_num"](us_part.get("total", us_cash), us_cash))

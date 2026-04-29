@@ -5,10 +5,10 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
 특징
     * 잔고·성적표·수동 매도·로그 뷰 등은 ``run_bot`` / ``execution`` / ``utils`` API를 그대로 호출.
     * ``import run_bot`` 시점에 ``config.json`` 이 로드되므로 **설정 변경 후 GUI 재시작** 필요.
-    * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_total_equity``(및 ``peak_equity_total_krw`` 미러)·``capital_adjustments`` 반영 (백그라운드 스레드).
-    * 매매는 기동 1초 후 1회 실행한 뒤, **KST :00 / :15 / :30 / :45**에 `run_trading_bot`을 맞춘다.
+    * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_total_equity``·``capital_adjustments`` 반영 (백그라운드 스레드).
+    * 매매는 시작 즉시 실행하지 않고, **KST :00 / :15 / :30 / :45** 정렬 스케줄에만 맞춰 `run_trading_bot`을 실행한다.
     * ``QTimer.singleShot`` 겹침으로 로그가 두 줄씩 나오는 것을 막기 위해 **단일 ``QTimer`` + 실행 중 가드**를 쓴다.
-    * 네트워크 감시·생존신고(heartbeat)는 **백그라운드 스레드**에서 돌리고, 텔레는 **기동 직후 1회** 보낸 뒤 **KST :00 / :30** 벽시계에 맞춘다.
+    * 네트워크 감시·생존신고(heartbeat)는 **백그라운드 스레드**에서 돌리고, 텔레는 **기동 직후 즉시 발송 없이** **KST :00 / :30** 벽시계에 맞춘다.
 
 로그
     * ``RedirectText`` 가 ``utils.logger.get_quant_logger()`` 로 ``logs/bot.log`` 에도 한 줄씩 넘긴다.
@@ -332,10 +332,12 @@ class BalanceUpdaterThread(QThread):
         try:
             m = "KR" if market_code == "KR" else ("US" if market_code == "US" else "COIN")
             cp_api = current_p_api
-            if m == "US":
-                cp_api = run_bot.normalize_us_current_p_api_for_display(
-                    buy_p,
-                    current_p_api,
+            if m in ("KR", "US"):
+                cp_api = run_bot.normalize_equity_current_p_api_for_display(
+                    market=m,
+                    buy_p=buy_p,
+                    current_p_api=current_p_api,
+                    is_market_open_now=bool(run_bot.is_market_open(m)),
                     is_weekend=bool(kis_equities_weekend_suppress_window_kst()),
                 )
             current_price = run_bot.resolve_display_current_price(m, ticker_code, buy_p, cp_api)
@@ -418,13 +420,13 @@ class BotDashboard(QMainWindow):
             print(f"  ⚠️ 브로커 초기화 중 오류: {e}")
             traceback.print_exc()
         
-        # 시작 직후 중복 API를 줄이기 위해 즉시 잔고 갱신은 생략하고,
-        # 1초 후 첫 매매 직전 갱신에서 화면/장부를 함께 맞춥니다.
-        # heartbeat는 API 다발이라 메인 스레드에서 돌리지 않음 — 기동 직후 1회 + 이후 KST :00 / :30 정렬
-        QTimer.singleShot(0, self.send_heartbeat)
+        # 시작 직후 화면은 1회 즉시 갱신(스냅샷 폴백 포함)하고, 매매는 정각 스케줄에서만 실행.
+        # heartbeat는 API 다발이라 메인 스레드에서 돌리지 않음 — 기동 직후 즉시 전송 없이 KST :00 / :30 정렬
+        self._schedule_next_heartbeat_aligned()
+        QTimer.singleShot(150, lambda: self.refresh_balance(sync_first=False))
 
-        # 시작 1초 후 매매 1회 → 다음 분봉 정각(:00/:15/:30/:45 KST)부터 반복
-        QTimer.singleShot(1000, self._first_trade_then_schedule_aligned)
+        # 시작 직후 매매는 실행하지 않고, 분봉 정각(:00/:15/:30/:45 KST)부터 반복
+        self._schedule_next_aligned_trade()
 
     def _check_network_and_maybe_restart(self):
         """연속으로 외부망이 안 되면 프로세스 종료 -> run_bot.bat가 GUI 재실행. 검사는 백그라운드."""
@@ -644,7 +646,7 @@ class BotDashboard(QMainWindow):
         capital_layout = QVBoxLayout(capital_tab)
         capital_help = QLabel(
             "<b>고점 보정 (수동 입·출금)</b><br>"
-            "예수금만 입금/출금하면 Phase5 주차 고점(<code>peak_total_equity</code>, 미러 <code>peak_equity_total_krw</code>)과 실총액이 어긋날 수 있습니다.<br>"
+            "예수금만 입금/출금하면 Phase5 주차 고점(<code>peak_total_equity</code>)과 실총액이 어긋날 수 있습니다.<br>"
             "실행 시 CLI와 같이 <b>실계좌 스냅샷 갱신</b> 후 고점을 가산/감산하고 <code>capital_adjustments</code>에 기록합니다.<br>"
             "<span style='color:#c0392b'>주말 KIS 점검 구간에는 국·미 스냅샷이 제한될 수 있습니다.</span>"
         )
@@ -984,8 +986,7 @@ class BotDashboard(QMainWindow):
         self.stats_label.setText(get_current_stats(STATE_PATH, roi_info=self._last_holdings_roi))
 
     def _first_trade_then_schedule_aligned(self):
-        """기동 직후 1회 매매 실행 후, KST 분봉 정각에 맞춰 다음 실행을 예약한다."""
-        self.do_trade()
+        """레거시 호환: 즉시 실행 없이 KST 분봉 정각 실행만 예약."""
         self._schedule_next_aligned_trade()
 
     def _schedule_next_aligned_trade(self):
@@ -1136,10 +1137,10 @@ class BotDashboard(QMainWindow):
             positions = state.get("positions", {})
             
             ticker_key = str(ticker).strip().upper()
-            
-            # 장 운영 시간 체크
+            # 최고가(max_p)는 정규장 중에만 갱신 (기존 정책 복원)
             market_type = "COIN" if ticker_key.startswith("KRW-") else ("KR" if ticker_key.isdigit() else "US")
-            if not run_bot.is_market_open(market_type): return
+            if not run_bot.is_market_open(market_type):
+                return
 
             if ticker_key in positions:
                 pos = positions[ticker_key]

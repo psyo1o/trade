@@ -67,8 +67,8 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
   - 스캐너: GUI 기동 시 start_scanner_scheduler 연동.
   - 네트워크 연속 실패 시 종료(BOT_DISABLE_NET_WATCH 로 감시 끔 가능).
   - 잔고 스레드: BalanceUpdaterThread + gui_table_adapter.build_rows_data.
-  - US 현재가: 주말 장부 폴백(current=avg) 시 run_bot.normalize_us_current_p_api_for_display 로 API값 비워
-    yfinance 경로 유도(텔레 heartbeat와 동일).
+  - 매매 스케줄: GUI 시작 즉시 1회 실행 없이 KST :00/:15/:30/:45 정렬 타이머에서만 run_trading_bot 호출.
+  - US/KR 현재가: 장부 폴백(current=avg)·비장중 구간에서 정규화 후 yfinance 경로를 유도해 표시 안정화.
 
 screener.py
   - 국장 HTS 조건검색 결과 합쳐 kr_targets.json 저장 (로컬만, Git 무시).
@@ -77,7 +77,7 @@ us_screener.py
   - 미장 유니버스 재빌드 → us_universe_cache.json. 스케줄 15:20 US/Eastern.
 
 adjust_capital.py
-  - 수동 입출금 시 peak_total_equity(및 peak_equity_total_krw 미러) 보정.
+  - 수동 입출금 시 peak_total_equity 단일 키 보정.
   - 실행 시 refresh_circuit_aux_from_brokers 선행. capital_adjustments 기록.
 
 
@@ -95,7 +95,7 @@ bot_state.json
     manual_partial_total_profit_pct=수동 부분 매도 가중 누적)
   - Phase5: peak_total_equity, last_reset_week(예 2026-W16),
     account_circuit_peak_reset_pending, account_circuit_cooldown_until,
-    peak_equity_total_krw(미러), circuit_aux_last_*
+    circuit_aux_last_*  (레거시 peak_equity_total_krw는 로드시 자동 이관/정리)
   - last_kis_display_snapshot, capital_adjustments(선택)
 
 trade_history.json

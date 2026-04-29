@@ -8,7 +8,7 @@
     * ``ticker_cooldowns`` — **매도 후** 티커별 절대 만료 시각(ISO). 전략·시장·사유 매트릭스(h) 적용; 분할 익절 잔량 시 미부여.
     * ``peak_equity_{KR|US|COIN}`` — 시장별 MDD 브레이크용 고점.
     * ``peak_total_equity`` / ``last_reset_week`` / ``account_circuit_peak_reset_pending`` /
-      ``peak_equity_total_krw``(레거시 미러) / ``account_circuit_cooldown_until`` — Phase5 합산 서킷(월요일 주차 MDD).
+      ``account_circuit_cooldown_until`` — Phase5 합산 서킷(월요일 주차 MDD).
 
 V7.1: 모든 보유 종목을 액티브 매매·샹들리에 동일 적용. 포지션별 ``scale_out_done`` 은
 ``load_state`` 시 기본값 ``false`` 로 보강된다.
@@ -62,6 +62,20 @@ def load_state(path: Path):
     data.setdefault("ticker_cooldowns", {})
     # KIS 최종 성공 조회 시점의 국·미 표시용 스냅샷(주말 점검 시 GUI/텔레 재사용)
     data.setdefault("last_kis_display_snapshot", {})
+    # Phase5 레거시 키(peak_equity_total_krw) 자동 이관/정리 — 단일 키 peak_total_equity 유지
+    try:
+        pt = float(data.get("peak_total_equity", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        pt = 0.0
+    try:
+        legacy_pt = float(data.get("peak_equity_total_krw", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        legacy_pt = 0.0
+    if pt <= 0.0 and legacy_pt > 0.0:
+        data["peak_total_equity"] = legacy_pt
+    if "peak_equity_total_krw" in data:
+        data.pop("peak_equity_total_krw", None)
+
     # V7.1: 분할 익절 1회 플래그(기존 장부 호환)
     for _tk, _pos in list(data.get("positions", {}).items()):
         if isinstance(_pos, dict) and "scale_out_done" not in _pos:
@@ -120,7 +134,7 @@ def check_mdd_break(market_type, current_equity, state, path):
 
 # --- Phase 5: 합산 자산 서킷(쿨다운) + 월요일 주차 고점(MDD) ---
 ACCOUNT_CIRCUIT_COOLDOWN_KEY = "account_circuit_cooldown_until"
-PEAK_EQUITY_TOTAL_KRW_KEY = "peak_equity_total_krw"  # 레거시·GUI·스크립트 호환용 미러
+PEAK_EQUITY_TOTAL_KRW_KEY = "peak_equity_total_krw"  # 레거시 입력 이관용(쓰기 금지)
 PEAK_TOTAL_EQUITY_KEY = "peak_total_equity"
 LAST_RESET_WEEK_KEY = "last_reset_week"
 ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY = "account_circuit_peak_reset_pending"
@@ -141,22 +155,20 @@ def week_label_seoul(dt: datetime | None = None) -> str:
     return f"{y}-W{w:02d}"
 
 
-def _mirror_legacy_peak_total_krw(state: dict) -> None:
-    """``peak_total_equity`` 를 ``peak_equity_total_krw`` 에 복제(adjust_capital·구버전 호환)."""
-    if PEAK_TOTAL_EQUITY_KEY in state and state.get(PEAK_TOTAL_EQUITY_KEY) is not None:
-        try:
-            state[PEAK_EQUITY_TOTAL_KRW_KEY] = float(state[PEAK_TOTAL_EQUITY_KEY])
-        except (TypeError, ValueError):
-            pass
+def _drop_legacy_peak_key(state: dict) -> None:
+    """레거시 키 ``peak_equity_total_krw`` 제거(단일 소스 유지)."""
+    if PEAK_EQUITY_TOTAL_KRW_KEY in state:
+        state.pop(PEAK_EQUITY_TOTAL_KRW_KEY, None)
 
 
 def _migrate_legacy_peak_to_total(state: dict) -> bool:
-    """``peak_total_equity`` 가 비어 있고 레거시 고점만 있으면 복사. 변경 시 True."""
+    """레거시 ``peak_equity_total_krw`` 를 ``peak_total_equity`` 로 1회 이관 후 제거."""
     try:
         pt = float(state.get(PEAK_TOTAL_EQUITY_KEY, 0.0) or 0.0)
     except (TypeError, ValueError):
         pt = 0.0
     if pt > 0:
+        _drop_legacy_peak_key(state)
         return False
     try:
         leg = float(state.get(PEAK_EQUITY_TOTAL_KRW_KEY, 0.0) or 0.0)
@@ -164,22 +176,21 @@ def _migrate_legacy_peak_to_total(state: dict) -> bool:
         leg = 0.0
     if leg > 0:
         state[PEAK_TOTAL_EQUITY_KEY] = leg
+        _drop_legacy_peak_key(state)
         return True
+    _drop_legacy_peak_key(state)
     return False
 
 
 def get_phase5_peak_total_equity(state: dict) -> float:
-    """Phase5 MDD 계산용 주차 트레일링 고점(원화). 레거시 키만 있으면 그 값을 반환."""
+    """Phase5 MDD 계산용 주차 트레일링 고점(원화) — 단일 키 ``peak_total_equity``."""
     try:
         pt = float(state.get(PEAK_TOTAL_EQUITY_KEY, 0.0) or 0.0)
     except (TypeError, ValueError):
         pt = 0.0
     if pt > 0:
         return pt
-    try:
-        return float(state.get(PEAK_EQUITY_TOTAL_KRW_KEY, 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    return 0.0
 
 
 def apply_phase5_trailing_week_and_cooldown(state: dict, current_total_krw: float, path: Path) -> None:
@@ -187,7 +198,7 @@ def apply_phase5_trailing_week_and_cooldown(state: dict, current_total_krw: floa
     합산 총자산 기준으로 주차 고점·쿨다운 후 리셋·상향 추적을 한 번에 반영한다.
 
     순서
-        1) 레거시 ``peak_equity_total_krw`` → ``peak_total_equity`` 이주
+        1) 레거시 ``peak_equity_total_krw`` 가 있으면 ``peak_total_equity`` 로 1회 이주 후 삭제
         2) 서킷 쿨다운이 **끝난 뒤** ``account_circuit_peak_reset_pending`` 이면 고점을 현재 총자산으로 리셋(무한 발동 방지)
         3) **서울 기준 월요일**이고 ``last_reset_week`` 가 이번 주와 다르면 고점을 현재 총자산으로 덮어쓰고 주차 갱신
         4) 그 외 ``현재 > 고점`` 이면 고점 상향
@@ -202,7 +213,7 @@ def apply_phase5_trailing_week_and_cooldown(state: dict, current_total_krw: floa
     if not in_cd and state.get(ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY) is True:
         state[PEAK_TOTAL_EQUITY_KEY] = cur
         state[ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY] = False
-        _mirror_legacy_peak_total_krw(state)
+        _drop_legacy_peak_key(state)
         mutated = True
         print(f"  📌 [Phase5] 쿨다운 해제 후 고점 리셋(영점) → {cur:,.0f}원")
 
@@ -212,14 +223,14 @@ def apply_phase5_trailing_week_and_cooldown(state: dict, current_total_krw: floa
         if str(state.get(LAST_RESET_WEEK_KEY, "")).strip() != wl:
             state[PEAK_TOTAL_EQUITY_KEY] = cur
             state[LAST_RESET_WEEK_KEY] = wl
-            _mirror_legacy_peak_total_krw(state)
+            _drop_legacy_peak_key(state)
             mutated = True
             print(f"  📌 [Phase5] 월요일 주차 고점 앵커 ({wl}) → {cur:,.0f}원")
 
     peak = float(state.get(PEAK_TOTAL_EQUITY_KEY, 0.0) or 0.0)
     if peak <= 0.0 or cur > peak:
         state[PEAK_TOTAL_EQUITY_KEY] = cur
-        _mirror_legacy_peak_total_krw(state)
+        _drop_legacy_peak_key(state)
         mutated = True
 
     if mutated:
@@ -245,12 +256,13 @@ def set_account_circuit_cooldown(state, path: Path, hours: float = 24.0) -> None
 
 
 def update_peak_equity_total_krw(state, current_krw: float, path: Path) -> float:
-    """레거시 이름 유지: 주차 MDD·쿨다운 리셋 규칙을 포함한 합산 고점 갱신 후 고점 반환."""
+    """레거시 함수명 유지(내부는 ``peak_total_equity`` 단일 키만 사용)."""
     apply_phase5_trailing_week_and_cooldown(state, float(current_krw), path)
     return get_phase5_peak_total_equity(state)
 
 
 def get_peak_equity_total_krw(state) -> float:
+    """레거시 함수명 유지(반환값은 ``peak_total_equity``)."""
     return get_phase5_peak_total_equity(state)
 
 
