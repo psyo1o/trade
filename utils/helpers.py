@@ -132,12 +132,20 @@ def ensure_dict(data):
     return {}
 
 
+def is_coin_ticker(ticker) -> bool:
+    """국·미가 아닌 **코인** 장부 키 (업비트 ``KRW-`` / 바이낸스 ``USDT-``)."""
+    v = str(ticker or "").strip().upper()
+    return v.startswith("KRW-") or v.startswith("USDT-")
+
+
 def normalize_ticker(ticker):
     """티커/종목코드를 장부 키 기준으로 정규화합니다."""
     value = str(ticker or "").strip().upper()
     if not value:
         return ""
     if value.startswith("KRW-"):
+        return value
+    if value.startswith("USDT-"):
         return value
     if value.isdigit():
         return value.zfill(6)
@@ -158,6 +166,8 @@ def get_coin_name(ticker):
         except Exception as e:
             print(f"⚠️ 코인명 조회 실패: {e}")
 
+    if ticker.startswith("USDT-"):
+        return ticker.replace("USDT-", "")
     # 캐시에서 이름을 찾고, 만약 없다면 'BTC' 처럼 영어만 잘라서 반환합니다.
     return _coin_name_cache.get(ticker, ticker.replace("KRW-", ""))
 

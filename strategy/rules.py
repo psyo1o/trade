@@ -223,8 +223,15 @@ def get_ohlcv_kis_domestic_daily(broker, ticker):
 
 # 🧰 2b. 5% 갭상승 등 — 국내는 KIS 후 yfinance, 그 외는 yfinance
 def get_ohlcv_realtime(broker, ticker):
-    """국내 6자리는 KIS 일봉 우선·부족 시 yfinance, 코인은 업비트, 그 외는 yfinance."""
+    """국내 6자리는 KIS 일봉 우선·부족 시 yfinance, 코인은 업비트/바이낸스, 그 외는 yfinance."""
     try:
+        if str(ticker).startswith("USDT-"):
+            try:
+                from api import coin_broker
+
+                return coin_broker.fetch_ohlcv(str(ticker), "day", 200)
+            except Exception:
+                return []
         if str(ticker).startswith("KRW-"):
             return get_ohlcv_upbit(ticker)
 

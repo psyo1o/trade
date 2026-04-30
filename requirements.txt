@@ -1,5 +1,6 @@
 mojito2
 pyupbit
+ccxt>=4.2.0
 pykrx
 schedule
 requests

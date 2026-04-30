@@ -20,15 +20,15 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import pyupbit
 
-from api import upbit_api
+from api import coin_broker, coin_config
 from api.kis_api import get_balance_with_retry, get_us_positions_with_retry
 from execution.guard import save_state
 from strategy.rules import get_ohlcv_yfinance
 from utils.helpers import (
     coin_qty_counts_for_position,
     ensure_dict,
+    is_coin_ticker,
     kis_equities_weekend_suppress_window_kst,
     normalize_ticker,
     get_kr_company_name,
@@ -108,19 +108,24 @@ def _get_live_position_seeds():
 
     # ===== 🪙 코인 =====
     try:
-        balances = upbit_api.upbit.get_balances() or []
+        balances = coin_broker.get_balances() or []
         if isinstance(balances, list):
             for b in balances:
                 currency = b.get('currency')
                 if currency in ['KRW', 'VTHO']:
                     continue
+                if coin_config.is_binance() and str(currency).upper() == 'USDT':
+                    continue
                 qty = _to_float(b.get('balance', 0))
                 if qty <= 0.00000001 or not coin_qty_counts_for_position(qty):
                     continue
-                ticker = f"KRW-{currency}"
+                ticker = coin_broker.held_ticker_row(b)
+                if not ticker:
+                    continue
                 avg_p = _to_float(b.get('avg_buy_price', 0))
                 if avg_p <= 0:
-                    avg_p = _to_float(pyupbit.get_current_price(ticker), 0)
+                    cp = coin_broker.get_current_price(ticker)
+                    avg_p = _to_float(cp, 0)
                 if avg_p > 0:
                     seeds[ticker] = {"avg_p": float(avg_p), "qty": float(qty)}
     except Exception:
@@ -154,13 +159,8 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
         live_qty = float(seed["qty"])
         if ticker not in current_positions:
             # 신규 복구 로직: 코인과 주식 데이터 수집 분리
-            if ticker.startswith("KRW-"):
-                # 코인은 pyupbit 전용으로 데이터 수집
-                df_coin = pyupbit.get_ohlcv(ticker, interval="day", count=30)
-                if df_coin is not None and not df_coin.empty:
-                    ohlcv = [{'o': row['open'], 'h': row['high'], 'l': row['low'], 'c': row['close'], 'v': row['volume']} for _, row in df_coin.iterrows()]
-                else:
-                    ohlcv = []
+            if is_coin_ticker(ticker):
+                ohlcv = coin_broker.fetch_ohlcv(ticker, "day", 30)
             else:
                 # 주식(국장/미장)은 기존대로 yfinance 사용
                 ohlcv = get_ohlcv_yfinance(ticker)
@@ -180,7 +180,7 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
             if live_qty > 0:
                 row["qty"] = float(live_qty)
             current_positions[ticker] = row
-            name = get_kr_company_name(ticker) if ticker.isdigit() else (ticker if ticker.startswith("KRW-") else get_us_company_name(ticker))
+            name = get_kr_company_name(ticker) if ticker.isdigit() else (ticker if is_coin_ticker(ticker) else get_us_company_name(ticker))
             print(f"  -> 🚨 [자동복구] {name}({ticker}) 장부 등록 완료 (평단={real_avg_p:,.2f})")
             changes_made = True
             recovered_count += 1
@@ -218,7 +218,7 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
         if ticker.isdigit():
             if ticker not in held_kr:
                 to_delete.append(ticker)
-        elif ticker.startswith("KRW-"):
+        elif is_coin_ticker(ticker):
             if ticker not in held_coins:
                 to_delete.append(ticker)
         else:
@@ -229,7 +229,7 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
         # 종목명 가져오기
         if t.isdigit():
             name = get_kr_company_name(t)
-        elif t.startswith("KRW-"):
+        elif is_coin_ticker(t):
             name = t
         else:
             name = get_us_company_name(t)

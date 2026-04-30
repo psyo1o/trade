@@ -79,8 +79,12 @@ def get_recent_15m_ohlcv(ticker: str, market: str, count: int = 10) -> List[Dict
     if not symbol:
         return []
 
-    if market.upper() == "COIN" or symbol.startswith("KRW-"):
+    if market.upper() == "COIN" or symbol.startswith("KRW-") or symbol.startswith("USDT-"):
         try:
+            from api import coin_broker, coin_config
+
+            if coin_config.is_binance() or str(symbol).upper().startswith("USDT-"):
+                return coin_broker.fetch_ohlcv(str(symbol), "minute15", int(count))
             df = pyupbit.get_ohlcv(symbol, interval="minute15", count=count)
             if df is not None and not df.empty:
                 rows = []
@@ -134,8 +138,12 @@ def get_recent_daily_ohlcv(ticker: str, market: str, count: int = 15) -> List[Di
         return []
     n = max(5, min(30, int(count)))
 
-    if market.upper() == "COIN" or symbol.startswith("KRW-"):
+    if market.upper() == "COIN" or symbol.startswith("KRW-") or symbol.startswith("USDT-"):
         try:
+            from api import coin_broker, coin_config
+
+            if coin_config.is_binance() or str(symbol).upper().startswith("USDT-"):
+                return coin_broker.fetch_ohlcv(str(symbol), "day", int(n))
             df = pyupbit.get_ohlcv(symbol, interval="day", count=n)
             if df is not None and not df.empty:
                 rows = []
@@ -226,6 +234,13 @@ def get_orderbook_summary_from_broker(broker: Any, ticker: str) -> Dict[str, flo
 
 def get_orderbook_summary_for_coin(ticker: str) -> Dict[str, float]:
     symbol = str(ticker or "").strip().upper()
+    if symbol.startswith("USDT-"):
+        try:
+            from api import coin_broker
+
+            return coin_broker.orderbook_summary(symbol)
+        except Exception:
+            return {"bid_size_total": 0.0, "ask_size_total": 0.0}
     if not symbol.startswith("KRW-"):
         return {"bid_size_total": 0.0, "ask_size_total": 0.0}
     try:

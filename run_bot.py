@@ -148,12 +148,14 @@ def get_market_index_change(market):
                 return change
                 
         elif market == "COIN":
-            df = pyupbit.get_ohlcv("KRW-BTC", interval="day", count=3)
-            if df is not None and len(df) >= 2:
-                prev_close = df['close'].iloc[-2]
-                curr_close = df['close'].iloc[-1]
-                change = ((curr_close - prev_close) / prev_close) * 100
-                return change
+            bt = coin_config.btc_benchmark_ticker()
+            oc = coin_broker.fetch_ohlcv(bt, "day", 3)
+            if oc and len(oc) >= 2:
+                prev_close = float(oc[-2]["c"])
+                curr_close = float(oc[-1]["c"])
+                if prev_close > 0:
+                    change = ((curr_close - prev_close) / prev_close) * 100
+                    return change
                 
     except Exception as e:
         print(f"  ⚠️ [{market} 지수] 조회 실패: {e}")
@@ -414,6 +416,7 @@ except Exception as e:
 from utils.telegram import configure_telegram, register_telegram_atexit, send_telegram
 from utils.helpers import (
     coin_qty_counts_for_position,
+    is_coin_ticker,
     configure_kis_token_path,
     configure_trade_history,
     ensure_dict,
@@ -434,6 +437,8 @@ configure_telegram(config)
 register_telegram_atexit()
 
 from api import kis_api, upbit_api
+from api import coin_broker, coin_config
+
 kis_api.configure(config)
 
 from api.kis_api import (
@@ -495,6 +500,15 @@ INDEX_CRASH_COIN = -3.5   # 코인 BTC 급락 기준 (%)
 # 업비트 코인 시장가 매수 — 가용 잔고 캡(수수료·반올림 오차로 InsufficientFundsBid 방지)
 UPBIT_KRW_AVAILABLE_CAP_RATIO = 0.999  # 주문 직전: min(목표액, get_balance(KRW) * 이 값)
 UPBIT_COIN_MIN_ORDER_KRW = 5000.0      # KRW 마켓 최소 주문 금액(업비트 기준)
+
+
+def _coin_min_order_krw() -> float:
+    """코인 최소 주문(원화 환산). 바이낸스는 USDT 최소명목×환율."""
+    try:
+        return float(coin_broker.min_order_budget_krw())
+    except Exception:
+        return float(UPBIT_COIN_MIN_ORDER_KRW)
+
 
 # 종목 명칭 딕셔너리
 kr_name_dict = {"005930": "삼성전자", "000660": "SK하이닉스", "035420": "NAVER", "035720": "카카오", "005380": "현대차", "069500": "KODEX 200"}
@@ -870,16 +884,15 @@ def get_held_coins():
     실패: None 반환
     """
     try:
-        balances = upbit_api.upbit.get_balances()
+        balances = coin_broker.get_balances()
         if not balances:
             print(f"❌ [코인 조회 실패] 잔고 API 응답 없음")
             return None
-        held = [
-            f"KRW-{b['currency']}"
-            for b in balances
-            if b['currency'] not in ['KRW', 'VTHO']
-            and coin_qty_counts_for_position(b.get('balance', 0))
-        ]
+        held = []
+        for b in balances:
+            t = coin_broker.held_ticker_row(b)
+            if t and coin_qty_counts_for_position(b.get("balance", 0)):
+                held.append(t)
         return held
     except Exception as e:
         print(f"❌ [코인 조회 실패] {type(e).__name__}: {e}")
@@ -897,8 +910,6 @@ def get_real_weather(broker_kr, broker_us):
     except ImportError:
         print("🚨 [경고] 'ta' 라이브러리가 없습니다. 터미널에서 'pip install ta'를 실행해주세요. (임시 횡보장 처리)")
         return weather
-
-    import pyupbit
 
     # -----------------------------------------------------------
     # 🇰🇷 국장 날씨 (KODEX 200 - yfinance 사용으로 KIS API 에러 원천 차단)
@@ -946,8 +957,13 @@ def get_real_weather(broker_kr, broker_us):
     # 🪙 코인 날씨 (비트코인)
     # -----------------------------------------------------------
     try:
-        df_coin = pyupbit.get_ohlcv("KRW-BTC", interval="day", count=40)
-        if df_coin is not None and len(df_coin) >= 30:
+        bt = coin_config.btc_benchmark_ticker()
+        rows = coin_broker.fetch_ohlcv(bt, "day", 40)
+        if rows and len(rows) >= 30:
+            df_coin = pd.DataFrame(rows)
+            df_coin = df_coin.rename(
+                columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
+            )
             adx_coin = ADXIndicator(high=df_coin['high'], low=df_coin['low'], close=df_coin['close'], window=14)
             df_coin['adx'] = adx_coin.adx()
             
@@ -1014,15 +1030,20 @@ def get_held_stocks_us_detail():
 def get_held_stocks_coins_info():
     """코인 보유 정보"""
     try:
-        balances = upbit_api.upbit.get_balances()
+        balances = coin_broker.get_balances()
         coins = []
         for b in balances:
-            if b['currency'] not in ('KRW', 'VTHO'):
-                qty = _to_float(b.get('balance'))
-                if coin_qty_counts_for_position(qty):
-                    ticker = f"KRW-{b['currency']}"
-                    price = pyupbit.get_current_price(ticker) or 0
-                    coins.append({'code': ticker, 'currency': b['currency'], 'qty': qty, 'current_price': price})
+            if b.get("currency") in ("KRW", "VTHO"):
+                continue
+            if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
+                continue
+            qty = _to_float(b.get('balance'))
+            if coin_qty_counts_for_position(qty):
+                ticker = coin_broker.held_ticker_row(b)
+                if not ticker:
+                    continue
+                price = coin_broker.get_current_price(ticker) or 0
+                coins.append({'code': ticker, 'currency': b['currency'], 'qty': qty, 'current_price': price})
         return coins
     except: return []
 
@@ -1047,7 +1068,7 @@ def get_safe_balance(data, key=None, default=0):
             try: return get_us_positions_with_retry()
             except: return {}
         elif market == "COIN":
-            try: return upbit_api.upbit.get_balances()
+            try: return coin_broker.get_balances()
             except: return []
         return {}
     
@@ -1254,8 +1275,8 @@ def manual_sell(market, code, quantity):
             return {"success": False, "message": msg}
 
         if market == "COIN":
-            current_p = _to_float(pyupbit.get_current_price(code), 0.0)
-            resp = upbit_api.upbit.sell_market_order(code, qty)
+            current_p = _to_float(coin_broker.get_current_price(code) or 0, 0.0)
+            resp = coin_broker.sell_market(code, float(qty))
             if resp:
                 st0 = load_state(STATE_PATH)
                 pos0 = (st0.get("positions") or {}).get(code, {})
@@ -1412,16 +1433,34 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
             print(f"  ⚠️ [circuit_aux 갱신] 미장 조회 실패: {e}")
 
     try:
-        balances = upbit_api.upbit.get_balances() or []
-        krw_row = next((b for b in balances if str(b.get("currency", "")).upper() == "KRW"), None) or {}
-        krw_on_book = _to_float(krw_row.get("balance", 0), 0.0)
-        total_coin_equity = float(krw_on_book)
-        for b in balances:
-            if b.get("currency") in ("KRW", "VTHO"):
-                continue
-            curr_p = pyupbit.get_current_price(f"KRW-{b['currency']}")
-            if curr_p:
-                total_coin_equity += float(_to_float(b.get("balance", 0))) * float(curr_p)
+        balances = coin_broker.get_balances() or []
+        if coin_config.is_binance():
+            kpx = float(coin_broker.get_krw_per_usdt())
+            usdt_row = next((b for b in balances if str(b.get("currency", "")).upper() == "USDT"), None) or {}
+            usdt_total = _to_float(usdt_row.get("balance", 0), 0.0)
+            total_coin_equity = float(usdt_total * kpx)
+            for b in balances:
+                if str(b.get("currency", "")).upper() in ("USDT", "VTHO"):
+                    continue
+                t = coin_broker.held_ticker_row(b)
+                if not t:
+                    continue
+                curr_p = coin_broker.get_current_price(t)
+                if curr_p:
+                    total_coin_equity += float(_to_float(b.get("balance", 0))) * float(curr_p) * kpx
+        else:
+            krw_row = next((b for b in balances if str(b.get("currency", "")).upper() == "KRW"), None) or {}
+            krw_on_book = _to_float(krw_row.get("balance", 0), 0.0)
+            total_coin_equity = float(krw_on_book)
+            for b in balances:
+                if b.get("currency") in ("KRW", "VTHO"):
+                    continue
+                t = coin_broker.held_ticker_row(b)
+                if not t:
+                    continue
+                curr_p = coin_broker.get_current_price(t)
+                if curr_p:
+                    total_coin_equity += float(_to_float(b.get("balance", 0))) * float(curr_p)
         result["coin_ok"] = True
     except Exception as e:
         print(f"  ⚠️ [circuit_aux 갱신] 코인 조회 실패: {e}")
@@ -1477,10 +1516,14 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
                     q = int(_to_float(item.get("ovrs_cblc_qty", item.get("hldg_qty", 0))))
                     if q > 0 and c:
                         lines.append(f"US {c} x{q}")
-            for b in upbit_api.upbit.get_balances() or []:
+            for b in coin_broker.get_balances() or []:
                 if b.get("currency") in ("KRW", "VTHO"):
                     continue
-                t = f"KRW-{b['currency']}"
+                if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
+                    continue
+                t = coin_broker.held_ticker_row(b)
+                if not t:
+                    continue
                 qf = float(_to_float(b.get("balance", 0)))
                 if coin_qty_counts_for_position(qf):
                     lines.append(f"COIN {t} x{qf}")
@@ -1521,10 +1564,14 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
 
     # COIN
     try:
-        for b in upbit_api.upbit.get_balances() or []:
+        for b in coin_broker.get_balances() or []:
             if b.get("currency") in ("KRW", "VTHO"):
                 continue
-            t = f"KRW-{b['currency']}"
+            if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
+                continue
+            t = coin_broker.held_ticker_row(b)
+            if not t:
+                continue
             qf = float(_to_float(b.get("balance", 0)))
             if not coin_qty_counts_for_position(qf):
                 continue
@@ -1677,25 +1724,33 @@ def _calc_coin_holdings_metrics(balances):
     try:
         total_invested = 0.0
         total_current = 0.0
+        kpx = float(coin_broker.get_krw_per_usdt()) if coin_config.is_binance() else 1.0
         for b in balances:
             if b['currency'] in ('KRW', 'VTHO'):
+                continue
+            if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
                 continue
             qty = _to_float(b.get('balance', 0))
             if not coin_qty_counts_for_position(qty):
                 continue
-            ticker = f"KRW-{b['currency']}"
-            # 현재가
-            curr_price = pyupbit.get_current_price(ticker) or 0
-            current = qty * curr_price
+            ticker = coin_broker.held_ticker_row(b)
+            if not ticker:
+                continue
+            curr_price = float(coin_broker.get_current_price(ticker) or 0)
+            if coin_config.is_binance():
+                current = qty * curr_price * kpx
+            else:
+                current = qty * curr_price
             total_current += current
 
-            # 매수 평균가
             avg_buy_price = _to_float(b.get('avg_buy_price', 0))
             if avg_buy_price > 0:
-                invested = qty * avg_buy_price
+                if coin_config.is_binance():
+                    invested = qty * avg_buy_price * kpx
+                else:
+                    invested = qty * avg_buy_price
                 total_invested += invested
 
-        # ROI 계산
         profit = total_current - total_invested
         roi = (profit / total_invested * 100) if total_invested > 0 else 0.0
         
@@ -2018,14 +2073,15 @@ def _execute_coin_market_buy_twap(
         print(f"  📉 [Phase2 TWAP COIN] {t} 예산 {int(budget_krw):,}원 → {len(slices)}분할")
 
     spent = 0.0
-    last_p = float(pyupbit.get_current_price(t) or 0.0)
+    last_p = float(coin_broker.get_current_price(t) or 0.0)
     any_fill = False
+    _min_krw = _coin_min_order_krw()
 
     for si, krw_slice in enumerate(slices):
         if krw_slice <= 0:
             continue
         if krw_bal_holder[0] < float(krw_slice):
-            print(f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} KRW 부족으로 중단")
+            print(f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} 예산(원화환산) 부족으로 중단")
             break
 
         if TEST_MODE:
@@ -2035,43 +2091,55 @@ def _execute_coin_market_buy_twap(
             krw_bal_holder[0] = float(krw_bal_holder[0]) - float(krw_slice)
             any_fill = True
         else:
-            # 주문 직전 실시간 가용 원화(pyupbit: 주문 가능액) + 수수료/오차용 0.1% 여유 캡
-            avail_raw = upbit_api.upbit.get_balance("KRW")
-            available_krw = float(avail_raw) if avail_raw is not None else float(krw_bal_holder[0])
+            avail_raw = coin_broker.get_quote_balance_direct()
+            if coin_config.is_binance():
+                kpx = float(coin_broker.get_krw_per_usdt())
+                available_krw = float(avail_raw or 0) * kpx
+            else:
+                available_krw = float(avail_raw) if avail_raw is not None else float(krw_bal_holder[0])
             target_buy_amount = float(min(float(krw_slice), float(krw_bal_holder[0])))
             safe_ceiling = available_krw * UPBIT_KRW_AVAILABLE_CAP_RATIO
             final_order_amount = min(target_buy_amount, safe_ceiling)
-            pay_krw = int(max(0, final_order_amount))
-            if pay_krw < UPBIT_COIN_MIN_ORDER_KRW:
+            pay_krw = float(max(0, final_order_amount))
+            if pay_krw < _min_krw:
+                exn = "바이낸스(USDT×환율)" if coin_config.is_binance() else "업비트"
                 print(
                     f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} 스킵 — "
-                    f"최종주문액 {pay_krw:,}원 < 업비트 최소 {int(UPBIT_COIN_MIN_ORDER_KRW):,}원 "
+                    f"최종주문액 {pay_krw:,.0f}원 < 최소 {int(_min_krw):,}원 ({exn}) "
                     f"(목표 {target_buy_amount:,.0f}원, 가용·API {available_krw:,.0f}원×{UPBIT_KRW_AVAILABLE_CAP_RATIO})"
                 )
                 break
             if pay_krw < int(target_buy_amount):
                 print(
-                    f"  🛡️ [COIN TWAP] 가용 캡 적용: 목표 {target_buy_amount:,.0f}원 → 최종 {pay_krw:,}원 "
+                    f"  🛡️ [COIN TWAP] 가용 캡 적용: 목표 {target_buy_amount:,.0f}원 → 최종 {pay_krw:,.0f}원 "
                     f"(가용 {available_krw:,.0f}원×{UPBIT_KRW_AVAILABLE_CAP_RATIO})"
                 )
-            resp = upbit_api.upbit.buy_market_order(t, pay_krw)
+            if coin_config.is_binance():
+                resp = coin_broker.buy_market_budget_krw(t, pay_krw)
+            else:
+                pay_krw_i = int(max(0, pay_krw))
+                resp = upbit_api.upbit.buy_market_order(t, pay_krw_i) if upbit_api.upbit else None
             print(
                 f"  🧾 [COIN BUY TWAP {si + 1}/{len(slices)}] {t} "
-                f"pay={pay_krw:,}원 resp={'OK' if resp else 'None'}"
+                f"pay≈{pay_krw:,.0f}원 resp={'OK' if resp else 'None'}"
             )
             if not resp:
                 print(
-                    f"  ❌ [COIN TWAP] {t} 슬라이스 실패 — 업비트 거절(잔고·최소주문·수수료). "
-                    f"가용 KRW는 get_balance('KRW') 기준으로 캡 후에도 거절 시 잔고·출금대기 확인."
+                    f"  ❌ [COIN TWAP] {t} 슬라이스 실패 — 거절(잔고·최소주문·수수료). "
+                    f"가용·최소주문·거래소 키를 확인하세요."
                 )
                 break
             spent += float(pay_krw)
-            after_raw = upbit_api.upbit.get_balance("KRW")
-            krw_bal_holder[0] = (
-                float(after_raw) if after_raw is not None else float(krw_bal_holder[0]) - float(pay_krw)
-            )
+            after_raw = coin_broker.get_quote_balance_direct()
+            if coin_config.is_binance():
+                kpx = float(coin_broker.get_krw_per_usdt())
+                krw_bal_holder[0] = float(after_raw or 0) * kpx
+            else:
+                krw_bal_holder[0] = (
+                    float(after_raw) if after_raw is not None else float(krw_bal_holder[0]) - float(pay_krw)
+                )
             any_fill = True
-            np = pyupbit.get_current_price(t)
+            np = coin_broker.get_current_price(t)
             if np:
                 last_p = float(np)
 
@@ -2275,6 +2343,19 @@ def normalize_equity_current_p_api_for_display(
     return cp
 
 
+def _coin_snapshot_get_balance(quote: str = "KRW"):
+    """스냅샷용 예수: 바이낸스는 USDT 가용을 원화 환산해 표시."""
+    try:
+        if coin_config.is_binance():
+            b = coin_broker.get_quote_balance_direct()
+            return int(float(b or 0) * float(coin_broker.get_krw_per_usdt()))
+        if upbit_api.upbit is None:
+            return 0
+        return upbit_api.upbit.get_balance(quote)
+    except Exception:
+        return 0
+
+
 def build_account_snapshot_for_report(
     *, allow_kis_fetch=None, with_backoff=None, force_kis_labels: bool = False
 ) -> dict:
@@ -2293,8 +2374,8 @@ def build_account_snapshot_for_report(
         "calc_kr_holdings_metrics": _calc_kr_holdings_metrics,
         "calc_us_holdings_metrics": _calc_us_holdings_metrics,
         "calc_coin_holdings_metrics": _calc_coin_holdings_metrics,
-        "upbit_get_balance": upbit_api.upbit.get_balance,
-        "upbit_get_balances": upbit_api.upbit.get_balances,
+        "upbit_get_balance": _coin_snapshot_get_balance,
+        "upbit_get_balances": coin_broker.get_balances,
         "get_kr_holdings_with_roi": get_kr_holdings_with_roi,
         "get_us_holdings_with_roi": get_us_holdings_with_roi,
         "get_coin_holdings_with_roi": get_coin_holdings_with_roi,
@@ -2459,17 +2540,21 @@ def get_coin_holdings_with_roi():
     """🪙 코인 보유 종목 + 현재 수익률"""
     try:
         state = load_state(STATE_PATH)
-        balances = upbit_api.upbit.get_balances() or []
+        balances = coin_broker.get_balances() or []
         
         holdings = []
         for b in balances:
             if b['currency'] in ('KRW', 'VTHO'):
                 continue
+            if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
+                continue
             qty = _to_float(b.get('balance', 0))
             if not coin_qty_counts_for_position(qty):
                 continue
 
-            ticker = f"KRW-{b['currency']}"
+            ticker = coin_broker.held_ticker_row(b)
+            if not ticker:
+                continue
             pos = state.get('positions', {}).get(ticker, {})
             buy_p = _to_float(pos.get('buy_p', 0), 0)
 
@@ -2851,18 +2936,40 @@ def _is_coin_buy_window_now(now_coin: datetime) -> tuple[bool, datetime, datetim
 
 
 def _extract_held_coins_from_balances(balances) -> list[str]:
-    """업비트 balances에서 유효 보유 코인 티커 추출(기존 로직 동일)."""
-    return [
-        f"KRW-{b['currency']}"
-        for b in balances
-        if b.get("currency") not in ["KRW", "VTHO"]
-        and coin_qty_counts_for_position(b.get("balance", 0))
-        and float(_to_float(b.get("avg_buy_price", 0))) > 0
-    ]
+    """거래소 balances에서 유효 보유 코인 티커 추출."""
+    out: list[str] = []
+    for b in balances:
+        if b.get("currency") in ["KRW", "VTHO"]:
+            continue
+        if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
+            continue
+        if not coin_qty_counts_for_position(b.get("balance", 0)):
+            continue
+        t = coin_broker.held_ticker_row(b)
+        if not t:
+            continue
+        avg = float(_to_float(b.get("avg_buy_price", 0)))
+        if avg > 0 or coin_config.is_binance():
+            out.append(t)
+    return out
 
 
 def _compute_coin_krw_balances(balances) -> tuple[float, float]:
-    """업비트 KRW 원장/주문가능 금액 계산 및 잠금 안내 출력(기존 로직 동일)."""
+    """코인 예수 장부/주문가능 금액(바이낸스는 USDT를 원화 환산해 동일 변수명 유지)."""
+    if coin_config.is_binance():
+        kpx = float(coin_broker.get_krw_per_usdt())
+        usdt_row = next((b for b in balances if str(b.get("currency", "")).upper() == "USDT"), None) or {}
+        usdt_on_book = _to_float(usdt_row.get("balance", 0), 0.0)
+        spend_usdt = coin_broker.quote_spendable(balances)
+        krw_on_book = usdt_on_book * kpx
+        krw_bal = spend_usdt * kpx
+        if usdt_on_book > spend_usdt + 1e-6:
+            print(
+                f"  💡 [코인] USDT 장부 {usdt_on_book:.4f} 중 "
+                f"{usdt_on_book - spend_usdt:.4f}는 locked — 주문가능 약 {spend_usdt:.4f} USDT "
+                f"(원화환산 주문가능 약 {krw_bal:,.0f}원)"
+            )
+        return float(krw_on_book), float(krw_bal)
     krw_row = next((b for b in balances if str(b.get("currency", "")).upper() == "KRW"), None) or {}
     krw_on_book = _to_float(krw_row.get("balance", 0), 0.0)
     krw_bal = _upbit_krw_spendable(balances)
@@ -2875,27 +2982,36 @@ def _compute_coin_krw_balances(balances) -> tuple[float, float]:
 
 
 def _compute_total_coin_equity_from_balances(balances, krw_on_book: float) -> float:
-    """코인 총평가금 계산(기존 로직 동일)."""
+    """코인 총평가금 계산(원화 기준; 바이낸스는 USDT×환율)."""
     total_coin_equity = float(krw_on_book)
+    kpx = float(coin_broker.get_krw_per_usdt()) if coin_config.is_binance() else 1.0
     for b in balances:
-        if b.get("currency") not in ["KRW", "VTHO"]:
-            curr_p = pyupbit.get_current_price(f"KRW-{b['currency']}")
-            if curr_p:
-                total_coin_equity += float(_to_float(b.get("balance", 0))) * float(curr_p)
+        if b.get("currency") in ["KRW", "VTHO"]:
+            continue
+        if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
+            continue
+        t = coin_broker.held_ticker_row(b)
+        if not t:
+            continue
+        curr_p = coin_broker.get_current_price(t)
+        if curr_p:
+            qv = float(_to_float(b.get("balance", 0))) * float(curr_p)
+            total_coin_equity += qv * kpx if coin_config.is_binance() else qv
     return float(total_coin_equity)
 
 
 def _count_coin_positions_for_sell_loop(balances, positions: dict) -> int:
-    """코인 매도 루프 대상 포지션 개수 집계(기존 로직 동일)."""
-    return len(
-        [
-            b
-            for b in balances
-            if f"KRW-{b.get('currency')}" in positions
-            and b.get("currency") not in ["KRW", "VTHO"]
-            and coin_qty_counts_for_position(b.get("balance", 0))
-        ]
-    )
+    """코인 매도 루프 대상 포지션 개수 집계."""
+    n = 0
+    for b in balances:
+        if b.get("currency") in ["KRW", "VTHO"]:
+            continue
+        if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
+            continue
+        t = coin_broker.held_ticker_row(b)
+        if t and t in positions and coin_qty_counts_for_position(b.get("balance", 0)):
+            n += 1
+    return n
 
 
 def _format_coin_price_log_fields(
@@ -2943,9 +3059,11 @@ def _print_position_hold_status(
 
 
 def _iter_coin_asset_rows(balances):
-    """balances에서 KRW/VTHO 제외 코인 row만 순회(기존 조건 동일)."""
+    """balances에서 표시통화·더스트 제외 코인 row만 순회."""
     for b in balances:
         if b.get("currency") in ["KRW", "VTHO"]:
+            continue
+        if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
             continue
         yield b
 
@@ -4174,13 +4292,13 @@ def run_trading_bot():
         _log_us_market_closed_or_suppressed()
 
     # -------------------------------------------------------------------------
-    # 코인(COIN) 엔진 — 업비트는 주말에도 조회 가능. 매수는 **일봉 전환 직전 KST 창**·BTC 급락·
+    # 코인(COIN) 엔진 — 업비트/바이낸스(CCXT). 매수는 **일봉 전환 직전 KST 창**·BTC 급락·
     # 배정예산·최소주문·AI·TWAP. 스킵은 ``[COIN …]`` 태그.
     # -------------------------------------------------------------------------
     if is_market_open("COIN"):
         coin_weather = weather.get('COIN', '☁️ SIDEWAYS')
         print("▶️ [🪙 코인] 매매 엔진 시작...")
-        balances = upbit_api.upbit.get_balances() or []
+        balances = coin_broker.get_balances() or []
         krw_on_book, krw_bal = _compute_coin_krw_balances(balances)
         held_coins = _extract_held_coins_from_balances(balances)
 
@@ -4197,7 +4315,9 @@ def run_trading_bot():
         if positions_count == 0:
             print(f"  ✅ [코인 매도 루프] 매도할 종목 없음 (완료)")
         for b in _iter_coin_asset_rows(balances):
-            t = f"KRW-{b['currency']}"
+            t = coin_broker.held_ticker_row(b)
+            if not t:
+                continue
 
             is_exit = False
 
@@ -4208,12 +4328,12 @@ def run_trading_bot():
             if not coin_qty_counts_for_position(qty):
                 print(f"  ⏭️ {t}: 수량 너무 적음 ({qty}) (패스)")
                 continue
-            curr_p = pyupbit.get_current_price(t)
+            curr_p = coin_broker.get_current_price(t)
             if not curr_p:
                 print(f"  ⏭️ {t}: 현재가 조회 실패 (패스)")
                 continue
-            df_upbit = pyupbit.get_ohlcv(t, interval="day", count=250)
-            if df_upbit is None or len(df_upbit) < 20:
+            ohlcv = coin_broker.fetch_ohlcv(t, "day", 250)
+            if not ohlcv or len(ohlcv) < 20:
                 # OHLCV 실패 시 현재가로만 손절 체크
                 print(f"  ⚠️  [{t}] OHLCV 데이터 부족, 현재가로 손절만 체크...")
                 pos_info = state.get("positions", {}).get(t, {})
@@ -4230,15 +4350,13 @@ def run_trading_bot():
                 save_state(STATE_PATH, state)
                 
                 print(f"     📊 {t}: 현재가 {curr_p:,.0f}원 / 손절가 {sl_p:,.0f}원 / 수익률 {profit_rate_now:+.2f}%")
-                
-            ohlcv = _build_coin_ohlcv_from_upbit_df(df_upbit)
             pos_info = state.get("positions", {}).get(t, {})
             atr_val = get_safe_atr(t, ohlcv)
             _update_position_current_atr_if_changed(state, t, pos_info, atr_val)
             
             # 🔄 [완전 동기화] GUI가 장부에 공유한 최신 가격을 최우선으로 사용
             curr_p = _resolve_curr_price_with_gui_override(pos_info, float(curr_p))
-            # else: curr_p는 이미 위에서 pyupbit.get_current_price로 가져옴
+            # else: curr_p는 이미 위에서 coin_broker.get_current_price로 가져옴
             buy_p = pos_info.get('buy_p', curr_p)
             max_p = pos_info.get('max_p', curr_p)
             profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
@@ -4284,7 +4402,7 @@ def run_trading_bot():
                     if not sell_q:
                         print(f"  ⏭️ [SWING-SELL] {t} HALF 수량 0 (패스)")
                         continue
-                    r_half = upbit_api.upbit.sell_market_order(t, float(sell_q))
+                    r_half = coin_broker.sell_market(t, float(sell_q))
                     if r_half:
                         state.setdefault("positions", {})[t] = post_partial_ledger(
                             pos_info, float(sell_q), float(curr_p), float(qty)
@@ -4295,10 +4413,10 @@ def run_trading_bot():
                         _record_trade_event("COIN", t, "SELL", float(sell_q), price=float(curr_p), profit_rate=float(profit_rate_now), reason="[SWING-SELL] 볼밴 상단 1차 익절")
                         print(f"  ✅ [SWING-SELL] {t} HALF | {sw_reason}")
                     else:
-                        print(f"  ❌ [SWING-SELL] {t} HALF 실패: 업비트 응답 없음")
+                        print(f"  ❌ [SWING-SELL] {t} HALF 실패: 거래소 응답 없음")
                     continue
                 if sw_action == "FULL":
-                    r_full = upbit_api.upbit.sell_market_order(t, qty)
+                    r_full = coin_broker.sell_market(t, qty)
                     if r_full:
                         p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
                         _record_trade_event("COIN", t, "SELL", qty, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
@@ -4316,7 +4434,7 @@ def run_trading_bot():
                         )
                         save_state(STATE_PATH, state)
                     else:
-                        print(f"  ❌ [SWING-SELL] {t} FULL 실패: 업비트 응답 없음")
+                        print(f"  ❌ [SWING-SELL] {t} FULL 실패: 거래소 응답 없음")
                     continue
 
             # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
@@ -4324,7 +4442,9 @@ def run_trading_bot():
             q_led = float(_to_float(pos_info.get("qty"), qty))
             if q_led <= 0:
                 q_led = float(qty)
-            notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), False, usdk)
+            notion_krw_so = notional_krw_kr_us(
+                float(buy_p), float(curr_p), float(q_led), bool(coin_config.is_binance()), usdk
+            )
             entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
             so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
             if not position_scale_out_done(pos_info) and so_hit:
@@ -4339,17 +4459,16 @@ def run_trading_bot():
                     sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
                     if not sell_q:
                         print(f"  ℹ️ [COIN Scale-Out 스킵] {t}: 50% 절삼 후 수량 0")
-                    elif not coin_scale_out_min_notional_ok(float(sell_q), float(curr_p), UPBIT_COIN_MIN_ORDER_KRW):
+                    elif not coin_broker.scale_out_min_notional_ok(float(sell_q), float(curr_p)):
                         print(
-                            f"  ℹ️ [COIN Scale-Out 스킵] {t}: 매도분 명목 "
-                            f"{float(sell_q) * float(curr_p):,.0f}원 < 업비트 최소 {UPBIT_COIN_MIN_ORDER_KRW:,.0f}원"
+                            f"  ℹ️ [COIN Scale-Out 스킵] {t}: 매도분이 거래소 최소 명목 미만"
                         )
                     else:
                         tw_th = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
                         chunks = plan_coin_sell_chunks(float(sell_q), float(curr_p), threshold_krw=float(tw_th))
 
                         def _coin_so_vol(vv: float) -> bool:
-                            return bool(upbit_api.upbit.sell_market_order(t, float(vv)))
+                            return bool(coin_broker.sell_market(t, float(vv)))
 
                         ok_so = run_coin_scale_out_chunks(chunks, _coin_so_vol, TWAP_SLICE_DELAY_SEC)
                         if ok_so:
@@ -4419,13 +4538,13 @@ def run_trading_bot():
 
                 # 1. 매도 주문 실행 루프
                 while retry_count < max_retries:
-                    resp = upbit_api.upbit.sell_market_order(t, qty)
+                    resp = coin_broker.sell_market(t, qty)
                     if resp:
                         break # 성공 시 while 루프 즉시 탈출 (정상)
                     
                     retry_count += 1
                     if retry_count < max_retries:
-                        print(f"  ⚠️ {t} 매도 실패 (#{retry_count}): upbit API 오류 → 재시도")
+                        print(f"  ⚠️ {t} 매도 실패 (#{retry_count}): 거래소 API 오류 → 재시도")
                         time.sleep(0.5) # API 호출 제한(Rate Limit) 방지를 위해 약간 대기
 
                 # 2. 루프 종료 후, 매도 성공 여부에 따라 장부 기록
@@ -4460,9 +4579,9 @@ def run_trading_bot():
                     save_state(STATE_PATH, state)
                     
                 else: # 3번 모두 실패했다면
-                    print(f"  ❌ {t} 매도 최종 실패 ({retry_count}회 시도): upbit API 오류")
+                    print(f"  ❌ {t} 매도 최종 실패 ({retry_count}회 시도): 거래소 API 오류")
 
-        balances = upbit_api.upbit.get_balances() or []
+        balances = coin_broker.get_balances() or []
         krw_on_book, krw_bal = _compute_coin_krw_balances(balances)
         held_coins = _extract_held_coins_from_balances(balances)
         total_coin_equity = _compute_total_coin_equity_from_balances(balances, float(krw_on_book))
@@ -4508,11 +4627,34 @@ def run_trading_bot():
                             print("  ⏭️ 코인 시장이 베어 상태라 신규 매수 안함 (패스)")
                         else:
                             try:
-                                markets = [m['market'] for m in requests.get("https://api.upbit.com/v1/market/all", timeout=10).json() if m.get('market', '').startswith("KRW-")]
-                                tickers_data = requests.get("https://api.upbit.com/v1/ticker?markets=" + ",".join(markets), timeout=10).json()
-                                scan_targets = [x['market'] for x in sorted(tickers_data, key=lambda x: x.get('acc_trade_price_24h', 0), reverse=True)[:20]]
+                                if coin_config.is_binance():
+                                    from api import binance_api as _bna
+
+                                    scan_targets = _bna.top_usdt_symbols_by_quote_volume(20)
+                                    _ohlcv_pref = coin_broker.run_prefetch_daily_sync(scan_targets, 250)
+                                else:
+                                    scan_targets = []
+                                    markets = [
+                                        m["market"]
+                                        for m in requests.get(
+                                            "https://api.upbit.com/v1/market/all", timeout=10
+                                        ).json()
+                                        if m.get("market", "").startswith("KRW-")
+                                    ]
+                                    tickers_data = requests.get(
+                                        "https://api.upbit.com/v1/ticker?markets=" + ",".join(markets),
+                                        timeout=10,
+                                    ).json()
+                                    scan_targets = [
+                                        x["market"]
+                                        for x in sorted(
+                                            tickers_data, key=lambda x: x.get("acc_trade_price_24h", 0), reverse=True
+                                        )[:20]
+                                    ]
+                                    _ohlcv_pref = {}
                             except Exception:
                                 scan_targets = []
+                                _ohlcv_pref = {}
 
                             print(f"  -> 🪙 코인 실시간 수급 상위 {len(scan_targets)}개 정밀 분석 시작!")
                             for idx, t in enumerate(scan_targets, 1):
@@ -4528,11 +4670,12 @@ def run_trading_bot():
                                 if t in held_coins:
                                     print(f"  ⏭️ {get_coin_name(t)}({t}): 이미 보유중 (패스)")
                                     continue
-                                df_upbit = pyupbit.get_ohlcv(t, interval="day", count=250)
-                                if df_upbit is None or len(df_upbit) < 20:
+                                ohlcv = _ohlcv_pref.get(t) if isinstance(_ohlcv_pref, dict) else None
+                                if not ohlcv or len(ohlcv) < 20:
+                                    ohlcv = coin_broker.fetch_ohlcv(t, "day", 250)
+                                if not ohlcv or len(ohlcv) < 20:
                                     print(f"  ⏭️ {t}: OHLCV 데이터 부족 (패스)")
                                     continue
-                                ohlcv = [{'o': row['open'], 'h': row['high'], 'l': row['low'], 'c': row['close'], 'v': row['volume']} for _, row in df_upbit.iterrows()]
                                 
                                 # 🛡️ [수술 1] 개별 종목 ADX 폭발 시 하락장 무시 및 비중 상향 로직
                                 try:
@@ -4579,7 +4722,7 @@ def run_trading_bot():
                                 ratio = min(ratio, max_allowed_ratio)
 
                                 budget = total_coin_equity * ratio * macro_mult
-                                coin_min_budget = UPBIT_COIN_MIN_ORDER_KRW  # 업비트 KRW 마켓 최소 주문
+                                coin_min_budget = _coin_min_order_krw()
 
                                 # 🧹 [수술 2] 예수금 영끌(Sweep) 및 철통 방어 로직
                                 if budget < coin_min_budget:

@@ -45,12 +45,27 @@ def send_telegram(message: str) -> bool:
         "text": message,
     }
 
-    max_attempts = 4
+    connect_timeout = 30
+    read_timeout = 60
+    max_attempts = 5
+    if isinstance(_config, dict):
+        try:
+            connect_timeout = max(5, int(_config.get("telegram_connect_timeout_sec", connect_timeout)))
+        except Exception:
+            pass
+        try:
+            read_timeout = max(10, int(_config.get("telegram_read_timeout_sec", read_timeout)))
+        except Exception:
+            pass
+        try:
+            max_attempts = max(1, int(_config.get("telegram_max_retries", max_attempts)))
+        except Exception:
+            pass
     last_err: Exception | None = None
 
     for attempt in range(max_attempts):
         try:
-            resp = requests.post(api_url, json=payload, timeout=(15, 45))
+            resp = requests.post(api_url, json=payload, timeout=(connect_timeout, read_timeout))
             if resp.status_code == 429:
                 try:
                     ra = int(resp.json().get("parameters", {}).get("retry_after", 3))
@@ -78,7 +93,10 @@ def send_telegram(message: str) -> bool:
         except requests.RequestException as e:
             last_err = e
             wait = min(2**attempt, 30)
-            print(f"⚠️ 텔레그램 전송 재시도 ({attempt + 1}/{max_attempts}) … {type(e).__name__}: {e}")
+            print(
+                f"⚠️ 텔레그램 전송 재시도 ({attempt + 1}/{max_attempts}) … "
+                f"{type(e).__name__}: {e} (timeout={connect_timeout}/{read_timeout}s)"
+            )
             time.sleep(wait)
 
     print(f"⚠️ 텔레그램 전송 실패(최종): {last_err}")

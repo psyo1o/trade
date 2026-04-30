@@ -63,7 +63,16 @@ def resolve_display_current_price(
                     if oc and len(oc) > 0:
                         cp = float(oc[-1]["c"])
         elif market == "COIN":
-            cp = float(pyupbit.get_current_price(str(ticker)) or bp)
+            try:
+                from api import coin_broker
+
+                cb = coin_broker.get_current_price(str(ticker))
+                if cb and float(cb) > 0:
+                    cp = float(cb)
+                else:
+                    cp = float(pyupbit.get_current_price(str(ticker)) or bp)
+            except Exception:
+                cp = float(pyupbit.get_current_price(str(ticker)) or bp)
     except Exception:
         cp = float(bp)
     return float(cp if cp > 0 else bp)

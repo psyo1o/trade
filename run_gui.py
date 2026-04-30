@@ -36,6 +36,7 @@ from utils.telegram import send_telegram
 from utils.helpers import (
     get_kr_company_name,
     get_us_company_name,
+    is_coin_ticker,
     kis_equities_weekend_suppress_window_kst,
     seconds_until_next_quarter_hour,
     seconds_until_next_half_hour,
@@ -851,7 +852,7 @@ class BotDashboard(QMainWindow):
                         except Exception:
                             symbol_name = ""
                 elif market in ("COIN", "🪙 코인"):
-                    if not symbol_name and ticker.startswith("KRW-"):
+                    if not symbol_name and is_coin_ticker(ticker):
                         symbol_name = ticker.split("-", 1)[1]
 
                 if symbol_name and symbol_name != ticker:
@@ -904,9 +905,9 @@ class BotDashboard(QMainWindow):
                         name = get_kr_company_name(ticker)
                     except:
                         name = ticker
-            elif ticker.startswith("KRW-"):
+            elif is_coin_ticker(ticker):
                 market = "🪙 코인"
-                name = ticker.replace("KRW-", "")
+                name = ticker.replace("KRW-", "").replace("USDT-", "")
             else:
                 market = "🇺🇸 미장"
                 name = us_name_dict.get(ticker, ticker)
@@ -1138,7 +1139,7 @@ class BotDashboard(QMainWindow):
             
             ticker_key = str(ticker).strip().upper()
             # 최고가(max_p)는 정규장 중에만 갱신 (기존 정책 복원)
-            market_type = "COIN" if ticker_key.startswith("KRW-") else ("KR" if ticker_key.isdigit() else "US")
+            market_type = "COIN" if is_coin_ticker(ticker_key) else ("KR" if ticker_key.isdigit() else "US")
             if not run_bot.is_market_open(market_type):
                 return
 

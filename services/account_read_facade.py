@@ -12,6 +12,7 @@ account_read_facade — 국·미 보유 조회의 **단일 진입점**.
 from __future__ import annotations
 
 from api.kis_parsers import parse_us_qty
+from utils.helpers import is_coin_ticker
 
 
 def get_held_stocks_kr(
@@ -68,7 +69,7 @@ def get_held_stocks_us(
         try:
             st = load_state(state_path)
             pos = st.get("positions") or {}
-            codes = [t for t in pos if (not str(t).isdigit() and not str(t).upper().startswith("KRW-"))]
+            codes = [t for t in pos if (not str(t).isdigit() and not is_coin_ticker(str(t)))]
             print(f"  📌 [조회 facade US] 주말·점검 창 — 장부 기반 보유 {len(codes)}종 (API 미호출)")
             return codes
         except Exception as e:
@@ -147,7 +148,7 @@ def get_held_stocks_us_info(
             return [
                 {"code": t, "name": us_name_dict.get(t, t), "qty": ledger_qty_for_ui(pos.get(t), 1.0)}
                 for t in pos
-                if not str(t).isdigit() and not str(t).upper().startswith("KRW-")
+                if not str(t).isdigit() and not is_coin_ticker(str(t))
             ]
         except Exception as e:
             print(f"  ⚠️ [조회 facade US info] 장부 폴백 실패: {type(e).__name__}: {e}")
@@ -191,7 +192,7 @@ def get_held_stocks_us_detail(
             pos = st.get("positions") or {}
             out = []
             for code, p in pos.items():
-                if str(code).isdigit() or str(code).upper().startswith("KRW-"):
+                if str(code).isdigit() or is_coin_ticker(str(code)):
                     continue
                 bp = to_float(p.get("buy_p", 0), 0.0)
                 out.append({"code": code, "qty": ledger_qty_for_ui(p, 1.0), "avg_p": bp, "current_p": bp})

@@ -31,6 +31,12 @@ _us_ticker_exchange_cache = {}
 def configure(config: dict):
     global _cfg
     _cfg = config
+    try:
+        from api import coin_config as _coin_cfg
+
+        _coin_cfg.configure(config)
+    except Exception:
+        pass
 
 
 def _split_account_no(acc_no: str):
@@ -81,8 +87,17 @@ def _create_brokers():
             api_key=_cfg["kis_key"], api_secret=_cfg["kis_secret"],
             acc_no=_cfg["kis_account"], exchange='나스닥'
         )
-        from api import upbit_api as _upbit_api
-        _upbit_api.init_upbit(_cfg)
+        from api import coin_config as _coin_cfg
+
+        _ae = _coin_cfg.active_exchange()
+        if _ae == "UPBIT" and _coin_cfg.upbit_enabled():
+            from api import upbit_api as _upbit_api
+
+            _upbit_api.init_upbit(_cfg)
+        elif _ae == "BINANCE" and _coin_cfg.binance_enabled():
+            from api import binance_api as _bn
+
+            _bn.init_binance(_cfg)
 
         # KIS 토큰 발급 (mojito는 자동 발급 안 함)
         token_data = issue_new_kis_token()

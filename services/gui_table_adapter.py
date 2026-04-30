@@ -68,9 +68,23 @@ def build_rows_data(
         print(f"⚠️ 미장 테이블 행 구성 실패: {e}")
 
     # 코인 파싱
+    try:
+        from api import coin_broker, coin_config
+    except Exception:
+        coin_broker = None
+        coin_config = None
+
     for coin in upbit_bals:
-        if coin.get("currency") != "KRW" and safe_num(coin.get("balance"), 0.0) > 0.00000001:
-            code = f"KRW-{coin['currency']}"
+        cur = str(coin.get("currency") or "").upper()
+        if cur in ("KRW", "VTHO"):
+            continue
+        if coin_config and coin_config.is_binance() and cur == "USDT":
+            continue
+        if safe_num(coin.get("balance"), 0.0) > 0.00000001:
+            if coin_config and coin_config.is_binance():
+                code = f"USDT-{coin['currency']}"
+            else:
+                code = f"KRW-{coin['currency']}"
             qty = str(safe_num(coin.get("balance"), 0.0))
             price = str(safe_num(coin.get("avg_buy_price", 0), 0.0))
             rows_data.append(process_row_data("🪙 코인", coin["currency"], qty, price, "COIN", code, None))

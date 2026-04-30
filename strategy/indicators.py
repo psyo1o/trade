@@ -71,7 +71,11 @@ def get_safe_atr(ticker: str, df: Any, period: int = 14) -> float | None:
         # V8: 검증/계산은 최근 period 구간 기준으로만 수행
         calc = wdf.tail(p).copy()
         # 2차 방어: 비정상 진폭 차단 (최근 구간, 종목군별 동적 임계)
-        tr_ratio_limit = 0.60 if str(ticker).startswith("KRW-") else 0.30
+        tr_ratio_limit = (
+            0.60
+            if (str(ticker).startswith("KRW-") or str(ticker).startswith("USDT-"))
+            else 0.30
+        )
         bad_tr = calc["tr"] > (calc["c"] * tr_ratio_limit)
         if bad_tr.any():
             print(
