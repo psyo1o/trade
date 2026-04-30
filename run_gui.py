@@ -692,7 +692,7 @@ class BotDashboard(QMainWindow):
         main_split.addWidget(log_panel)
         main_split.setStretchFactor(0, 1)
         main_split.setStretchFactor(1, 0)
-        main_split.setSizes([520, 220])
+        main_split.setSizes([520, 350])
         layout.addWidget(main_split, 1)
 
     def _on_capital_adjust_clicked(self):

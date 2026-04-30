@@ -51,6 +51,7 @@ run_bot.py
   - refresh_circuit_aux_from_brokers(state, path) … 브로커만으로 동일 키 재기록(adjust_capital 등)
   - 관측성: [KR …], [US …], [COIN …] 태그. 매수 스캔은 rules.calculate_pro_signals 안에서 [V8],
     스윙 보조는 check_swing_entry 실패 시 [스윙] 한 줄(run_bot에서 출력).
+  - 타임스탑(보유 연속시간): V8 주식 10일(+4% 유예) / V8 코인 3일 / SWING 주식 14일(+2%) / SWING 코인 5일 — README 표·run_bot 상수와 동일.
 
 run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI 사용 안내」)
   - PyQt5. import run_bot 순간 config 로드 → config 수정 후에는 GUI 재시작.

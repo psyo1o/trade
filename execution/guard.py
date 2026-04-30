@@ -314,9 +314,9 @@ _COOLDOWN_HOURS_MATRIX: dict[tuple[str, str, str], float] = {
     ("TREND_V8", "KR", "profit"): 72.0,
     ("TREND_V8", "US", "profit"): 72.0,
     ("TREND_V8", "COIN", "profit"): 24.0,
-    # TREND_V8 — 손절·타임스탑
-    ("TREND_V8", "KR", "stop"): 168.0,
-    ("TREND_V8", "US", "stop"): 168.0,
+    # TREND_V8 — 손절·타임스탑 (주식 타임스탑 달력 10일과 동일 스케일)
+    ("TREND_V8", "KR", "stop"): 240.0,
+    ("TREND_V8", "US", "stop"): 240.0,
     ("TREND_V8", "COIN", "stop"): 72.0,
     # SWING_FIB — 정상 익절
     ("SWING_FIB", "KR", "profit"): 480.0,

@@ -3141,16 +3141,16 @@ def _calc_hard_stop(pos_info: dict, buy_p: float) -> float:
     return float(pos_info.get("sl_p", buy_p * 0.9))
 
 
-# 타임스탑
-#   V8 주식(KR/US): 7일(168h) + 수익 < +4% 전량 / ≥4% 유예
-#   V8 코인: 3일(72h) + 수익 < +4% 전량 / ≥4% 유예
-#   SWING 주식(KR/US): 10일(240h) + 수익 < +2% 전량 / ≥2% 유예
-#   SWING 코인: 5일(120h) + 수익 < +2% 전량 / ≥2% 유예
+# 타임스탑 (보유 = 달력·연속시간; 주식은 주말 포함 ≈ 영업일 환산 안내용)
+#   V8 주식(KR/US): 10일(240h) + 수익 < +4% 전량 / ≥4% 유예  (≈ 7영업일 + 주말 1~2회)
+#   V8 코인: 3일(72h) + 수익 < +4% 전량 / ≥4% 유예  (휴장 없음)
+#   SWING 주식(KR/US): 14일(336h) + 수익 < +2% 전량 / ≥2% 유예  (≈ 10영업일 + 주말 2회)
+#   SWING 코인: 5일(120h) + 수익 < +2% 전량 / ≥2% 유예  (휴장 없음)
 # (보유시간은 buy_date 우선, 없으면 buy_time — 캘린더 경과시간)
-V8_TIME_STOP_HOURS_EQUITY = 7.0 * 24.0
+V8_TIME_STOP_HOURS_EQUITY = 10.0 * 24.0
 V8_TIME_STOP_HOURS_COIN = 3.0 * 24.0
 V8_TIME_STOP_EXEMPT_PROFIT_PCT = 4.0
-SWING_TIME_STOP_HOURS_EQUITY = 10.0 * 24.0
+SWING_TIME_STOP_HOURS_EQUITY = 14.0 * 24.0
 SWING_TIME_STOP_HOURS_COIN = 5.0 * 24.0
 SWING_TIME_STOP_EXEMPT_PROFIT_PCT = 2.0
 

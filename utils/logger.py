@@ -15,6 +15,18 @@ from logging.handlers import TimedRotatingFileHandler
 _quant_logger = None
 
 
+def _daily_log_namer(default_name: str) -> str:
+    """
+    TimedRotatingFileHandler 기본 이름(`bot.log.YYYY-MM-DD`)을
+    `bot.YYYY-MM-DD.log`로 바꿔 저장한다.
+    """
+    marker = ".log."
+    if marker in default_name:
+        head, tail = default_name.split(marker, 1)
+        return f"{head}.{tail}.log"
+    return default_name if default_name.endswith(".log") else f"{default_name}.log"
+
+
 def _safe_write_terminal(stream, buf: str) -> None:
     """Windows cp949 콘솔 등에서 이모지 출력 시 UnicodeEncodeError 방지."""
     if not stream:
@@ -85,6 +97,7 @@ def setup_quant_logging():
         backupCount=30,
         encoding='utf-8'
     )
+    log_handler.namer = _daily_log_namer
 
     log_handler.setFormatter(logging.Formatter('%(message)s'))
     quant_logger.addHandler(log_handler)
