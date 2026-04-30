@@ -9,6 +9,9 @@
     * ``binance_recv_window`` — 선택
 
 수수료 BNB 차감은 **바이낸스 웹 계정 설정**(BNB로 수수료 결제)에서 켜두면 자동 반영된다.
+
+비동기 확장: 장기적으로 ``ccxt.async_support.binance`` 전환 시 동일 시그니처의 비동기 주문 래퍼를
+두면 된다. 현재 엔진·GUI는 동기 CCXT 로 단일 스레드 호환을 유지한다.
 """
 
 from __future__ import annotations
@@ -18,6 +21,8 @@ import logging
 from typing import Any
 
 import ccxt  # type: ignore
+
+from utils.helpers import ensure_binance_order_precision
 
 exchange: ccxt.binance | None = None
 _cfg: dict = {}
@@ -96,10 +101,13 @@ def get_balances_like_upbit() -> list[dict[str, Any]]:
             continue
         free = float((bal.get(cur) or {}).get("free") or 0)
         used = float((bal.get(cur) or {}).get("used") or 0)
+        total_free_used = free + used
+        if total_free_used <= 0:
+            continue
         out.append(
             {
                 "currency": cur,
-                "balance": str(free + used),
+                "balance": str(total_free_used),
                 "locked": str(used),
                 "avg_buy_price": "0",
             }
@@ -146,10 +154,11 @@ def fetch_order_book_summary(internal_ticker: str) -> dict[str, float]:
 
 
 def clamp_qty_and_check_min_notional(internal_ticker: str, qty: float, price: float) -> tuple[float, str | None]:
-    """수량 정밀도 반올림 + 최소 명목(USDT) 검사. 불가 시 (0, reason)."""
+    """수량·명목 보정(helpers ``ensure_binance_order_precision``) + 최소 명목(USDT) 검사."""
     ex = ensure_exchange()
     sym = internal_to_ccxt(internal_ticker)
-    q = float(ex.amount_to_precision(sym, qty))
+    q_adj, _ = ensure_binance_order_precision(internal_ticker, float(qty), None)
+    q = float(q_adj) if q_adj is not None else float(ex.amount_to_precision(sym, float(qty)))
     p = float(price or 0.0)
     if q <= 0:
         return 0.0, "수량 0"
@@ -169,7 +178,7 @@ def clamp_qty_and_check_min_notional(internal_ticker: str, qty: float, price: fl
 
 def market_buy_usdt(internal_ticker: str, spend_usdt: float) -> dict[str, Any]:
     """
-    시장가 매수(지출 USDT). 바이낸스는 ``quoteOrderQty`` 로 USDT 금액 매수.
+    시장가 매수만 사용(지정가 없음). 지출 USDT — ``quoteOrderQty``.
     """
     ex = ensure_exchange()
     sym = internal_to_ccxt(internal_ticker)
@@ -181,17 +190,43 @@ def market_buy_usdt(internal_ticker: str, spend_usdt: float) -> dict[str, Any]:
         order = ex.create_order(sym, "market", "buy", spend_adj, None, {"quoteOrderQty": spend_adj})
     except Exception:
         order = ex.create_market_buy_order(sym, spend_adj)
-    return order if isinstance(order, dict) else {"info": order}
+    od = order if isinstance(order, dict) else {"info": order}
+    avg, filled = order_avg_fill_usdt(od)
+    tot = float(od.get("cost") or 0) or (avg * filled if avg > 0 and filled > 0 else spend_adj)
+    log.info(
+        "[BINANCE MARKET BUY] %s | Qty: %.8f | Total: %.4f USDT",
+        internal_ticker,
+        filled,
+        tot,
+    )
+    print(
+        f"[BINANCE MARKET BUY] {internal_ticker} | Qty: {filled:.8f} | Total: {tot:.4f} USDT"
+    )
+    return od
 
 
 def market_sell_base(internal_ticker: str, qty: float) -> dict[str, Any]:
+    """시장가 매도만 사용(지정가 없음). 수량은 ``ensure_binance_order_precision`` 경유."""
     ex = ensure_exchange()
     sym = internal_to_ccxt(internal_ticker)
-    q = float(ex.amount_to_precision(sym, qty))
+    q_adj, _ = ensure_binance_order_precision(internal_ticker, float(qty), None)
+    q = float(q_adj) if q_adj is not None else float(ex.amount_to_precision(sym, float(qty)))
     if q <= 0:
         raise ValueError("qty<=0")
     order = ex.create_market_sell_order(sym, q)
-    return order if isinstance(order, dict) else {"info": order}
+    od = order if isinstance(order, dict) else {"info": order}
+    avg, filled = order_avg_fill_usdt(od)
+    tot = float(od.get("cost") or 0) or (avg * filled if avg > 0 and filled > 0 else 0.0)
+    log.info(
+        "[BINANCE MARKET SELL] %s | Qty: %.8f | Total: %.4f USDT",
+        internal_ticker,
+        filled,
+        tot,
+    )
+    print(
+        f"[BINANCE MARKET SELL] {internal_ticker} | Qty: {filled:.8f} | Total: {tot:.4f} USDT"
+    )
+    return od
 
 
 def order_avg_fill_usdt(order: dict[str, Any]) -> tuple[float, float]:
@@ -209,7 +244,7 @@ def order_avg_fill_usdt(order: dict[str, Any]) -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def top_usdt_symbols_by_quote_volume(limit: int = 20) -> list[str]:
+def top_usdt_symbols_by_quote_volume(limit: int = 30) -> list[str]:
     """거래대금(quote) 상위 → 내부 티커 ``USDT-XXX``."""
     ex = ensure_exchange()
     tickers = ex.fetch_tickers()

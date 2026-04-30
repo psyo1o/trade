@@ -54,5 +54,5 @@ def btc_benchmark_ticker() -> str:
 
 
 def get(key: str, default=None):
-    """원본 설정 조회(환율 등)."""
+    """원본 설정 조회(환율·coin_min_notional_usd 등)."""
     return _cfg.get(key, default)

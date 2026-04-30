@@ -15,6 +15,7 @@ from typing import Any
 from api import binance_api
 from api import coin_config
 from api import upbit_api
+from utils.helpers import coin_holding_meets_min_notional
 
 log = logging.getLogger(__name__)
 
@@ -47,12 +48,40 @@ def get_krw_per_usdt() -> float:
     return 1350.0
 
 
+def should_include_coin_balance_row(b: dict) -> bool:
+    """
+    GUI·동기화·매매 루프 공통: 표시통화·먼지 제외.
+
+    기본 ``config.coin_min_notional_usd``(달러) 미만 명목은 제외(현재가 조회 실패 시 수량 폴백).
+    """
+    cur = str(b.get("currency") or "").upper()
+    if cur in ("KRW", "VTHO"):
+        return True
+    if coin_config.is_binance() and cur == "USDT":
+        return True
+    t = held_ticker_row(b)
+    if not t:
+        return False
+    qty = _float_bal(b.get("balance"))
+    min_usd = float(coin_config.get("coin_min_notional_usd") or 1.0)
+    px = get_current_price(t)
+    return coin_holding_meets_min_notional(
+        qty,
+        px,
+        is_binance=coin_config.is_binance(),
+        min_usd=min_usd,
+        krw_per_usdt=get_krw_per_usdt(),
+    )
+
+
 def get_balances() -> list[dict[str, Any]]:
     if coin_config.is_binance():
-        return binance_api.get_balances_like_upbit()
-    if upbit_api.upbit is None:
+        raw = binance_api.get_balances_like_upbit()
+    elif upbit_api.upbit is None:
         return []
-    return upbit_api.upbit.get_balances() or []
+    else:
+        raw = upbit_api.upbit.get_balances() or []
+    return [b for b in raw if should_include_coin_balance_row(b)]
 
 
 def quote_symbol() -> str:
@@ -196,11 +225,6 @@ def buy_market_budget_krw(internal_ticker: str, budget_krw: float) -> Any:
         )
         return None
     order = binance_api.market_buy_usdt(internal_ticker, spend_usdt)
-    avg, filled = binance_api.order_avg_fill_usdt(order if isinstance(order, dict) else {})
-    tot = spend_usdt
-    print(
-        f"  [BINANCE BUY] {internal_ticker} | Qty: {filled:.8f} | Price: ~{avg:.8f} USDT | Total: ~{tot:.4f} USDT"
-    )
     return order
 
 

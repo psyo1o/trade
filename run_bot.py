@@ -415,7 +415,6 @@ except Exception as e:
 
 from utils.telegram import configure_telegram, register_telegram_atexit, send_telegram
 from utils.helpers import (
-    coin_qty_counts_for_position,
     is_coin_ticker,
     configure_kis_token_path,
     configure_trade_history,
@@ -500,6 +499,8 @@ INDEX_CRASH_COIN = -3.5   # 코인 BTC 급락 기준 (%)
 # 업비트 코인 시장가 매수 — 가용 잔고 캡(수수료·반올림 오차로 InsufficientFundsBid 방지)
 UPBIT_KRW_AVAILABLE_CAP_RATIO = 0.999  # 주문 직전: min(목표액, get_balance(KRW) * 이 값)
 UPBIT_COIN_MIN_ORDER_KRW = 5000.0      # KRW 마켓 최소 주문 금액(업비트 기준)
+# 바이낸스: 24h 거래대금(USDT) 상위 N (기본 30)
+BINANCE_UNIVERSE_TOP = int(config.get("binance_universe_top", 30))
 
 
 def _coin_min_order_krw() -> float:
@@ -891,7 +892,7 @@ def get_held_coins():
         held = []
         for b in balances:
             t = coin_broker.held_ticker_row(b)
-            if t and coin_qty_counts_for_position(b.get("balance", 0)):
+            if t and coin_broker.should_include_coin_balance_row(b):
                 held.append(t)
         return held
     except Exception as e:
@@ -1038,7 +1039,7 @@ def get_held_stocks_coins_info():
             if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
                 continue
             qty = _to_float(b.get('balance'))
-            if coin_qty_counts_for_position(qty):
+            if coin_broker.should_include_coin_balance_row(b):
                 ticker = coin_broker.held_ticker_row(b)
                 if not ticker:
                     continue
@@ -1525,7 +1526,7 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
                 if not t:
                     continue
                 qf = float(_to_float(b.get("balance", 0)))
-                if coin_qty_counts_for_position(qf):
+                if coin_broker.should_include_coin_balance_row(b):
                     lines.append(f"COIN {t} x{qf}")
             send_telegram(f"{msg}\n대상:\n" + "\n".join(lines[:40]))
         except Exception as e:
@@ -1573,7 +1574,7 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
             if not t:
                 continue
             qf = float(_to_float(b.get("balance", 0)))
-            if not coin_qty_counts_for_position(qf):
+            if not coin_broker.should_include_coin_balance_row(b):
                 continue
             manual_sell("COIN", t, qf)
     except Exception as e:
@@ -1731,7 +1732,7 @@ def _calc_coin_holdings_metrics(balances):
             if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
                 continue
             qty = _to_float(b.get('balance', 0))
-            if not coin_qty_counts_for_position(qty):
+            if not coin_broker.should_include_coin_balance_row(b):
                 continue
             ticker = coin_broker.held_ticker_row(b)
             if not ticker:
@@ -2549,7 +2550,7 @@ def get_coin_holdings_with_roi():
             if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
                 continue
             qty = _to_float(b.get('balance', 0))
-            if not coin_qty_counts_for_position(qty):
+            if not coin_broker.should_include_coin_balance_row(b):
                 continue
 
             ticker = coin_broker.held_ticker_row(b)
@@ -2929,10 +2930,45 @@ def _is_us_buy_window_now(now_us: datetime) -> tuple[bool, datetime, datetime]:
 
 
 def _is_coin_buy_window_now(now_coin: datetime) -> tuple[bool, datetime, datetime]:
-    """COIN 매수 시간창 계산(기존 로직 동일, KST 09:00 일봉 전환 기준)."""
+    """COIN 매수 시간창. ``coin_close`` = 매일 KST 09:00.
+
+    * **바이낸스(CCXT) 1d** 캔들은 관례상 **UTC 00:00** 경계(새 일봉 시작). 한국은 UTC+9·서머타임 없음 →
+      **KST 09:00 = UTC 00:00** 이므로, 이 ``coin_close`` 는 바이낸스 일봉이 갱신되는 순간과 같다.
+    * **업비트** 일봉이 API/차트마다 **KST 자정(00:00)** 인 경우도 있어, 엄밀히는 거래소 일봉 정의와
+      1~2h 오차가 날 수 있다(전략이 09:00 KST를 “국제가 일봉 기준”으로 쓰는 셈).
+    """
     coin_close = now_coin.replace(hour=9, minute=0, second=0, microsecond=0)
     coin_buy_start = coin_close - timedelta(minutes=BUY_WINDOW_MINUTES_BEFORE_CLOSE)
     return coin_buy_start <= now_coin < coin_close, coin_buy_start, coin_close
+
+
+def _binance_v8_slot_key(now_kst) -> str:
+    """KST 벽시계 **15분 슬롯** (:00, :15, :30, :45) 식별자."""
+    slot_min = (int(now_kst.minute) // 15) * 15
+    return now_kst.replace(minute=slot_min, second=0, microsecond=0).strftime("%Y-%m-%d-%H-%M")
+
+
+def _binance_should_run_v8_scan(state: dict, now_kst) -> bool:
+    """바이낸스 V8: KST 기준 **15분마다 1회** (해당 :00/:15/:30/:45 슬롯에서 아직 스캔 안 됐을 때)."""
+    cur = _binance_v8_slot_key(now_kst)
+    return state.get("last_binance_v8_scan_slot_key") != cur
+
+
+def _binance_mark_v8_scan_done(state: dict, now_kst) -> None:
+    state["last_binance_v8_scan_slot_key"] = _binance_v8_slot_key(now_kst)
+    state.pop("last_binance_v8_scan_hour_key", None)
+
+
+def _binance_should_run_swing_scan(state: dict, now_kst) -> bool:
+    """바이낸스 SWING: UTC 일봉 직후 KST 09:05~09:15, **일 1회**."""
+    if now_kst.hour != 9 or not (5 <= now_kst.minute < 15):
+        return False
+    d = now_kst.strftime("%Y-%m-%d")
+    return state.get("last_binance_swing_run_date") != d
+
+
+def _binance_mark_swing_scan_done(state: dict, now_kst) -> None:
+    state["last_binance_swing_run_date"] = now_kst.strftime("%Y-%m-%d")
 
 
 def _extract_held_coins_from_balances(balances) -> list[str]:
@@ -2943,7 +2979,7 @@ def _extract_held_coins_from_balances(balances) -> list[str]:
             continue
         if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
             continue
-        if not coin_qty_counts_for_position(b.get("balance", 0)):
+        if not coin_broker.should_include_coin_balance_row(b):
             continue
         t = coin_broker.held_ticker_row(b)
         if not t:
@@ -3009,7 +3045,7 @@ def _count_coin_positions_for_sell_loop(balances, positions: dict) -> int:
         if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
             continue
         t = coin_broker.held_ticker_row(b)
-        if t and t in positions and coin_qty_counts_for_position(b.get("balance", 0)):
+        if t and t in positions and coin_broker.should_include_coin_balance_row(b):
             n += 1
     return n
 
@@ -4325,8 +4361,8 @@ def run_trading_bot():
                 print(f"  ⏭️ {t}: 장부에 없음 (패스)")
                 continue
             qty = float(_to_float(b.get('balance', 0)))
-            if not coin_qty_counts_for_position(qty):
-                print(f"  ⏭️ {t}: 수량 너무 적음 ({qty}) (패스)")
+            if not coin_broker.should_include_coin_balance_row(b):
+                print(f"  ⏭️ {t}: 명목 최소 미만 또는 수량 부족 ({qty}) (패스)")
                 continue
             curr_p = coin_broker.get_current_price(t)
             if not curr_p:
@@ -4604,17 +4640,38 @@ def run_trading_bot():
         elif in_account_circuit_cooldown(state):
             print("  -> 🚨 코인 Phase5 계좌 서킷 쿨다운 — 신규 매수 중단.")
         else:
-            # ⏳ [핵심] 코인 매수: KST 09:00 일봉 전환 직전 N분(기본 30분 → 08:30~08:59, 업비트 24h 중 전략용 창)
+            # 업비트: KST 일봉 창 직전 N분만 매수. 바이낸스: V8=15분마다 상위 USDT 유니버스 / SWING=09:05~09:15·일1회
             now_coin = datetime.now(pytz.timezone("Asia/Seoul"))
-            is_coin_buy_time, _coin_buy_start, _coin_close = _is_coin_buy_window_now(now_coin)
+            use_bn_sched = bool(coin_config.is_binance())
+            do_bn_v8 = False
+            do_bn_sw = False
+            run_v8_signals = True
+            run_swing_signals = True
+            skip_buy = False
 
-            if not is_coin_buy_time:
-                print(
-                    f"  ⏳ [COIN 매수 대기] 일봉 기준점 직전 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분만 매수 "
-                    f"({_coin_buy_start.strftime('%H:%M')}~{_coin_close.strftime('%H:%M')} KST, "
-                    f"현재 {now_coin.strftime('%H:%M')})"
-                )
+            if use_bn_sched:
+                do_bn_v8 = _binance_should_run_v8_scan(state, now_coin)
+                do_bn_sw = _binance_should_run_swing_scan(state, now_coin)
+                run_v8_signals = do_bn_v8
+                run_swing_signals = do_bn_sw
+                skip_buy = not do_bn_v8 and not do_bn_sw
+                if skip_buy:
+                    print(
+                        f"  ⏳ [BINANCE 매수 대기] V8·상위{BINANCE_UNIVERSE_TOP}·15분마다 / "
+                        f"SWING·09:05~09:15·일1회 — 이번 틱 미해당 "
+                        f"(지금 {now_coin.strftime('%H:%M')} KST)"
+                    )
             else:
+                is_coin_buy_time, _coin_buy_start, _coin_close = _is_coin_buy_window_now(now_coin)
+                skip_buy = not is_coin_buy_time
+                if skip_buy:
+                    print(
+                        f"  ⏳ [COIN 매수 대기] 일봉 기준점 직전 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분만 매수 "
+                        f"({_coin_buy_start.strftime('%H:%M')}~{_coin_close.strftime('%H:%M')} KST, "
+                        f"현재 {now_coin.strftime('%H:%M')})"
+                    )
+
+            if not skip_buy:
                 # 지수 급락 체크
                 coin_index_change = get_market_index_change("COIN")
                 print(f"  📊 [BTC 지수] 변화율: {coin_index_change:+.2f}% 날씨는 {coin_weather}")
@@ -4630,7 +4687,7 @@ def run_trading_bot():
                                 if coin_config.is_binance():
                                     from api import binance_api as _bna
 
-                                    scan_targets = _bna.top_usdt_symbols_by_quote_volume(20)
+                                    scan_targets = _bna.top_usdt_symbols_by_quote_volume(BINANCE_UNIVERSE_TOP)
                                     _ohlcv_pref = coin_broker.run_prefetch_daily_sync(scan_targets, 250)
                                 else:
                                     scan_targets = []
@@ -4656,7 +4713,12 @@ def run_trading_bot():
                                 scan_targets = []
                                 _ohlcv_pref = {}
 
-                            print(f"  -> 🪙 코인 실시간 수급 상위 {len(scan_targets)}개 정밀 분석 시작!")
+                            _sched_note = ""
+                            if use_bn_sched:
+                                _sched_note = (
+                                    f" [V8={'ON' if do_bn_v8 else 'off'}, SWING={'ON' if do_bn_sw else 'off'}]"
+                                )
+                            print(f"  -> 🪙 코인 실시간 수급 상위 {len(scan_targets)}개 정밀 분석 시작!{_sched_note}")
                             for idx, t in enumerate(scan_targets, 1):
                                 if in_ticker_cooldown(state, t):
                                     print(
@@ -4742,16 +4804,24 @@ def run_trading_bot():
 
                                 strategy_type = "TREND_V8"
                                 entry_fib_level = 0.0
-                                is_buy, sl_p, s_name = calculate_pro_signals(ohlcv, coin_weather, t, get_coin_name(t), idx, len(scan_targets))
-                                if is_buy:
-                                    print(f"  ✅ [V8-BUY] {t} 진입")
-                                else:
+                                is_buy = False
+                                sl_p = 0.0
+                                s_name = ""
+
+                                if run_v8_signals:
+                                    is_buy, sl_p, s_name = calculate_pro_signals(
+                                        ohlcv, coin_weather, t, get_coin_name(t), idx, len(scan_targets)
+                                    )
+                                    if is_buy:
+                                        print(f"  ✅ [V8-BUY] {t} 진입")
+                                if not is_buy and run_swing_signals:
                                     sw_ok, sw_fib, sw_why = check_swing_entry(pd.DataFrame(ohlcv))
                                     if sw_ok:
                                         strategy_type = "SWING_FIB"
                                         entry_fib_level = float(sw_fib)
                                         sl_p = float(sw_fib)
                                         s_name = "SWING_FIB"
+                                        is_buy = True
                                         print(f"  ✅ [SWING-BUY] {t} entry_fib={entry_fib_level:,.2f}")
                                     else:
                                         _cn = get_coin_name(t)
@@ -4759,6 +4829,8 @@ def run_trading_bot():
                                         _disp = f"{_cn}({t})" if _cn and _cn != t else t
                                         print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
                                         continue
+                                if not is_buy:
+                                    continue
 
                                 if not can_open_new(t, state, max_positions=MAX_POSITIONS_COIN):
                                     print(f"  ⏭️ {t}: 포지션 개수 초과 ({MAX_POSITIONS_COIN}개) (패스)")
@@ -4801,6 +4873,12 @@ def run_trading_bot():
                                         f"예산 {int(budget):,}원, 주문가능 추정 {int(krw_box[0]):,}원 (TWAP·최소주문·업비트 응답 확인)"
                                     )
                                 krw_bal = float(krw_box[0])
+
+                            if use_bn_sched and (do_bn_v8 or do_bn_sw):
+                                if do_bn_v8:
+                                    _binance_mark_v8_scan_done(state, now_coin)
+                                if do_bn_sw:
+                                    _binance_mark_swing_scan_done(state, now_coin)
     else:
         print("💤 코인은 점검 또는 데이터 조회 불가 상태입니다.")
 

@@ -1,10 +1,10 @@
 ================================================================================
-  c-bot 프로젝트 구조 / 파일 설명 (2026-04-28)
+  c-bot 프로젝트 구조 / 파일 설명 (2026-04-30)
   — 처음 보는 분도 따라갈 수 있게: 무엇이 어디에 있고, 무엇을 Git에 올리지 않는지까지 정리
 ================================================================================
 
 [이 저장소는?]
-  한국투자증권(KIS) 국장·미장 + 업비트 코인을 자동매매하는 Python 프로젝트입니다.
+  한국투자증권(KIS) 국장·미장 + 코인(업비트 원화 마켓 또는 바이낸스 현물 USDT, CCXT) 자동매매 Python 프로젝트입니다.
   엔진은 run_bot.py, 일상 운영은 run_gui.py(GUI)를 권장합니다.
 
 [문서 역할 분담]
@@ -25,7 +25,7 @@
 --------------------------------------------------------------------------------
 
   run_bot.py, run_gui.py, screener.py, us_screener.py, adjust_capital.py  … 루트 실행·도구
-  api/           … KIS·업비트·거시지표 API 래퍼, KIS 응답 파서(kis_parsers.py)
+  api/           … KIS·업비트·바이낸스(CCXT)·거시지표 래퍼, coin_config/coin_broker, KIS 파서(kis_parsers.py)
   strategy/      … 진입·청산 규칙(rules.py, indicators.py), 섹터·AI·거시
   execution/     … 장부·동기화·TWAP·분할익절·서킷브레이커
   services/      … 잔고 facade, GUI/heartbeat 공용 스냅샷, 테이블 어댑터
@@ -59,8 +59,9 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
   - 스핀: 국·미·코인 max_positions + "설정 실시간 적용" → run_bot.MAX_* 즉시 + bot_state settings 저장.
   - 실시간 현황 보유표 마지막 열: 수량 QLineEdit(기본=행 보유 전량, 비우면 전량) + 매도 버튼 → _on_manual_sell_click
     (보유 초과·정수 주/코인 소수 검증) → run_bot.manual_sell.
-  - 탭: 실시간 현황(보유표·수동매도·로그), 매매 내역(trade_history), 장부(positions, 마지막 열은 tier),
+  - 탭: 실시간 현황(보유표·수동매도), 매매 내역(trade_history), 장부(positions, 마지막 열은 tier),
     고점 보정(입출금, adjust_capital 동일·CapitalAdjustThread).
+  - 실시간 작동 로그(봇 브리핑)는 탭 아래 공통 영역(세로 QSplitter) — 탭 전환과 무관하게 항상 표시.
   - 매매: 기동 약 1초 후 run_trading_bot 1회 → 이후 KST :00/:15/:30/:45 (중복 실행 가드).
   - 매매 직전 refresh_balance로 max_p 맞춤 후 WorkerThread에서 엔진.
   - 텔레 heartbeat: 기동 1회 + KST :00/:30 (백그라운드).
@@ -86,10 +87,12 @@ adjust_capital.py
 --------------------------------------------------------------------------------
 
 config.json
-  - API, test_mode, TWAP, 거시, AI 휩쏘 등. 저장소에 커밋하지 않음.
+  - API, test_mode, TWAP, 거시, AI 휩쏘, 코인 market_preference·binance_* 등. 저장소에 커밋하지 않음.
 
 bot_state.json
-  - positions: buy_p, sl_p, qty, scale_out_done, entry_atr, current_atr,
+  - positions 키는 종목 식별 문자열(티커 형태). 업비트면 KRW-BTC 등 **KRW- 접두**,
+    바이낸스 현물이면 USDT-BTC 등 **USDT- 접두** — “장부에 원화만 따로 있다”는 뜻이 아님(README 동명 절 참고).
+  - 각 포지션 필드: buy_p, sl_p, qty, scale_out_done, entry_atr, current_atr,
     strategy_type(TREND_V8 | SWING_FIB), entry_fib_level(스윙 하드스탑 기준) …
   - cooldown, ticker_cooldowns, stats (wins/losses/total_profit=전량 청산 누적,
     manual_partial_total_profit_pct=수동 부분 매도 가중 누적)
@@ -113,7 +116,10 @@ kr_targets.json
 --------------------------------------------------------------------------------
 
 api/
-  kis_api.py, upbit_api.py … 주문·잔고·토큰
+  kis_api.py, upbit_api.py … 주문·잔고·토큰; coin_config에 따라 업비트만/바이낸스만 초기화
+  coin_config.py … 코인 거래소 선택·환율 힌트 등
+  coin_broker.py … 스캔·주문·잔고 공통 진입(업비트/바이낸스 분기)
+  binance_api.py … 바이낸스 현물(CCXT)
   macro_data.py … VIX, Fear&Greed
   kis_parsers.py … output2 list/dict 혼합 파싱 공통화
 

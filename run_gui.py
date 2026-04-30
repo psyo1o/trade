@@ -4,6 +4,7 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
 
 특징
     * 잔고·성적표·수동 매도·로그 뷰 등은 ``run_bot`` / ``execution`` / ``utils`` API를 그대로 호출.
+    * **실시간 작동 로그(봇 브리핑)** 는 탭 위젯 **아래**에 두어, 탭을 바꿔도 같은 자리에 보이게 한다(세로 ``QSplitter``).
     * ``import run_bot`` 시점에 ``config.json`` 이 로드되므로 **설정 변경 후 GUI 재시작** 필요.
     * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_total_equity``·``capital_adjustments`` 반영 (백그라운드 스레드).
     * 매매는 시작 즉시 실행하지 않고, **KST :00 / :15 / :30 / :45** 정렬 스케줄에만 맞춰 `run_trading_bot`을 실행한다.
@@ -25,8 +26,8 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QTextEdit, QTableWidget, QTableWidgetItem,
                              QHeaderView, QTabWidget, QMessageBox, QSpinBox, QLineEdit, QRadioButton,
-                             QButtonGroup, QSizePolicy)
-from PyQt5.QtCore import QTimer, pyqtSignal, QObject, QThread
+                             QButtonGroup, QSizePolicy, QSplitter)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont
 from pathlib import Path
 import traceback
@@ -578,9 +579,8 @@ class BotDashboard(QMainWindow):
         
         layout.addLayout(settings_layout)
 
-        # 탭 위젯 생성
+        # 탭 위젯 생성 (봇 브리핑 로그는 탭 밖 하단에 고정)
         tabs = QTabWidget()
-        layout.addWidget(tabs)
 
         # 1. 실시간 현황 탭
         dashboard_tab = QWidget()
@@ -598,15 +598,6 @@ class BotDashboard(QMainWindow):
 
         dashboard_layout.addWidget(QLabel("<b>📊 현재 보유 종목 (국장/미장/코인)</b>"))
         dashboard_layout.addWidget(self.table)
-        
-        dashboard_layout.addWidget(QLabel("<b>📝 실시간 작동 로그 (봇 브리핑)</b>"))
-        self.log_console = QTextEdit()
-        self.log_console.setReadOnly(True)
-        self.log_console.setStyleSheet(
-            "background-color: #1e1e1e; color: #00ff00; font-family: Consolas, 'Malgun Gothic', monospace; font-size: 12px;"
-        )
-        self.log_console.setMinimumHeight(200)
-        dashboard_layout.addWidget(self.log_console)
 
         tabs.addTab(dashboard_tab, "실시간 현황")
 
@@ -681,6 +672,28 @@ class BotDashboard(QMainWindow):
         capital_layout.addStretch()
 
         tabs.addTab(capital_tab, "고점 보정 (입출금)")
+
+        log_header = QLabel("<b>📝 실시간 작동 로그 (봇 브리핑)</b>")
+        self.log_console = QTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setStyleSheet(
+            "background-color: #1e1e1e; color: #00ff00; font-family: Consolas, 'Malgun Gothic', monospace; font-size: 12px;"
+        )
+        self.log_console.setMinimumHeight(200)
+
+        log_panel = QWidget()
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(log_header)
+        log_layout.addWidget(self.log_console, 1)
+
+        main_split = QSplitter(Qt.Vertical)
+        main_split.addWidget(tabs)
+        main_split.addWidget(log_panel)
+        main_split.setStretchFactor(0, 1)
+        main_split.setStretchFactor(1, 0)
+        main_split.setSizes([520, 220])
+        layout.addWidget(main_split, 1)
 
     def _on_capital_adjust_clicked(self):
         import adjust_capital

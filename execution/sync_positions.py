@@ -26,7 +26,6 @@ from api.kis_api import get_balance_with_retry, get_us_positions_with_retry
 from execution.guard import save_state
 from strategy.rules import get_ohlcv_yfinance
 from utils.helpers import (
-    coin_qty_counts_for_position,
     ensure_dict,
     is_coin_ticker,
     kis_equities_weekend_suppress_window_kst,
@@ -117,7 +116,7 @@ def _get_live_position_seeds():
                 if coin_config.is_binance() and str(currency).upper() == 'USDT':
                     continue
                 qty = _to_float(b.get('balance', 0))
-                if qty <= 0.00000001 or not coin_qty_counts_for_position(qty):
+                if qty <= 0.00000001 or not coin_broker.should_include_coin_balance_row(b):
                     continue
                 ticker = coin_broker.held_ticker_row(b)
                 if not ticker:

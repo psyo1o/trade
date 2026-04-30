@@ -2,9 +2,10 @@
 """
 크로스컷팅 헬퍼 — 티커 키, 표시 이름, KIS 토큰·매매내역 JSON.
 
-``COIN_MIN_POSITION_QTY`` / ``coin_qty_counts_for_position``
-    코인 먼지 잔고는 ``get_held_coins``·``sync_positions``·ROI 집계에서 제외되어
-    ``positions`` 에도 자동복구되지 않고, 장부에만 있으면 유령으로 삭제된다.
+``coin_holding_meets_min_notional`` / ``coin_broker.should_include_coin_balance_row``
+    코인 **먼지**는 config ``coin_min_notional_usd``(기본 1 USD) **미만 명목**이면 잔고·GUI·동기화에서 제외.
+    가격을 못 구할 때만 ``coin_qty_counts_for_position``(수량 하한)으로 폴백.
+    그 외 먼지는 ``get_held_coins``·``sync``·ROI 경로에서 제외되고, ``positions`` 자동복구·유령 정리 규칙은 기존과 같다.
 
 설계 메모
     * ``configure_kis_token_path`` / ``configure_trade_history`` 는 ``run_bot`` 기동 시 한 번 호출.
@@ -39,11 +40,51 @@ COIN_MIN_POSITION_QTY = 0.0001
 
 
 def coin_qty_counts_for_position(qty) -> bool:
-    """``COIN_MIN_POSITION_QTY`` 초과일 때만 실질 보유로 본다."""
+    """``COIN_MIN_POSITION_QTY`` 초과일 때만 실질 보유로 본다(가격을 못 구할 때 폴백)."""
     try:
         return float(qty or 0) > COIN_MIN_POSITION_QTY
     except (TypeError, ValueError):
         return False
+
+
+def coin_holding_meets_min_notional(
+    qty: float,
+    unit_price: float | None,
+    *,
+    is_binance: bool,
+    min_usd: float,
+    krw_per_usdt: float,
+) -> bool:
+    """
+    보유 명목이 최소 기준 이상이면 True.
+
+    * 바이낸스: ``qty × 호가(USDT) >= min_usd`` (기본 min_usd 는 USD·USDT 명목).
+    * 업비트: ``qty × 호가(KRW) >= min_usd × krw_per_usdt`` (달러 기준을 원화로 환산).
+    * 현재가를 못 구하면 레거시 수량 하한(``coin_qty_counts_for_position``)만 적용.
+    """
+    try:
+        q = float(qty or 0)
+    except (TypeError, ValueError):
+        return False
+    if q <= 0:
+        return False
+    m = float(min_usd or 1.0)
+    if m <= 0:
+        m = 1.0
+    try:
+        px = float(unit_price) if unit_price is not None else 0.0
+    except (TypeError, ValueError):
+        px = 0.0
+    if px > 0:
+        if is_binance:
+            return q * px >= m
+        try:
+            kpx = float(krw_per_usdt or 0)
+        except (TypeError, ValueError):
+            kpx = 0.0
+        if kpx > 0:
+            return q * px >= m * kpx
+    return coin_qty_counts_for_position(q)
 
 
 def seconds_until_next_quarter_hour(tz_name: str = "Asia/Seoul") -> float:
@@ -241,3 +282,43 @@ def record_trade(trade_info):
 
         with open(_trade_history_path, 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=2, ensure_ascii=False)
+
+
+def ensure_binance_order_precision(
+    internal_ticker: str,
+    amount: float | None = None,
+    price: float | None = None,
+) -> tuple[float | None, float | None]:
+    """
+    바이낸스 현물 주문 직전 수량·가격 보정.
+
+    ``ccxt`` 마켓의 ``precision`` / ``limits`` 를 반영한다. 수량은 LOT_SIZE step 기준 **내림(floor)** 이
+    가능하면 적용해 초과 매도·Invalid Order 를 줄인다.
+    """
+    from api import binance_api
+
+    ex = binance_api.ensure_exchange()
+    sym = binance_api.internal_to_ccxt(internal_ticker)
+    m = ex.market(sym)
+    out_amt = None
+    out_px = None
+    if amount is not None and float(amount) > 0:
+        amt = float(amount)
+        step = None
+        try:
+            for f in (m.get("info") or {}).get("filters") or []:
+                if str(f.get("filterType") or "") == "LOT_SIZE":
+                    step = float(f.get("stepSize") or 0)
+                    break
+        except Exception:
+            step = None
+        if step and step > 0:
+            import math
+
+            amt = math.floor(amt / step) * step
+        out_amt = float(ex.amount_to_precision(sym, amt))
+        if out_amt <= 0:
+            out_amt = None
+    if price is not None and float(price) > 0:
+        out_px = float(ex.price_to_precision(sym, float(price)))
+    return out_amt, out_px

@@ -10,7 +10,6 @@
     * ``verify=False`` 가 들어간 호출이 있을 수 있으니(레거시) 운영 환경에서는 증권사 정책에 맞게 조정한다.
     * ``configure(config)`` 가 선행되어야 ``_cfg`` 가 채워진다.
 """
-import sys
 from datetime import datetime, timedelta
 
 import mojito
@@ -116,7 +115,18 @@ def _create_brokers():
     except Exception as e:
         print(f"🚨 브로커 객체 생성 실패: {e}")
         send_telegram(f"🚨 [긴급] 브로커 객체 생성에 실패했습니다. 키/계좌번호 설정을 확인하세요.\n{e}")
-        sys.exit(1)
+        # sys.exit 금지: GUI·adjust_capital 등은 except Exception 으로 처리하고 프로세스 유지.
+        raise RuntimeError(f"브로커 객체 생성 실패: {e}") from e
+
+
+def _create_brokers_safe() -> bool:
+    """GUI·adjust_capital 등에서 실패 시 프로세스 종료 없이 False."""
+    try:
+        _create_brokers()
+        return True
+    except RuntimeError as e:
+        print(f"⚠️ 브로커 생성 실패: {e}")
+        return False
 
 
 def issue_new_kis_token():
@@ -159,7 +169,8 @@ def refresh_brokers_if_needed(force=False):
         else:
             print(f"     [이전 토큰] {old_token}")
 
-        _create_brokers()
+        if not _create_brokers_safe():
+            return
 
         new_token = str(broker_kr.access_token) if broker_kr and hasattr(broker_kr, 'access_token') else "없음"
         if len(new_token) > 20:
@@ -171,7 +182,8 @@ def refresh_brokers_if_needed(force=False):
 
     # 브로커가 없으면 생성
     if broker_kr is None or broker_us is None:
-        _create_brokers()
+        if not _create_brokers_safe():
+            return
         print("  -> ✅ 브로커 초기화 완료")
         return
 
@@ -192,7 +204,7 @@ def refresh_brokers_if_needed(force=False):
             print("  -> ✅ 토큰 유효")
     else:
         print("  -> ⚠️ 토큰 파일 없음 - 브로커 재생성")
-        _create_brokers()
+        _create_brokers_safe()
 
 
 def get_us_cash_real(broker):

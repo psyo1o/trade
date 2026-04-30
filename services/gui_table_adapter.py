@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from api import coin_broker
+
 
 def build_rows_data(
     *,
@@ -80,7 +82,7 @@ def build_rows_data(
             continue
         if coin_config and coin_config.is_binance() and cur == "USDT":
             continue
-        if safe_num(coin.get("balance"), 0.0) > 0.00000001:
+        if coin_broker.should_include_coin_balance_row(coin):
             if coin_config and coin_config.is_binance():
                 code = f"USDT-{coin['currency']}"
             else:
