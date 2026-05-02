@@ -1,5 +1,5 @@
 ================================================================================
-  c-bot 프로젝트 구조 / 파일 설명 (2026-04-30)
+  c-bot 프로젝트 구조 / 파일 설명 (2026-05-01)
   — 처음 보는 분도 따라갈 수 있게: 무엇이 어디에 있고, 무엇을 Git에 올리지 않는지까지 정리
 ================================================================================
 
@@ -25,6 +25,8 @@
 --------------------------------------------------------------------------------
 
   run_bot.py, run_gui.py, screener.py, us_screener.py, adjust_capital.py  … 루트 실행·도구
+  github_trade_remote.bat … GitHub `https://github.com/<USER>/trade.git` 를 origin 으로 등록
+  git_push.bat … git add -A → commit → push -u origin main (origin 없으면 안내)
   api/           … KIS·업비트·바이낸스(CCXT)·거시지표 래퍼, coin_config/coin_broker, KIS 파서(kis_parsers.py)
   strategy/      … 진입·청산 규칙(rules.py, indicators.py), 섹터·AI·거시
   execution/     … 장부·동기화·TWAP·분할익절·서킷브레이커
@@ -51,7 +53,8 @@ run_bot.py
   - refresh_circuit_aux_from_brokers(state, path) … 브로커만으로 동일 키 재기록(adjust_capital 등)
   - 관측성: [KR …], [US …], [COIN …] 태그. 매수 스캔은 rules.calculate_pro_signals 안에서 [V8],
     스윙 보조는 check_swing_entry 실패 시 [스윙] 한 줄(run_bot에서 출력).
-  - 타임스탑(보유 연속시간): V8 주식 10일(+4% 유예) / V8 코인 3일 / SWING 주식 14일(+2%) / SWING 코인 5일 — README 표·run_bot 상수와 동일.
+  - 바이낸스: ``binance_v8_interval_minutes``(15/30/60)로 V8 상위 USDT 스캔 주기(슬롯=자정부터 분÷간격).
+    SWING은 KST 9시대 09:15/09:30/09:45 첫 틱에서 일 1회(구 09:05~09:14는 매매 :00/:15 슬롯과 무교집합이었음).
 
 run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI 사용 안내」)
   - PyQt5. import run_bot 순간 config 로드 → config 수정 후에는 GUI 재시작.
@@ -62,10 +65,11 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
     (보유 초과·정수 주/코인 소수 검증) → run_bot.manual_sell.
   - 탭: 실시간 현황(보유표·수동매도), 매매 내역(trade_history), 장부(positions, 마지막 열은 tier),
     고점 보정(입출금, adjust_capital 동일·CapitalAdjustThread).
-  - 실시간 작동 로그(봇 브리핑)는 탭 아래 공통 영역(세로 QSplitter) — 탭 전환과 무관하게 항상 표시.
-  - 매매: 기동 약 1초 후 run_trading_bot 1회 → 이후 KST :00/:15/:30/:45 (중복 실행 가드).
+    봇 브리핑 로그는 탭 아래 공통 영역(QSplitter, run_gui.py setSizes).
+  - 매매: 기동 직후 즉시 1회 없음 → KST :00/:15/:30/:45 정렬 타이머만 (중복 실행 가드).
+  - 기동 직후 약 150ms에 refresh_balance(sync_first=False) 1회로 화면만 선채움.
   - 매매 직전 refresh_balance로 max_p 맞춤 후 WorkerThread에서 엔진.
-  - 텔레 heartbeat: 기동 1회 + KST :00/:30 (백그라운드).
+  - 텔레 heartbeat: 기동 직후 전송 없음 → 다음 KST :00/:30 정렬 후 반복 (백그라운드).
   - 스캐너: GUI 기동 시 start_scanner_scheduler 연동.
   - 네트워크 연속 실패 시 종료(BOT_DISABLE_NET_WATCH 로 감시 끔 가능).
   - 잔고 스레드: BalanceUpdaterThread + gui_table_adapter.build_rows_data.
@@ -137,7 +141,8 @@ execution/
   guard.py … load/save_state, cooldown, MDD, Phase5, can_open_new,
     compute_ticker_cooldown_hours / set_ticker_cooldown_after_sell (Layer2 ticker_cooldowns:
     전략·시장·사유 매트릭스(h), 분할 잔량 시 미부여)
-  sync_positions.py … 실계좌↔장부, qty 동기화(평일). 주말 국·미 시드 스킵 로그
+  sync_positions.py … 실계좌↔장부. KR/US 휴장(is_market_open False)이면 KIS 시드·유령·주식 자동복구 생략(코인은 계속).
+    자동복구 buy_date 는 trade_history 마지막 BUY 우선. held∪live_seeds 보수적 유령 판단 등
   order_twap.py … Phase2 TWAP
   scale_out.py … V8 분할 익절(Scale-Out); post_partial_ledger(..., set_scale_out_done=True 기본),
     수동 부분 매도는 False로 자동 분할익절 플래그와 분리
@@ -149,7 +154,8 @@ services/
   gui_table_adapter.py … 실시간 테이블 행 조립
 
 utils/
-  logger.py, telegram.py, helpers.py … COIN_MIN_POSITION_QTY,
+  logger.py … 일별 롤오버, 보관 파일명 bot.YYYY-MM-DD.log
+  telegram.py, helpers.py … COIN_MIN_POSITION_QTY, coin_min_notional_usd,
     kis_equities_weekend_suppress_window_kst() 등
 
 tests/

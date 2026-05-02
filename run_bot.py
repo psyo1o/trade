@@ -501,6 +501,9 @@ UPBIT_KRW_AVAILABLE_CAP_RATIO = 0.999  # 주문 직전: min(목표액, get_balan
 UPBIT_COIN_MIN_ORDER_KRW = 5000.0      # KRW 마켓 최소 주문 금액(업비트 기준)
 # 바이낸스: 24h 거래대금(USDT) 상위 N (기본 30)
 BINANCE_UNIVERSE_TOP = int(config.get("binance_universe_top", 30))
+# 바이낸스 V8 유니버스 스캔 주기(분). 매매가 :00/:15/:30/:45에만 돌아 **60의 약수**만 허용.
+_raw_bn_iv = int(config.get("binance_v8_interval_minutes", 15))
+BINANCE_V8_INTERVAL_MINUTES = 15 if _raw_bn_iv not in (15, 30, 60) else _raw_bn_iv
 
 
 def _coin_min_order_krw() -> float:
@@ -2943,13 +2946,18 @@ def _is_coin_buy_window_now(now_coin: datetime) -> tuple[bool, datetime, datetim
 
 
 def _binance_v8_slot_key(now_kst) -> str:
-    """KST 벽시계 **15분 슬롯** (:00, :15, :30, :45) 식별자."""
-    slot_min = (int(now_kst.minute) // 15) * 15
-    return now_kst.replace(minute=slot_min, second=0, microsecond=0).strftime("%Y-%m-%d-%H-%M")
+    """KST 당일 자정부터 경과 **분**을 ``BINANCE_V8_INTERVAL_MINUTES`` 로 나눈 슬롯 ID.
+
+    15/30/60 모두 :00/:15/:30/:45 틱과 일치하도록 **60의 약수**만 지원한다.
+    """
+    iv = BINANCE_V8_INTERVAL_MINUTES
+    total_min = int(now_kst.hour) * 60 + int(now_kst.minute)
+    slot_id = total_min // iv
+    return f"{now_kst.strftime('%Y-%m-%d')}-m{slot_id}"
 
 
 def _binance_should_run_v8_scan(state: dict, now_kst) -> bool:
-    """바이낸스 V8: KST 기준 **15분마다 1회** (해당 :00/:15/:30/:45 슬롯에서 아직 스캔 안 됐을 때)."""
+    """바이낸스 V8: ``BINANCE_V8_INTERVAL_MINUTES`` 마다 1회(해당 슬롯에서 아직 스캔 안 됐을 때)."""
     cur = _binance_v8_slot_key(now_kst)
     return state.get("last_binance_v8_scan_slot_key") != cur
 
@@ -2960,11 +2968,20 @@ def _binance_mark_v8_scan_done(state: dict, now_kst) -> None:
 
 
 def _binance_should_run_swing_scan(state: dict, now_kst) -> bool:
-    """바이낸스 SWING: UTC 일봉 직후 KST 09:05~09:15, **일 1회**."""
-    if now_kst.hour != 9 or not (5 <= now_kst.minute < 15):
-        return False
+    """바이낸스 SWING: KST 09:00(UTC 일봉) 이후 **09:15·09:30·09:45** 분기 틱 중 첫 번째에서 **일 1회**.
+
+    과거 09:05~09:14 조건은 GUI/헤드리스 매매가 **:00/:15/:30/:45**에만 실행되어
+    **시간대가 겹치지 않아** 스윙이 사실상 동작하지 않았음.
+    """
     d = now_kst.strftime("%Y-%m-%d")
-    return state.get("last_binance_swing_run_date") != d
+    if state.get("last_binance_swing_run_date") == d:
+        return False
+    if now_kst.hour != 9:
+        return False
+    # 분기 정렬(0,15,30,45)만 들어온다고 가정. 09:00은 일봉 직후라 제외하고 09:15부터.
+    if int(now_kst.minute) // 15 < 1:
+        return False
+    return True
 
 
 def _binance_mark_swing_scan_done(state: dict, now_kst) -> None:
@@ -4640,7 +4657,7 @@ def run_trading_bot():
         elif in_account_circuit_cooldown(state):
             print("  -> 🚨 코인 Phase5 계좌 서킷 쿨다운 — 신규 매수 중단.")
         else:
-            # 업비트: KST 일봉 창 직전 N분만 매수. 바이낸스: V8=15분마다 상위 USDT 유니버스 / SWING=09:05~09:15·일1회
+            # 업비트: KST 일봉 창 직전 N분만 매수. 바이낸스: V8=설정 분 간격 / SWING=09:15~09:45 첫 틱·일1회
             now_coin = datetime.now(pytz.timezone("Asia/Seoul"))
             use_bn_sched = bool(coin_config.is_binance())
             do_bn_v8 = False
@@ -4657,8 +4674,8 @@ def run_trading_bot():
                 skip_buy = not do_bn_v8 and not do_bn_sw
                 if skip_buy:
                     print(
-                        f"  ⏳ [BINANCE 매수 대기] V8·상위{BINANCE_UNIVERSE_TOP}·15분마다 / "
-                        f"SWING·09:05~09:15·일1회 — 이번 틱 미해당 "
+                        f"  ⏳ [BINANCE 매수 대기] V8·상위{BINANCE_UNIVERSE_TOP}·{BINANCE_V8_INTERVAL_MINUTES}분마다 / "
+                        f"SWING·09:15~09:45 첫틱·일1회 — 이번 틱 미해당 "
                         f"(지금 {now_coin.strftime('%H:%M')} KST)"
                     )
             else:

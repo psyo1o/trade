@@ -1,6 +1,6 @@
 # c-bot — 국·미·코인 자동매매 봇
 
-_문서 갱신: 2026-04-30 — 코인 **업비트 / 바이낸스 현물(CCXT)** 선택 연동, 장부 티커 키(`KRW-`·`USDT-`) 설명, **GUI에서 실시간 작동 로그(봇 브리핑)를 탭 아래 공통 영역에 고정**한 내용을 반영했습니다._
+_문서 갱신: 2026-05-01 — 아래 내용은 저장소 코드(`run_bot.py`, `run_gui.py`, `execution/guard.py`, `execution/sync_positions.py` 등)와 맞춰 두었습니다._
 
 ---
 
@@ -84,10 +84,10 @@ py -3.11 adjust_capital.py
 
 `config.json` 은 **프로세스가 시작될 때 한 번** 읽습니다. 값을 바꾼 뒤에는 **GUI/봇을 완전히 종료했다가 다시 실행**해야 합니다.
 
-### 매매·알림 시계 (GUI = 헤드리스와 같은 매매 리듬)
+### 매매·알림 시계
 
-- **매매 엔진:** GUI 기동 직후 즉시 실행은 하지 않고, KST **`:00` / `:15` / `:30` / `:45`** 분기 스케줄에서만 사이클을 실행합니다.
-- **텔레그램 생존신고(heartbeat):** 기동 직후 1회, 이후 KST **`:00` / `:30`** (매매 주기와 별도). 보유 한 줄은 **매수가·현재가(수익률)·최고가·매도선·보유기간** 형식이며, 주말 미장은 `normalize_us_current_p_api_for_display` 로 장부 폴백 시에도 **yfinance 종가**를 쓰도록 GUI와 동일 전처리를 맞춥니다.
+- **매매 엔진:** **GUI**는 기동 직후 즉시 실행 없이, KST **`:00` / `:15` / `:30` / `:45`** 분기 스케줄에서만 `run_trading_bot()` 을 돌립니다. **`run_bot.py` 헤드리스**는 시작 시 **`run_trading_bot()` 1회**를 먼저 돌린 뒤, 같은 KST 분 슬롯에 이어서 스케줄합니다.
+- **텔레그램 생존신고(heartbeat):** **GUI**는 **기동 직후 발송 없음**. 다음 **KST `:00` / `:30`** 벽시계에 맞춰 첫 전송 후, 같은 간격으로 반복합니다(매매 15분 주기와 별도). **`run_bot.py` 단독(헤드리스)** 은 프로세스 시작 시 **`heartbeat_report()` 1회**를 보낸 뒤, **`schedule.every(4).hours`** 로 이어집니다(벽시계 `:00/:30` 정렬은 GUI 전용). 보유 한 줄은 **매수가·현재가(수익률)·최고가·매도선·보유기간** 형식이며, 주말 미장은 `normalize_us_current_p_api_for_display` 로 장부 폴백 시에도 **yfinance 종가**를 쓰도록 GUI와 동일 전처리를 맞춥니다.
 
 ---
 
@@ -101,16 +101,18 @@ py -3.11 adjust_capital.py
 |------|------|
 | **성적표 라벨** | `bot_state.stats` 의 **승/패·누적 수익률 합**(전량 청산 기준)·마지막 보유 ROI. 수동 부분 매도 분(`manual_partial_total_profit_pct`)은 **JSON에는 누적**되지만 성적표 한 줄에는 아직 표시하지 않습니다. 약 **3초마다** 갱신합니다. |
 | **🇰🇷 🇺🇸 🪙 세 칸** | 시장별 **예수금·총평가·보유 수익률**. 숫자는 백그라운드 스레드(`BalanceUpdaterThread`)가 브로커·스냅샷 규칙에 맞춰 채웁니다. |
-| **🔄 예수금 새로고침** | 일반 갱신: 장중/쿨다운 등 **정책을 지키며** KIS·업비트 조회. 조건이 안 맞으면 저장된 **`last_kis_display_snapshot`** 등으로 맞춥니다. |
+| **🔄 예수금 새로고침** | 일반 갱신: 장중/쿨다운 등 **정책을 지키며** KIS·**설정된 코인 거래소**(업비트/바이낸스) 조회. 조건이 안 맞으면 저장된 **`last_kis_display_snapshot`** 등으로 맞춥니다. |
 | **🏦 KIS 강제 새로고침** | 장외·쿨다운 중에도 **KIS를 한 번 강제로** 호출해 국·미 숫자를 바로 확인할 때 사용합니다. (남용하면 증권사 쪽 부담·제한에 걸릴 수 있어, 자동 갱신에는 **최소 간격(약 25초)** 이 있습니다.) |
 | **최대 종목 수 스핀박스** | 국장 / 미장 / 코인 각각 **동시에 들고 갈 수 있는 종목 수 상한**입니다. |
 | **💾 설정 실시간 적용** | `run_bot` 모듈의 `MAX_POSITIONS_*` 값을 즉시 바꾸고, 같은 내용을 **`bot_state.json` 의 `settings`** (`max_pos_kr` / `max_pos_us` / `max_pos_coin`)에 저장합니다. **다음 매수 사이클부터** 반영됩니다. |
 
-### 탭 구성 (위에서 아래 순)
+### 탭·로그 레이아웃
 
-탭 위젯 **아래**에는 **세로 `QSplitter`** 로 나눈 **실시간 작동 로그 (봇 브리핑)** 영역이 있습니다. **탭을 바꿔도** 이 검은 콘솔은 같은 자리에 남고, 위·아래 경계를 드래그해 표와 로그 높이 비율을 조절할 수 있습니다. `print` / 리다이렉트 로그가 여기에 붙고, 같은 내용이 **`logs/bot.log`** 등 파일 로거로도 이어질 수 있습니다(`RedirectText`). 최소 높이는 약 200px 수준에서 시작하며, 초기 분할은 코드의 `setSizes([…])` 로 조정할 수 있습니다.
+- **위쪽:** `QTabWidget` — **실시간 현황**(보유표·수동 매도), **매매 내역**, **장부**, **고점 보정** 등 탭만 전환됩니다.  
+- **아래쪽:** **실시간 작동 로그(봇 브리핑)** 는 탭 **밖**에 두어, 탭을 바꿔도 **항상 같은 자리**에 보입니다. 세로 **`QSplitter`** 로 위·아래 높이를 드래그해 조절합니다(초기 비율은 `run_gui.py` 의 `setSizes` 참고).  
+- 기동 시 **매매 루프는 돌리지 않되**, 약 **0.15초 후** `refresh_balance(sync_first=False)` 를 한 번 호출해 표·라벨을 가능한 빨리 채웁니다(스냅샷 폴백 포함).
 
-1. **실시간 현황**  
+1. **실시간 현황** 탭  
    - 보유 종목 **테이블**: 시장, 종목명(코드), 수량, 매수단가, 현재가, 수익률, **매도수량 입력 + 매도** (기본값은 해당 행 보유 전량; 칸을 비우면 전량 매도).  
    - 확인 창 후 `run_bot.manual_sell` 로 주문합니다. 국·미장은 정수 주, 코인은 소수 수량 입력 가능합니다.  
    - 잔고 갱신 시 `build_account_snapshot_for_report`·`gui_table_adapter` 경로로 행이 만들어집니다.
@@ -132,7 +134,7 @@ py -3.11 adjust_capital.py
 |------|------|
 | **매매 엔진** | 기동 직후 즉시 실행 없이, **KST `:00` / `:15` / `:30` / `:45`** 마다 `run_trading_bot()` 실행. 이미 한 사이클이 돌고 있으면 중복 호출은 건너뜁니다. |
 | **매매 직전** | `do_trade()` 안에서 잔고 갱신(`refresh_balance`)으로 **최신 `max_p` 등**을 맞춘 뒤 `WorkerThread`에서 실제 `run_trading_bot()` 을 돌립니다. |
-| **텔레그램 heartbeat** | 기동 직후 1회, 이후 **KST `:00` / `:30`** — UI 스레드를 막지 않도록 **별도 스레드**에서 `heartbeat_report()` 호출. |
+| **텔레그램 heartbeat** | **기동 직후 전송 없음.** 다음 **KST `:00` / `:30`** 에 맞춰 전송·재스케줄 — UI 스레드를 막지 않도록 **별도 스레드**에서 `heartbeat_report()` 호출. |
 | **스캐너 스케줄** | GUI가 `run_bot` 을 불러올 때 `start_scanner_scheduler()` 가 한 번 붙습니다(국·미 스캔 시각은 README 앞부분·`PROJECT_STRUCTURE.txt` 참고). |
 | **네트워크 감시** | 일정 간격으로 외부망 연결을 검사하고, **연속 실패** 시 프로세스를 종료합니다. `run_bot.bat` 로 감싸 두었다면 **자동 재기동**에 맡기는 설계입니다. (끄려면 환경 변수 `BOT_DISABLE_NET_WATCH` 참고 — 코드 주석 확인.) |
 
@@ -192,9 +194,10 @@ flowchart TD
 
 - **국장(KR) / 미장(US) / 코인(COIN)** 통합 엔진.
 - 읽고 쓰는 대표 파일: `config.json`, `bot_state.json`, `trade_history.json`.
-- **Phase 5** 합산 서킷용으로 브로커에서 가져온 국·미·코인 평가액을 **`circuit_aux_last_*`** 에 넣고, **`peak_total_equity` / `last_reset_week`** 로 **월요일(서울) 주차별 트레일링 MDD** 를 관리합니다.
+- **Phase 5** 합산 서킷용으로 브로커에서 가져온 국·미·코인 평가액을 **`circuit_aux_last_*`** 에 넣고, **`peak_total_equity` / `last_reset_week`** 로 **월요일(서울) 주차별 트레일링 MDD** 를 관리합니다. 고점은 **`peak_total_equity` 단일 키**가 소스이며, 옛 **`peak_equity_total_krw`** 가 남아 있으면 `execution/guard.py` 의 `load_state()` 에서 **한 번 이관 후 삭제**합니다.
 - US 스냅샷(`services/account_snapshot.py`)은 미장 예수금/총평가가 간헐적으로 튈 때 직전 `last_kis_display_snapshot.us`로 폴백해 텔레그램/GUI 표시를 안정화합니다.
-- KR/US 잔고 정책: **장중에만 KIS 실조회**, **장외(휴장/점검)에는 `last_kis_display_snapshot` 고정값 사용**. 코인은 기존대로 실조회합니다.
+- KR/US 잔고 정책: **장중에만 KIS 실조회**, **장외(휴장/점검)에는 `last_kis_display_snapshot` 고정값 사용**. 코인은 기존대로 실조회합니다.  
+- **`sync_all_positions`:** `run_bot.is_market_open("KR")` / `"US"` 가 **False** 인 시장은 **KIS 시드·평단 보정·유령 삭제·주식 자동복구**를 하지 않아 **휴장일에 장부가 KIS만 보고 흔들리지 않게** 했습니다(코인 동기화는 계속). 주식 **자동복구**로 새 행을 넣을 때 **`buy_date`** 는 가능하면 **`trade_history.json`** 에서 해당 티커·시장의 **가장 최근 `BUY`의 `timestamp`** 를 씁니다(없을 때만 복구 시각).
 - **매도 후 Layer2:** 전량 청산 시 `set_ticker_cooldown_after_sell`(전략·시장·사유 매트릭스). 수동 매도는 `_apply_manual_sell_state_update`·`_run_manual_sell_position_sync` 경로.
 - **관측성:** 예산·예수·TWAP·시장별 스킵은 `[KR …]`, `[US …]`, `[COIN …]` 등 태그 로그로 남깁니다. 모듈 상단 docstring에 grep용 태그 요약이 있습니다.
 
@@ -204,7 +207,6 @@ flowchart TD
 - 잔고 표시는 **`services/account_snapshot.py`** 와 동일 규칙으로 맞춥니다.
 - **KIS 주말 점검** 구간에는 국·미 API를 덜 부르고, 저장된 **`last_kis_display_snapshot`** 과 장부 **`positions[*].qty`** 로 화면을 채웁니다.
 - **수동 매도 UI:** 보유 행마다 **수량 `QLineEdit`(기본=해당 행 보유 전량) + 매도 버튼**. 빈 칸은 전량, 국·미는 정수 주, 코인은 소수 입력. `_on_manual_sell_click` 에서 보유 초과·형식 검증.
-- **실시간 로그:** 탭 **밖** 하단에 두어 어떤 탭을 보든 **봇 브리핑 콘솔**이 유지됩니다(세로 `QSplitter`).
 - **버튼·탭·타이머** 등 화면 구성은 위 **[GUI 사용 안내](#gui-사용-안내)** 절을 보세요.
 
 ### `screener.py` / `us_screener.py`
@@ -229,7 +231,7 @@ flowchart TD
 | `positions[티커]` | 매수가·손절·수량 `qty`·ATR·분할익절 여부 `scale_out_done`·**`strategy_type`**·**`entry_fib_level`** 등 |
 | `stats` | `wins` / `losses` / `total_profit` 은 **전량 청산**(자동·수동) 시만 반영. 수동 **부분** 매도 실현분은 **`manual_partial_total_profit_pct`** 에만 가중 누적 |
 | `cooldown` / `ticker_cooldowns` | 단기 쿨다운, 매도 후 **재진입 금지** 시각 |
-| `peak_total_equity`, `last_reset_week` | Phase5 **월요일 앵커** 이후 이번 주 합산 고점·주차 라벨 |
+| `peak_total_equity`, `last_reset_week` | Phase5 **월요일 앵커** 이후 이번 주 합산 고점·주차 라벨(고점은 **`peak_total_equity`만** 표준; 레거시 키는 로드 시 정리) |
 | `circuit_aux_last_*` | 국·미·코인 합산용 최근 스냅샷 |
 | `last_kis_display_snapshot` | 평일 마지막 성공한 KIS 라벨(주말 GUI/텔레용) |
 
@@ -273,10 +275,12 @@ flowchart TD
 
 | 전략·시장 | 보유 기준 | 수익률 검사 | 유예(타임스탑 무효) |
 |-----------|------------|-------------|---------------------|
-| V8 주식 (KR·US) | **10일**(240h, 달력·연속) ≈ **7영업일** + 주말 1~2회 | **+4% 미만**이면 전량 | **≥ +4%** |
-| V8 코인 | **3일**(72h) | 동일 | **≥ +4%** (24시장) |
-| SWING 주식 (KR·US) | **14일**(336h, 달력·연속) ≈ **10영업일** + 주말 2회 | **+2% 미만**이면 전량 | **≥ +2%** |
-| SWING 코인 | **5일**(120h) | 동일 | **≥ +2%** (24시장) |
+| V8 주식 (KR·US) | **10일**(240h) | **+4% 미만**이면 전량 | **≥ +4%** |
+| V8 코인 | **3일**(72h) | 동일 | **≥ +4%** |
+| SWING 주식 (KR·US) | **14일**(336h) | **+2% 미만**이면 전량 | **≥ +2%** |
+| SWING 코인 | **5일**(120h) | 동일 | **≥ +2%** |
+
+주식은 **영업일이 아니라 `buy_date`/`buy_time` 기준 경과 시간(연속 시각)** 으로만 판단합니다. “약 N영업일”은 **의도 설명**이며, 실제 상수는 `run_bot.py` 의 `V8_TIME_STOP_HOURS_*` / `SWING_TIME_STOP_HOURS_*` 와 동일합니다.
 
 매도 **`reason`**·로그에는 **`[V8_TIME_STOP_KR]`**, **`[V8_TIME_STOP_US]`**, **`[V8_TIME_STOP_COIN]`**, **`[SWING_TIME_STOP_KR]`** 등 태그가 붙습니다.
 
@@ -287,7 +291,7 @@ flowchart TD
 | 전략 | 구분 | KR·US | COIN |
 |------|------|-------|------|
 | **TREND_V8** | 정상 익절 등 | 72h (3일) | 24h (1일) |
-| **TREND_V8** | 손절·타임스탑 | 240h (10일) | 72h (3일) |
+| **TREND_V8** | 손절·타임스탑 | **240h (10일)** — 주식 타임스탑과 동일 스케일 | 72h (3일) |
 | **SWING_FIB** | 정상 익절 등 | 480h (20일) | 168h (7일) |
 | **SWING_FIB** | 손절·타임스탑·지하실/좀비화 등 | 720h (30일) | 240h (10일) |
 
@@ -343,6 +347,7 @@ flowchart TD
 
 ## 10) 관측성: 로그를 읽는 법
 
+- **파일 로그:** `utils/logger.py` 의 일별 롤오버로 **`logs/bot.log`** 가 쌓이고, 자정 넘기면 이전 날짜 파일이 **`logs/bot.YYYY-MM-DD.log`** 형식으로 보관됩니다.
 - **시장별:** `[KR …]`, `[US …]`, `[COIN …]` — 예산·예수·정수주 0·TWAP 미체결·BEAR+ADX 스킵 등.
 - **V8 스캔:** `🔍 [V8] [n/N] 종목 … ❌ 패스:` 또는 통과 시 `🔥 [V8] …`.
 - **스윙 보조:** V8 실패 뒤 `🔍 [스윙] … ❌ 패스: 사유` 또는 `✅ [SWING-BUY] …`.
@@ -358,6 +363,7 @@ flowchart TD
 - `kis_key`, `kis_secret`, `kis_account`, `kis_hts_id`
 - `upbit_access`, `upbit_secret`
 - `telegram_token`, `telegram_chat_id`
+- (선택) `telegram_connect_timeout_sec`(기본 30), `telegram_read_timeout_sec`(기본 60), `telegram_max_retries`(기본 5) — `utils/telegram.py` 에서 연결 타임아웃·재시도 조절
 
 <a id="coin-exchange-config"></a>
 
@@ -374,9 +380,10 @@ flowchart TD
 | `krw_per_usdt` | (선택) 1 USDT당 원화. 없으면 `USDKRW=X` 등으로 추정 — 금액이 크면 **직접 입력 권장**. |
 | `binance_min_cost_usdt` | (선택) 최소 주문 명목(USDT), 기본 10 근처 — CCXT 마켓 정보와 함께 최소금액 검사에 사용. |
 | `binance_universe_top` | (선택) 24h USDT 거래대금 상위 N개만 스캔, 기본 **30**. |
+| `binance_v8_interval_minutes` | (선택) 바이낸스 V8 유니버스 스캔 주기(분). **`15`**(기본), **`30`**, **`60`** 만 허용. 15분은 호출이 잦아 API·CPU 부담이 크므로 **30~60**을 운영에 맞게 검토. |
 | `coin_min_notional_usd` | (선택) 코인 **잔고·GUI** 에서 제외할 최소 **명목(USD)**. 기본 **1** (바이낸스: USDT, 업비트: 달러 환산 KRW). 가격 조회 실패 시 옛 **수량** 먼지 기준으로 폴백. |
 
-구현: `api/coin_config.py`, `api/coin_broker.py`(공통 진입), `api/binance_api.py`(CCXT). 의존성: **`ccxt`** (`requirements.txt`). 바이낸스 **시장가** 체결 시 터미널·로그에 `[BINANCE MARKET BUY]` / `[BINANCE MARKET SELL]` … `USDT` 형식이 붙습니다. V8은 **KST 기준 15분마다 1회**·상위 N USDT 유니버스, SWING은 **09:05~09:15 KST·일 1회**. **수수료를 BNB로 할인**하려면 바이낸스 웹에서 켜 두면 됩니다(API와 별개).
+구현: `api/coin_config.py`, `api/coin_broker.py`(공통 진입), `api/binance_api.py`(CCXT). 의존성: **`ccxt`** (`requirements.txt`). 바이낸스 **시장가** 체결 시 터미널·로그에 `[BINANCE MARKET BUY]` / `[BINANCE MARKET SELL]` … `USDT` 형식이 붙습니다. V8은 **`binance_v8_interval_minutes`(기본 15분)** 마다 상위 N USDT 유니버스를 스캔합니다. SWING은 **KST 9시대·분기 매매틱(09:15 / 09:30 / 09:45) 중 첫 틱에서 하루 1회** `check_swing_entry` 만 돌립니다(일봉 직후 09:00 틱은 제외). **수수료를 BNB로 할인**하려면 바이낸스 웹에서 켜 두면 됩니다(API와 별개).
 
 ### 안전
 
@@ -414,7 +421,7 @@ flowchart TD
 
 ### 코인 먼지 잔고
 
-`utils/helpers.py` 의 `COIN_MIN_POSITION_QTY` 이하는 실질 보유로 보지 않습니다.
+기본은 **`config.json`의 `coin_min_notional_usd`**(없으면 **1 USDT** 명목 미만)을 잔고·GUI에서 제외합니다. 현재가 조회가 실패할 때만 **`COIN_MIN_POSITION_QTY`**(`utils/helpers.py`) 수량 폴백을 씁니다.
 
 ### 분할 익절(Scale-Out)을 바꿀 때
 
@@ -463,6 +470,7 @@ flowchart TD
   "binance_secret": "",
   "krw_per_usdt": 1380,
   "binance_min_cost_usdt": 10,
+  "binance_v8_interval_minutes": 30,
 
   "telegram_token": "123456789:AA...",
   "telegram_chat_id": "123456789",
@@ -504,6 +512,23 @@ flowchart TD
 - **`account_circuit_*`:** 합산 계좌 서킷 on/off, MDD 임계(%), 쿨다운 시간(시간).
 - **`ai_false_breakout_*`:** 매수 직전 AI 휩쏘 게이트. LLM에는 `strategy/ai_filter.py` 의 **0~100 절대 루브릭**이 프롬프트에 포함되며, 점수가 임계 이상이면 차단(위 표·Phase 3 절 참고). **API 키**는 환경 변수 `GOOGLE_API_KEY` / `OPENAI_API_KEY`, 또는 `config.json` 동명 키, 또는 **프로젝트 루트 `ai_keys.txt`**(`KEY=value`, `ai_keys.txt.example` 참고) 순으로 조회된다. 선택 키: `ai_false_breakout_openai_fallback`(Gemini 실패 시 OpenAI 재시도, 기본 켜짐), `ai_false_breakout_openai_model`(OpenAI 호출 시 모델, 기본 `gpt-4o-mini`).
 - **`macro_*`:** VIX/FGI 기반 예산 조절·차단.
+
+---
+
+## GitHub `trade` 저장소에 푸시하기
+
+1. GitHub에서 **비어 있는** 저장소 `trade`를 만듭니다(이름은 `trade` 권장). 웹에서 README를 같이 만들면 첫 `push` 때 충돌할 수 있어, **빈 저장소**로 두는 편이 안전합니다.  
+2. 로컬에서 **`github_trade_remote.bat`** 을 실행하고, 프롬프트에 **GitHub 사용자명 또는 조직**을 입력합니다. `origin`이 `https://github.com/아이디/trade.git` 으로 등록됩니다.  
+3. **`git_push.bat`** 을 실행합니다. 커밋 메시지(한국어 권장, [.cursor/rules/git-commit-korean.mdc](.cursor/rules/git-commit-korean.mdc))를 입력한 뒤 `git add` → `commit` → **`git push -u origin main`** 까지 진행합니다.
+
+수동으로 할 때는 예시대로 실행하면 됩니다.
+
+```bat
+github_trade_remote.bat
+git_push.bat
+```
+
+HTTPS 푸시 시 GitHub 비밀번호 대신 **Personal Access Token**을 쓰는 경우가 많습니다. `git credential` 또는 GitHub Desktop으로 한 번 로그인해 두면 이후 편합니다.
 
 ---
 

@@ -19,6 +19,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import os
+import re
 import sys, json
 import socket
 import threading
@@ -95,6 +96,31 @@ def _safe_num(value, default=0.0):
         return _to_float(value, default)
     except Exception:
         return float(default)
+
+
+def _gui_krw_to_usdt_label(krw_int: int) -> str:
+    """스냅샷 코인 라벨 값은 내부적으로 항상 원화 환산 정수 — GUI만 USDT로 표시."""
+    from api import coin_broker
+
+    r = float(coin_broker.get_krw_per_usdt() or 0.0)
+    if r <= 0:
+        r = 1.0
+    u = float(krw_int) / r
+    return f"{u:,.2f} USDT"
+
+
+def _gui_coin_unit_price_str(usdt: float) -> str:
+    """보유/장부 테이블: 코인 매수가·현재가 한 줄 (바이낸스 = USDT 단위 그대로 표시)."""
+    x = float(usdt)
+    if x >= 1000:
+        return f"{x:,.2f} USDT"
+    if x >= 1:
+        return f"{x:,.4f} USDT"
+    if x <= 0:
+        return "0 USDT"
+    s = f"{x:.8f}".rstrip("0").rstrip(".")
+    return f"{s} USDT" if s else "0 USDT"
+
 
 def get_current_stats(state_file: Path, roi_info=None):
     """STATE_PATH(bot_state.json)에서 성적표 + (옵션) 수익률(%)을 읽어옵니다."""
@@ -532,7 +558,15 @@ class BotDashboard(QMainWindow):
         self.lbl_us_total.setText("🇺🇸 총평가: 조회중...")
         self.lbl_us_roi.setText("🇺🇸 보유수익률: 조회중...")
 
-        self.lbl_coin_cash.setText("🪙 예수금(KRW): 조회중...")
+        try:
+            from api import coin_config as _cc_init
+
+            _coin_quote = "USDT" if _cc_init.is_binance() else "KRW"
+        except Exception:
+            _coin_quote = "KRW"
+        self.lbl_coin_cash.setText(
+            f"🪙 예수금({_coin_quote}): 조회중..." if _coin_quote == "USDT" else "🪙 예수금(KRW): 조회중..."
+        )
         self.lbl_coin_total.setText("🪙 총평가: 조회중...")
         self.lbl_coin_roi.setText("🪙 보유수익률: 조회중...")
 
@@ -954,9 +988,20 @@ class BotDashboard(QMainWindow):
                 sl_p_str = f"${sl_p:.2f}"
                 max_p_str = f"${max_p:.2f}"
             elif market == "🪙 코인":
-                buy_p_str = f"{buy_p:,.4f}원" if buy_p < 100 else f"{int(buy_p):,}원"
-                sl_p_str = f"{sl_p:,.4f}원" if sl_p < 100 else f"{int(sl_p):,}원"
-                max_p_str = f"{max_p:,.4f}원" if max_p < 100 else f"{int(max_p):,}원"
+                try:
+                    from api import coin_config as _cc_led
+
+                    _led_usdt = _cc_led.is_binance()
+                except Exception:
+                    _led_usdt = False
+                if _led_usdt:
+                    buy_p_str = _gui_coin_unit_price_str(buy_p)
+                    sl_p_str = _gui_coin_unit_price_str(sl_p)
+                    max_p_str = _gui_coin_unit_price_str(max_p)
+                else:
+                    buy_p_str = f"{buy_p:,.4f}원" if buy_p < 100 else f"{int(buy_p):,}원"
+                    sl_p_str = f"{sl_p:,.4f}원" if sl_p < 100 else f"{int(sl_p):,}원"
+                    max_p_str = f"{max_p:,.4f}원" if max_p < 100 else f"{int(max_p):,}원"
             else: # 국장
                 buy_p_str = f"{int(buy_p):,}원"
                 sl_p_str = f"{int(sl_p):,}원"
@@ -991,9 +1036,15 @@ class BotDashboard(QMainWindow):
             self.ledger_table.setItem(row, 8, QTableWidgetItem(tier or ""))
 
     def append_log(self, text):
-        if text.strip():
+        raw = text.strip()
+        if not raw:
+            return
+        # run_bot 등이 이미 ``[HH:MM:SS]`` 를 붙인 줄이면 중복 접두어를 붙이지 않는다.
+        if re.match(r"^\[\d{2}:\d{2}:\d{2}\]", raw):
+            self.log_console.append(raw)
+        else:
             time_str = datetime.now().strftime("%H:%M:%S")
-            self.log_console.append(f"[{time_str}] {text.strip()}")
+            self.log_console.append(f"[{time_str}] {raw}")
             self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
 
     def update_stats_ui(self):
@@ -1070,8 +1121,18 @@ class BotDashboard(QMainWindow):
         self.lbl_us_total.setText(f"🇺🇸 총평가: ${data['us']['total']:,.2f}")
         self.lbl_us_roi.setText(f"🇺🇸 보유수익률: {format_roi(data['us']['roi'])}")
 
-        self.lbl_coin_cash.setText(f"🪙 예수금(KRW): {data['coin']['cash']:,}원")
-        self.lbl_coin_total.setText(f"🪙 총평가: {data['coin']['total']:,}원")
+        try:
+            from api import coin_config as _cc_lbl
+
+            _bn = _cc_lbl.is_binance()
+        except Exception:
+            _bn = False
+        if _bn:
+            self.lbl_coin_cash.setText(f"🪙 예수금(USDT): {_gui_krw_to_usdt_label(int(data['coin']['cash']))}")
+            self.lbl_coin_total.setText(f"🪙 총평가: {_gui_krw_to_usdt_label(int(data['coin']['total']))}")
+        else:
+            self.lbl_coin_cash.setText(f"🪙 예수금(KRW): {data['coin']['cash']:,}원")
+            self.lbl_coin_total.setText(f"🪙 총평가: {data['coin']['total']:,}원")
         self.lbl_coin_roi.setText(f"🪙 보유수익률: {format_roi(data['coin']['roi'])}")
 
         self._last_holdings_roi = {k: v["roi"] for k, v in data.items() if v["roi"] is not None}
@@ -1087,15 +1148,36 @@ class BotDashboard(QMainWindow):
             name_text, code_text = str(d['name']).strip(), str(d['t_code']).strip()
             display_name = f"{name_text}({code_text})" if name_text and code_text and name_text != code_text else (code_text or name_text)
             
+            try:
+                from api import coin_config as _cc_tbl
+
+                _coin_usdt = _cc_tbl.is_binance()
+            except Exception:
+                _coin_usdt = False
+
             # 매수단가 포맷팅
-            if d['market'] == "🇰🇷 국장": price_str = f"{int(d['buy_p_float']):,}원"
-            elif d['market'] == "🇺🇸 미장": price_str = f"${d['buy_p_float']:,.2f}"
-            else: price_str = f"{d['buy_p_float']:,.4f}원" if d['buy_p_float'] < 100 else f"{int(d['buy_p_float']):,}원"
+            if d['market'] == "🇰🇷 국장":
+                price_str = f"{int(d['buy_p_float']):,}원"
+            elif d['market'] == "🇺🇸 미장":
+                price_str = f"${d['buy_p_float']:,.2f}"
+            elif d['market'] == "🪙 코인" and _coin_usdt:
+                price_str = _gui_coin_unit_price_str(d['buy_p_float'])
+            else:
+                price_str = f"{d['buy_p_float']:,.4f}원" if d['buy_p_float'] < 100 else f"{int(d['buy_p_float']):,}원"
 
             # 현재가 포맷팅
-            if d['market'] == "🇰🇷 국장": curr_str = f"{int(d['current_price']):,}원"
-            elif d['market'] == "🇺🇸 미장": curr_str = f"${d['current_price']:.2f}"
-            else: curr_str = f"{d['current_price']:,.4f}원" if d['current_price'] < 100 else f"{int(d['current_price']):,}원"
+            if d['market'] == "🇰🇷 국장":
+                curr_str = f"{int(d['current_price']):,}원"
+            elif d['market'] == "🇺🇸 미장":
+                curr_str = f"${d['current_price']:.2f}"
+            elif d['market'] == "🪙 코인" and _coin_usdt:
+                curr_str = _gui_coin_unit_price_str(d['current_price'])
+            else:
+                curr_str = (
+                    f"{d['current_price']:,.4f}원"
+                    if d['current_price'] < 100
+                    else f"{int(d['current_price']):,}원"
+                )
 
             self.table.setItem(row, 0, QTableWidgetItem(d['market']))
             self.table.setItem(row, 1, QTableWidgetItem(display_name))
