@@ -7,6 +7,7 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
     * **실시간 작동 로그(봇 브리핑)** 는 탭 위젯 **아래**에 두어, 탭을 바꿔도 같은 자리에 보이게 한다(세로 ``QSplitter``).
     * ``import run_bot`` 시점에 ``config.json`` 이 로드되므로 **설정 변경 후 GUI 재시작** 필요.
     * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_total_equity``·``capital_adjustments`` 반영 (백그라운드 스레드).
+    * 바이낸스 코인 상단 **예수금·총평가** 숫자는 ``binance_display_cash_and_total_usdt()`` 등. 보유/장부 단가는 USDT. 스냅샷·서킷은 엔진과 동일 원화 환산.
     * 매매는 시작 즉시 실행하지 않고, **KST :00 / :15 / :30 / :45** 정렬 스케줄에만 맞춰 `run_trading_bot`을 실행한다.
     * ``QTimer.singleShot`` 겹침으로 로그가 두 줄씩 나오는 것을 막기 위해 **단일 ``QTimer`` + 실행 중 가드**를 쓴다.
     * 네트워크 감시·생존신고(heartbeat)는 **백그라운드 스레드**에서 돌리고, 텔레는 **기동 직후 즉시 발송 없이** **KST :00 / :30** 벽시계에 맞춘다.
@@ -17,6 +18,11 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+import logging
+
+for _yn in ("yfinance", "urllib3"):
+    logging.getLogger(_yn).setLevel(logging.ERROR)
 
 import os
 import re
@@ -71,9 +77,22 @@ from execution.guard import load_state
 
 TRADE_HISTORY_PATH = Path(__file__).resolve().parent / "trade_history.json"
 
-# Internet watch: GUI exits after consecutive failures so run_bot.bat can relaunch.
-_NET_CHECK_INTERVAL_MS = 12_000
-_NET_FAILS_BEFORE_EXIT = 3
+# Internet watch: TCP로 외부망을 짧게 확인. 연속 실패 시에만 quit → run_bot.bat가 GUI 재실행.
+# (구버전: 12초×3회 ≈ 40초 끊김에도 종료) — 환경 변수로 조절 가능.
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+_DEFAULT_NET_INTERVAL_MS = 15_000
+_DEFAULT_NET_FAILS = 20
+_NET_CHECK_INTERVAL_MS = max(5_000, _env_int("BOT_NET_WATCH_INTERVAL_MS", _DEFAULT_NET_INTERVAL_MS))
+_NET_FAILS_BEFORE_EXIT = max(3, _env_int("BOT_NET_WATCH_FAILS_BEFORE_EXIT", _DEFAULT_NET_FAILS))
 _KIS_REFRESH_MIN_INTERVAL_SEC = 25.0
 _last_kis_kr_fetch_ts = 0.0
 _last_kis_us_fetch_ts = 0.0
@@ -98,11 +117,16 @@ def _safe_num(value, default=0.0):
         return float(default)
 
 
-def _gui_krw_to_usdt_label(krw_int: int) -> str:
-    """스냅샷 코인 라벨 값은 내부적으로 항상 원화 환산 정수 — GUI만 USDT로 표시."""
+def _gui_krw_to_usdt_label(krw_int: int, krw_per_usdt: float | None = None) -> str:
+    """스냅샷 코인 라벨 값은 내부적으로 항상 원화 환산 정수 — GUI만 USDT로 표시.
+
+    ``krw_per_usdt`` 를 넘기면 예수·총평에 **동일 환율**을 쓴다(두 줄이 같은 스냅샷 기준).
+    """
     from api import coin_broker
 
-    r = float(coin_broker.get_krw_per_usdt() or 0.0)
+    r = float(krw_per_usdt) if krw_per_usdt is not None and float(krw_per_usdt) > 0 else float(
+        coin_broker.get_krw_per_usdt() or 0.0
+    )
     if r <= 0:
         r = 1.0
     u = float(krw_int) / r
@@ -158,24 +182,23 @@ def get_current_stats(state_file: Path, roi_info=None):
     return f"🏆 승률: 데이터 없음   |   💸 누적 수익률 합: 0.00%{roi_text}"
 
 class RedirectText(QObject):
+    """표준 출력 리다이렉트. 파일 로깅은 **메인 스레드** ``append_log`` 에서만 수행한다.
+
+    예전 구현은 ``write()`` 안에서 ``logger.info`` 를 호출해, Balancer/하트비트 등 **워커 스레드**가
+    ``logs/bot.log``(특히 네트워크 공유 경로)에 동기 쓰기로 묶이거나 락 경쟁으로 멈출 수 있었다.
+    시그널은 ``QueuedConnection`` 으로 UI 스레드에만 넘긴다.
+    """
     out_signal = pyqtSignal(str)
-    
-    def __init__(self):
-        super().__init__()
-        # ``setup_quant_logging()`` 은 ``utils.logger`` 에만 보관; ``run_bot.quant_logger`` 는 없음.
-        self.logger = get_quant_logger()
 
-    def write(self, text): 
-        # 1. GUI 화면(실시간 로그 탭)으로 텍스트 발사!
-        self.out_signal.emit(text)
-        
-        # 2. 파일 저장은 run_bot의 기관급 로거한테 토스! (매일 자정 롤오버 자동 처리)
-        if self.logger and text.strip():
-            for line in text.rstrip().splitlines():
-                if line.strip():
-                    self.logger.info(line.rstrip())
+    def write(self, text):
+        if not text:
+            return
+        try:
+            self.out_signal.emit(text)
+        except Exception:
+            pass
 
-    def flush(self): 
+    def flush(self):
         pass
 
 class WorkerThread(QThread):
@@ -212,6 +235,24 @@ class CapitalAdjustThread(QThread):
             self.done.emit(ok, msg)
         except Exception as e:
             self.done.emit(False, f"{type(e).__name__}: {e}")
+
+
+def _gui_saved_curr_p_from_state(state_path, ticker_code):
+    """
+    ``bot_state.json`` ``positions[ticker].curr_p`` — ``update_max_price_if_higher`` 가
+    **해당 시장 정규장**에 GUI로 확인한 마지막 현재가. 휴장·KIS 점검 창에는 라이브 조회 대신 표시용으로 쓴다.
+    """
+    try:
+        st = load_state(state_path)
+        pos = st.get("positions") or {}
+        t = str(ticker_code).strip().upper()
+        row = pos.get(t)
+        if not isinstance(row, dict):
+            return None
+        v = float(row.get("curr_p") or 0)
+        return v if v > 0 else None
+    except Exception:
+        return None
 
 
 # =====================================================================
@@ -339,6 +380,7 @@ class BalanceUpdaterThread(QThread):
                 kr_name_dict=kr_name_dict,
                 us_name_dict=us_name_dict,
                 get_kr_company_name=get_kr_company_name,
+                get_us_company_name=get_us_company_name,
                 safe_num=_safe_num,
                 process_row_data=self._process_row_data,
             )
@@ -360,15 +402,20 @@ class BalanceUpdaterThread(QThread):
         try:
             m = "KR" if market_code == "KR" else ("US" if market_code == "US" else "COIN")
             cp_api = current_p_api
+            suppress_kis = bool(kis_equities_weekend_suppress_window_kst())
+            saved_p = _gui_saved_curr_p_from_state(STATE_PATH, ticker_code) if m in ("KR", "US") else None
             if m in ("KR", "US"):
                 cp_api = run_bot.normalize_equity_current_p_api_for_display(
                     market=m,
                     buy_p=buy_p,
                     current_p_api=current_p_api,
                     is_market_open_now=bool(run_bot.is_market_open(m)),
-                    is_weekend=bool(kis_equities_weekend_suppress_window_kst()),
+                    is_weekend=suppress_kis,
                 )
-            current_price = run_bot.resolve_display_current_price(m, ticker_code, buy_p, cp_api)
+            if suppress_kis and m in ("KR", "US"):
+                current_price = saved_p if saved_p is not None else buy_p
+            else:
+                current_price = run_bot.resolve_display_current_price(m, ticker_code, buy_p, cp_api)
 
             if current_price > 0 and self.dashboard:
                 self.dashboard.update_max_price_if_higher(ticker_code, current_price)
@@ -402,7 +449,7 @@ class BotDashboard(QMainWindow):
         self._net_check_inflight = False
 
         self._stdout_redirect = RedirectText()
-        self._stdout_redirect.out_signal.connect(self.append_log)
+        self._stdout_redirect.out_signal.connect(self.append_log, Qt.QueuedConnection)
         sys.stdout = self._stdout_redirect
         sys.stderr = self._stdout_redirect
 
@@ -435,6 +482,12 @@ class BotDashboard(QMainWindow):
         self._net_watch_timer = QTimer(self)
         self._net_watch_timer.timeout.connect(self._check_network_and_maybe_restart)
         if os.environ.get("BOT_DISABLE_NET_WATCH", "").strip().lower() not in ("1", "true", "yes"):
+            _nw_sec = (_NET_CHECK_INTERVAL_MS / 1000.0) * _NET_FAILS_BEFORE_EXIT
+            print(
+                f"  📡 [네트워크 감시] {_NET_CHECK_INTERVAL_MS / 1000:.0f}초마다 확인, "
+                f"연속 {_NET_FAILS_BEFORE_EXIT}회 실패 시 종료(끊김 한도 약 {_nw_sec / 60:.1f}분). "
+                f"끄기: 환경변수 BOT_DISABLE_NET_WATCH=1 · 간격/횟수: BOT_NET_WATCH_INTERVAL_MS, BOT_NET_WATCH_FAILS_BEFORE_EXIT"
+            )
             self._net_watch_timer.start(_NET_CHECK_INTERVAL_MS)
         
         print("🤖 [시스템 가동] GUI 대시보드 초기화 중...")
@@ -475,9 +528,12 @@ class BotDashboard(QMainWindow):
                 self._net_fail_count = 0
                 return
             self._net_fail_count += 1
-            print(f"  ⚠️ [네트워크] 응답 없음 ({self._net_fail_count}/{_NET_FAILS_BEFORE_EXIT})")
+            print(
+                f"  ⚠️ [네트워크] 응답 없음 ({self._net_fail_count}/{_NET_FAILS_BEFORE_EXIT}, "
+                f"간격 {_NET_CHECK_INTERVAL_MS/1000:.0f}s)"
+            )
             if self._net_fail_count >= _NET_FAILS_BEFORE_EXIT:
-                print("  🔄 [네트워크] 연결 불안으로 GUI를 종료합니다. (run_bot.bat가 곧 다시 실행)")
+                print("  🔄 [네트워크] 연속 실패 한도 초과 — GUI를 종료합니다. (run_bot.bat가 다시 띄우면 재연결)")
                 QApplication.instance().quit()
         finally:
             self._net_check_inflight = False
@@ -558,15 +614,7 @@ class BotDashboard(QMainWindow):
         self.lbl_us_total.setText("🇺🇸 총평가: 조회중...")
         self.lbl_us_roi.setText("🇺🇸 보유수익률: 조회중...")
 
-        try:
-            from api import coin_config as _cc_init
-
-            _coin_quote = "USDT" if _cc_init.is_binance() else "KRW"
-        except Exception:
-            _coin_quote = "KRW"
-        self.lbl_coin_cash.setText(
-            f"🪙 예수금({_coin_quote}): 조회중..." if _coin_quote == "USDT" else "🪙 예수금(KRW): 조회중..."
-        )
+        self.lbl_coin_cash.setText("🪙 예수금: 조회중...")
         self.lbl_coin_total.setText("🪙 총평가: 조회중...")
         self.lbl_coin_roi.setText("🪙 보유수익률: 조회중...")
 
@@ -710,6 +758,8 @@ class BotDashboard(QMainWindow):
         log_header = QLabel("<b>📝 실시간 작동 로그 (봇 브리핑)</b>")
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
+        # 재연결·에러 폭주 시 메모리·페인트 폭주 완화 (구형 단말·공유기 재부팅 구간)
+        self.log_console.document().setMaximumBlockCount(5000)
         self.log_console.setStyleSheet(
             "background-color: #1e1e1e; color: #00ff00; font-family: Consolas, 'Malgun Gothic', monospace; font-size: 12px;"
         )
@@ -1036,7 +1086,18 @@ class BotDashboard(QMainWindow):
             self.ledger_table.setItem(row, 8, QTableWidgetItem(tier or ""))
 
     def append_log(self, text):
-        raw = text.strip()
+        blob = (text or "").replace("\r", "").rstrip()
+        if not blob:
+            return
+        lg = get_quant_logger()
+        if lg:
+            try:
+                for line in blob.splitlines():
+                    if line.strip():
+                        lg.info(line.rstrip())
+            except Exception:
+                pass
+        raw = blob.strip()
         if not raw:
             return
         # run_bot 등이 이미 ``[HH:MM:SS]`` 를 붙인 줄이면 중복 접두어를 붙이지 않는다.
@@ -1045,7 +1106,7 @@ class BotDashboard(QMainWindow):
         else:
             time_str = datetime.now().strftime("%H:%M:%S")
             self.log_console.append(f"[{time_str}] {raw}")
-            self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
+        self.log_console.verticalScrollBar().setValue(self.log_console.verticalScrollBar().maximum())
 
     def update_stats_ui(self):
         self.stats_label.setText(get_current_stats(STATE_PATH, roi_info=self._last_holdings_roi))
@@ -1128,10 +1189,31 @@ class BotDashboard(QMainWindow):
         except Exception:
             _bn = False
         if _bn:
-            self.lbl_coin_cash.setText(f"🪙 예수금(USDT): {_gui_krw_to_usdt_label(int(data['coin']['cash']))}")
-            self.lbl_coin_total.setText(f"🪙 총평가: {_gui_krw_to_usdt_label(int(data['coin']['total']))}")
+            from api import coin_broker as _cb_lbl
+
+            _coin_fb = bool((data.get("coin") or {}).get("display_fallback"))
+            _r = float(_cb_lbl.get_krw_per_usdt() or 0.0)
+            if _coin_fb:
+                self.lbl_coin_cash.setText(
+                    f"🪙 예수금: {_gui_krw_to_usdt_label(int(data['coin']['cash']), _r)}"
+                )
+                self.lbl_coin_total.setText(
+                    f"🪙 총평가: {_gui_krw_to_usdt_label(int(data['coin']['total']), _r)}"
+                )
+            else:
+                try:
+                    _cu, _tu = _cb_lbl.binance_display_cash_and_total_usdt()
+                    self.lbl_coin_cash.setText(f"🪙 예수금: {_cu:,.2f} USDT")
+                    self.lbl_coin_total.setText(f"🪙 총평가: {_tu:,.2f} USDT")
+                except Exception:
+                    self.lbl_coin_cash.setText(
+                        f"🪙 예수금: {_gui_krw_to_usdt_label(int(data['coin']['cash']), _r)}"
+                    )
+                    self.lbl_coin_total.setText(
+                        f"🪙 총평가: {_gui_krw_to_usdt_label(int(data['coin']['total']), _r)}"
+                    )
         else:
-            self.lbl_coin_cash.setText(f"🪙 예수금(KRW): {data['coin']['cash']:,}원")
+            self.lbl_coin_cash.setText(f"🪙 예수금: {data['coin']['cash']:,}원")
             self.lbl_coin_total.setText(f"🪙 총평가: {data['coin']['total']:,}원")
         self.lbl_coin_roi.setText(f"🪙 보유수익률: {format_roi(data['coin']['roi'])}")
 

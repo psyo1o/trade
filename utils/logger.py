@@ -77,6 +77,7 @@ def setup_quant_logging():
     """
     global _quant_logger
 
+    # 네트워크 공유 경로( UNC )면 공유기 재부팅 구간에 파일 쓰기가 매우 느려질 수 있다 → 가능하면 로컬 디스크 권장.
     LOG_DIR = Path("logs")
     LOG_DIR.mkdir(exist_ok=True)
 

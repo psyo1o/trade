@@ -25,7 +25,13 @@ def load_state(path: Path):
     bot_state.json 로드. 파일 없음 / 빈 파일 / JSON 깨짐 시 기본 장부 반환(크래시 방지).
     깨진 내용은 *_corrupt_타임스탬프.bak 으로 한 번 복사해 둔다.
     """
-    empty: dict = {"positions": {}, "cooldown": {}, "ticker_cooldowns": {}, "last_kis_display_snapshot": {}}
+    empty: dict = {
+        "positions": {},
+        "cooldown": {},
+        "ticker_cooldowns": {},
+        "last_kis_display_snapshot": {},
+        "last_coin_display_snapshot": {},
+    }
     if not path.exists():
         return empty
     try:
@@ -64,6 +70,8 @@ def load_state(path: Path):
     data.setdefault("ticker_cooldowns", {})
     # KIS 최종 성공 조회 시점의 국·미 표시용 스냅샷(주말 점검 시 GUI/텔레 재사용)
     data.setdefault("last_kis_display_snapshot", {})
+    # 코인 라벨용 직전 성공 조회(잔고 API 실패 시 폴백 — 보유 행은 장부·별도 조회)
+    data.setdefault("last_coin_display_snapshot", {})
     # Phase5 레거시 키(peak_equity_total_krw) 자동 이관/정리 — 단일 키 peak_total_equity 유지
     try:
         pt = float(data.get("peak_total_equity", 0.0) or 0.0)

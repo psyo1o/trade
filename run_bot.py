@@ -413,6 +413,11 @@ try:
 except Exception as e:
     print(f"⚠️ 로깅 설정 실패: {e}")
 
+import logging
+
+for _yn in ("yfinance", "urllib3"):
+    logging.getLogger(_yn).setLevel(logging.ERROR)
+
 from utils.telegram import configure_telegram, register_telegram_atexit, send_telegram
 from utils.helpers import (
     is_coin_ticker,
@@ -501,9 +506,8 @@ UPBIT_KRW_AVAILABLE_CAP_RATIO = 0.999  # 주문 직전: min(목표액, get_balan
 UPBIT_COIN_MIN_ORDER_KRW = 5000.0      # KRW 마켓 최소 주문 금액(업비트 기준)
 # 바이낸스: 24h 거래대금(USDT) 상위 N (기본 30)
 BINANCE_UNIVERSE_TOP = int(config.get("binance_universe_top", 30))
-# 바이낸스 V8 유니버스 스캔 주기(분). 매매가 :00/:15/:30/:45에만 돌아 **60의 약수**만 허용.
-_raw_bn_iv = int(config.get("binance_v8_interval_minutes", 15))
-BINANCE_V8_INTERVAL_MINUTES = 15 if _raw_bn_iv not in (15, 30, 60) else _raw_bn_iv
+# 바이낸스 V8 스캔: _is_coin_buy_window_now(일봉 09:00 KST 직전 N분)과 동일 창에서 **일 1회** (기본 08:30~09:00).
+# 예전 `binance_v8_interval_minutes`(15분마다)는 제거됨 — state `last_binance_v8_pre_daily_date`로 중복 방지.
 
 
 def _coin_min_order_krw() -> float:
@@ -851,6 +855,32 @@ def save_last_kis_display_snapshot(
     save_state(STATE_PATH, st)
 
 
+def load_last_coin_display_snapshot() -> dict:
+    """``bot_state.json`` 의 ``last_coin_display_snapshot`` — 코인 예수·총평·ROI(원화환산 정수).
+
+    잔고 API 실패 시 GUI·텔레 라벨 폴백용. 보유 종목 표는 여전히 실조회·장부에 의존.
+    """
+    st = load_state(STATE_PATH)
+    x = st.get("last_coin_display_snapshot")
+    return x if isinstance(x, dict) else {}
+
+
+def save_last_coin_display_snapshot(cash_krw: int, total_krw: int, roi) -> None:
+    """코인 라벨 조회 성공 직후 저장. 국·미와 달리 **주말에도 갱신**(코인 시장 상시).
+
+    ``cash_krw`` / ``total_krw`` 는 **업비트=원**, **바이낸스=USDT를 원화 환산한 정수**
+    (스냅샷 ``labels["coin"]`` 과 동일 스키마). 서킷·Phase5와 별개인 **표시용** 직전 성공 값.
+    """
+    st = load_state(STATE_PATH)
+    st["last_coin_display_snapshot"] = {
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cash": int(cash_krw),
+        "total": int(total_krw),
+        "roi": roi,
+    }
+    save_state(STATE_PATH, st)
+
+
 # =====================================================================
 # 4. 실보유 조회 — API 실패 시 ``None``, 빈 보유는 ``[]`` (동기화 로직이 구분)
 # =====================================================================
@@ -915,47 +945,52 @@ def get_real_weather(broker_kr, broker_us):
         print("🚨 [경고] 'ta' 라이브러리가 없습니다. 터미널에서 'pip install ta'를 실행해주세요. (임시 횡보장 처리)")
         return weather
 
+    suppress_kr_us_yahoo = kis_equities_weekend_suppress_window_kst()
     # -----------------------------------------------------------
-    # 🇰🇷 국장 날씨 (KODEX 200 - yfinance 사용으로 KIS API 에러 원천 차단)
+    # 🇰🇷 국장 날씨 (KODEX 200 - yfinance). 주말·KIS 점검 창에서는 Yahoo 생략(횡보장 유지).
     # -----------------------------------------------------------
-    try:
-        df_kr = yf.Ticker("069500.KS").history(period="2mo")
-        if not df_kr.empty and len(df_kr) >= 30:
-            # ADX 계산 (기본 14일)
-            adx_kr = ADXIndicator(high=df_kr['High'], low=df_kr['Low'], close=df_kr['Close'], window=14)
-            df_kr['adx'] = adx_kr.adx()
-            
-            curr_c = df_kr['Close'].iloc[-1]
-            ma20 = df_kr['Close'].rolling(20).mean().iloc[-1]
-            curr_adx = df_kr['adx'].iloc[-1]
-            
-            # ADX가 20 이하면 무조건 횡보장 (매수 금지)
-            if pd.isna(curr_adx) or curr_adx < 20:
-                weather['KR'] = "☁️ SIDEWAYS"
-            else:
-                weather['KR'] = "☀️ BULL" if curr_c > ma20 else "🌧️ BEAR"
-    except Exception as e: 
-        print(f"  ⚠️ 국장 ADX 날씨 판독 실패: {e}")
+    if suppress_kr_us_yahoo:
+        print("  📌 [기상] KIS 주말·점검 창 — 국·미 날씨 Yahoo 생략 (코인만 실조회)")
+    if not suppress_kr_us_yahoo:
+        try:
+            df_kr = yf.Ticker("069500.KS").history(period="2mo")
+            if not df_kr.empty and len(df_kr) >= 30:
+                # ADX 계산 (기본 14일)
+                adx_kr = ADXIndicator(high=df_kr['High'], low=df_kr['Low'], close=df_kr['Close'], window=14)
+                df_kr['adx'] = adx_kr.adx()
+                
+                curr_c = df_kr['Close'].iloc[-1]
+                ma20 = df_kr['Close'].rolling(20).mean().iloc[-1]
+                curr_adx = df_kr['adx'].iloc[-1]
+                
+                # ADX가 20 이하면 무조건 횡보장 (매수 금지)
+                if pd.isna(curr_adx) or curr_adx < 20:
+                    weather['KR'] = "☁️ SIDEWAYS"
+                else:
+                    weather['KR'] = "☀️ BULL" if curr_c > ma20 else "🌧️ BEAR"
+        except Exception as e: 
+            print(f"  ⚠️ 국장 ADX 날씨 판독 실패: {e}")
 
     # -----------------------------------------------------------
-    # 🇺🇸 미장 날씨 (SPY - S&P 500 ETF)
+    # 🇺🇸 미장 날씨 (SPY - S&P 500 ETF). 주말·점검 창에서는 위와 같이 생략됨.
     # -----------------------------------------------------------
-    try:
-        df_us = yf.Ticker("SPY").history(period="2mo")
-        if not df_us.empty and len(df_us) >= 30:
-            adx_us = ADXIndicator(high=df_us['High'], low=df_us['Low'], close=df_us['Close'], window=14)
-            df_us['adx'] = adx_us.adx()
-            
-            curr_c = df_us['Close'].iloc[-1]
-            ma20 = df_us['Close'].rolling(20).mean().iloc[-1]
-            curr_adx = df_us['adx'].iloc[-1]
-            
-            if pd.isna(curr_adx) or curr_adx < 25:
-                weather['US'] = "☁️ SIDEWAYS"
-            else:
-                weather['US'] = "☀️ BULL" if curr_c > ma20 else "🌧️ BEAR"
-    except Exception as e:
-        print(f"  ⚠️ 미장 ADX 날씨 판독 실패: {e}")
+    if not suppress_kr_us_yahoo:
+        try:
+            df_us = yf.Ticker("SPY").history(period="2mo")
+            if not df_us.empty and len(df_us) >= 30:
+                adx_us = ADXIndicator(high=df_us['High'], low=df_us['Low'], close=df_us['Close'], window=14)
+                df_us['adx'] = adx_us.adx()
+                
+                curr_c = df_us['Close'].iloc[-1]
+                ma20 = df_us['Close'].rolling(20).mean().iloc[-1]
+                curr_adx = df_us['adx'].iloc[-1]
+                
+                if pd.isna(curr_adx) or curr_adx < 25:
+                    weather['US'] = "☁️ SIDEWAYS"
+                else:
+                    weather['US'] = "☀️ BULL" if curr_c > ma20 else "🌧️ BEAR"
+        except Exception as e:
+            print(f"  ⚠️ 미장 ADX 날씨 판독 실패: {e}")
         
     # -----------------------------------------------------------
     # 🪙 코인 날씨 (비트코인)
@@ -2089,8 +2124,21 @@ def _execute_coin_market_buy_twap(
             break
 
         if TEST_MODE:
-            print(f"  🧪 TEST_MODE [COIN TWAP {si + 1}/{len(slices)}] {t} {int(krw_slice):,}원")
-            send_telegram(f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {int(krw_slice):,}KRW")
+            if coin_config.is_binance():
+                kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
+                usdt_s = float(krw_slice) / kpx
+                print(
+                    f"  🧪 TEST_MODE [COIN TWAP {si + 1}/{len(slices)}] {t} "
+                    f"{usdt_s:,.2f} USDT (≈{int(krw_slice):,}원 환산)"
+                )
+                send_telegram(
+                    f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {usdt_s:,.2f} USDT"
+                )
+            else:
+                print(f"  🧪 TEST_MODE [COIN TWAP {si + 1}/{len(slices)}] {t} {int(krw_slice):,}원")
+                send_telegram(
+                    f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {int(krw_slice):,}KRW"
+                )
             spent += float(krw_slice)
             krw_bal_holder[0] = float(krw_bal_holder[0]) - float(krw_slice)
             any_fill = True
@@ -2155,12 +2203,20 @@ def _execute_coin_market_buy_twap(
 
     coin_qty = spent / last_p
     coin_name = get_coin_name(t)
-    p_fmt = f"{last_p:,.4f}" if last_p < 100 else f"{int(last_p):,}"
-    sl_fmt = f"{sl_p:,.4f}" if sl_p < 100 else f"{int(sl_p):,}"
-    print(f"  ✅ [코인 매수 체결 TWAP] {t}({coin_name}) | {p_fmt}원 × {coin_qty:.4f} | 손절가: {sl_fmt}원")
-    send_telegram(
-        f"🎯 [코인 TWAP 매수] {t}({coin_name})\n평단: {p_fmt}원 × {coin_qty:.4f} | 손절: {sl_fmt}원\n전략: {s_name}"
-    )
+    if coin_config.is_binance():
+        p_fmt = _fmt_telegram_coin_unit_usdt(last_p)
+        sl_fmt = _fmt_telegram_coin_unit_usdt(sl_p)
+        print(f"  ✅ [코인 매수 체결 TWAP] {t}({coin_name}) | {p_fmt} × {coin_qty:.4f} | 손절가: {sl_fmt}")
+        send_telegram(
+            f"🎯 [코인 TWAP 매수] {t}({coin_name})\n평단: {p_fmt} × {coin_qty:.4f} | 손절: {sl_fmt}\n전략: {s_name}"
+        )
+    else:
+        p_fmt = f"{last_p:,.4f}" if last_p < 100 else f"{int(last_p):,}"
+        sl_fmt = f"{sl_p:,.4f}" if sl_p < 100 else f"{int(sl_p):,}"
+        print(f"  ✅ [코인 매수 체결 TWAP] {t}({coin_name}) | {p_fmt}원 × {coin_qty:.4f} | 손절가: {sl_fmt}원")
+        send_telegram(
+            f"🎯 [코인 TWAP 매수] {t}({coin_name})\n평단: {p_fmt}원 × {coin_qty:.4f} | 손절: {sl_fmt}원\n전략: {s_name}"
+        )
     payload = {
         "buy_p": last_p,
         "sl_p": sl_p,
@@ -2235,12 +2291,32 @@ def _holding_duration_clause(pos: dict) -> str:
     return f" | 보유 {d}" if d else ""
 
 
+def _fmt_telegram_coin_unit_usdt(p: float) -> str:
+    """텔레그램·로그: 바이낸스 코인 단가(USDT) — GUI ``_gui_coin_unit_price_str`` 와 동일 룰."""
+    x = float(_to_float(p, 0.0))
+    if x >= 1000:
+        return f"{x:,.2f} USDT"
+    if x >= 1:
+        return f"{x:,.4f} USDT"
+    if x <= 0:
+        return "0 USDT"
+    s = f"{x:.8f}".rstrip("0").rstrip(".")
+    return f"{s} USDT" if s else "0 USDT"
+
+
 def _fmt_price_for_heartbeat(market: str, price: float) -> str:
     p = float(_to_float(price, 0.0))
     if market == "US":
         return f"${p:,.2f}"
-    if market == "COIN" and 0 < p < 100:
-        return f"{p:,.4f}원"
+    if market == "COIN":
+        try:
+            if coin_config.is_binance():
+                return _fmt_telegram_coin_unit_usdt(p)
+        except Exception:
+            pass
+        if 0 < p < 100:
+            return f"{p:,.4f}원"
+        return f"{int(p):,}원"
     return f"{int(p):,}원"
 
 
@@ -2369,6 +2445,8 @@ def build_account_snapshot_for_report(
         "broker_us": kis_api.broker_us,
         "load_last_kis_display_snapshot": load_last_kis_display_snapshot,
         "save_last_kis_display_snapshot": save_last_kis_display_snapshot,
+        "load_last_coin_display_snapshot": load_last_coin_display_snapshot,
+        "save_last_coin_display_snapshot": save_last_coin_display_snapshot,
         "is_weekend_suppress": kis_equities_weekend_suppress_window_kst,
         "get_balance_with_retry": get_balance_with_retry,
         "get_us_positions_with_retry": get_us_positions_with_retry,
@@ -2408,6 +2486,12 @@ def _telegram_sl_clause(market: str, curr_p: float, pos: dict) -> str:
         return f" · 매도선 {int(sl):,}원 (vs {pct:+.1f}%p)"
     if market == "US":
         return f" · 매도선 ${sl:.2f} (vs {pct:+.1f}%p)"
+    if market == "COIN":
+        try:
+            if coin_config.is_binance():
+                return f" · 매도선 {_fmt_telegram_coin_unit_usdt(float(sl))} (vs {pct:+.1f}%p)"
+        except Exception:
+            pass
     if float(sl) < 100:
         return f" · 매도선 {sl:,.4f}원 (vs {pct:+.1f}%p)"
     return f" · 매도선 {int(sl):,}원 (vs {pct:+.1f}%p)"
@@ -2425,15 +2509,13 @@ def get_kr_holdings_with_roi():
                 buy_p = _to_float(pos.get("buy_p", 0), 0)
                 if buy_p <= 0:
                     continue
-                curr_p = buy_p
-                try:
-                    oc = get_ohlcv_yfinance(code)
-                    if oc and len(oc) > 0:
-                        curr_p = float(oc[-1]["c"])
-                except Exception:
-                    pass
-                roi = ((curr_p - buy_p) / buy_p) * 100
+                # GUI·장부에 저장된 마지막 현재가가 있으면 텔레 보유 줄에도 동일 표시(없으면 평단)
+                curr_p = _resolve_curr_price_with_gui_override(pos, float(buy_p))
+                roi = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                 kr_name = get_kr_company_name(code)
+                tag = "(주말·장부평단)"
+                if float(pos.get("curr_p") or 0) > 0 and abs(curr_p - buy_p) > 1e-9:
+                    tag = "(주말·마지막현재가)"
                 holdings.append(
                     _format_holding_line(
                         "KR",
@@ -2443,7 +2525,7 @@ def get_kr_holdings_with_roi():
                         float(curr_p),
                         float(roi),
                         pos,
-                        source_tag="(주말·yfinance)",
+                        source_tag=tag,
                     )
                 )
             return holdings
@@ -2511,18 +2593,23 @@ def get_us_holdings_with_roi():
             if buy_p <= 0:
                 continue
             
-            # 현재가: 공용 해석 함수
+            pos_u = state.get("positions", {}).get(ticker, {})
+            if not isinstance(pos_u, dict):
+                pos_u = {}
+            # 현재가: 공용 해석 함수 (주말·점검 창은 장부 curr_p 우선 — GUI와 동일)
             cp_api = normalize_us_current_p_api_for_display(
                 buy_p,
                 item.get("current_p", 0),
                 is_market_open_now=is_us_open,
                 is_weekend=is_weekend,
             )
-            curr_p = resolve_display_current_price("US", ticker, buy_p, cp_api)
+            if is_weekend:
+                curr_p = _resolve_curr_price_with_gui_override(pos_u, float(buy_p))
+            else:
+                curr_p = resolve_display_current_price("US", ticker, buy_p, cp_api)
             
             roi = ((curr_p - buy_p) / buy_p) * 100
             us_name = get_us_company_name(ticker)
-            pos_u = state.get("positions", {}).get(ticker, {})
             holdings.append(
                 _format_holding_line(
                     "US",
@@ -2592,7 +2679,11 @@ def get_coin_holdings_with_roi():
         return []
 
 def heartbeat_report():
-    """모든 자산 현황을 종합하여 텔레그램으로 보고 (GUI와 동일한 로직)"""
+    """모든 자산 현황을 종합하여 텔레그램으로 보고.
+
+    코인 한 줄: 업비트는 스냅샷 원화. 바이낸스는 조회 성공 시 ``binance_display_cash_and_total_usdt()``,
+    ``labels["coin"].display_fallback`` 이면 스냅샷 원화 라벨을 환율로 USDT만 표시(API 실패 시 0 덮어쓰기 방지).
+    """
     print("💓 생존 신고 보고서 생성 중...")
     try:
         snap = build_account_snapshot_for_report()
@@ -2606,6 +2697,7 @@ def heartbeat_report():
         krw_bal = int(snap["labels"]["coin"]["cash"])
         coin_total = int(snap["labels"]["coin"]["total"])
         coin_roi = snap["labels"]["coin"]["roi"]
+        coin_disp_fb = bool((snap["labels"].get("coin") or {}).get("display_fallback"))
 
         # 수익률 텍스트 포맷팅
         kr_roi_str = f"{kr_roi:+.2f}%" if kr_roi is not None else "보유없음"
@@ -2620,7 +2712,29 @@ def heartbeat_report():
         kr_holdings_str = "\n".join(kr_holdings) if kr_holdings else "  (보유 없음)"
         us_holdings_str = "\n".join(us_holdings) if us_holdings else "  (보유 없음)"
         coin_holdings_str = "\n".join(coin_holdings) if coin_holdings else "  (보유 없음)"
-        
+
+        if coin_config.is_binance():
+            if coin_disp_fb:
+                kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
+                cash_u = float(krw_bal) / kpx
+                tot_u = float(coin_total) / kpx
+            else:
+                try:
+                    cash_u, tot_u = coin_broker.binance_display_cash_and_total_usdt()
+                except Exception:
+                    kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
+                    cash_u = float(krw_bal) / kpx
+                    tot_u = float(coin_total) / kpx
+            coin_summary_line = (
+                f"{weather['COIN']} 🪙 코인 | 예수금: {cash_u:,.2f} USDT | "
+                f"총평가: {tot_u:,.2f} USDT | 수익률: {coin_roi_str}"
+            )
+        else:
+            coin_summary_line = (
+                f"{weather['COIN']} 🪙 코인 | 예수금: {krw_bal:,}원 | "
+                f"총평가: {coin_total:,}원 | 수익률: {coin_roi_str}"
+            )
+
         msg = f"""💓 [3콤보 생존신고]
 {weather['KR']} 🇰🇷 국장 | 예수금: {kr_cash:,}원 | 총평가: {kr_total:,}원 | 수익률: {kr_roi_str}
 [국장 보유]
@@ -2630,7 +2744,7 @@ def heartbeat_report():
 [미장 보유]
 {us_holdings_str}
 
-{weather['COIN']} 🪙 코인 | 예수금: {krw_bal:,}원 | 총평가: {coin_total:,}원 | 수익률: {coin_roi_str}
+{coin_summary_line}
 [코인 보유]
 {coin_holdings_str}"""
         if kis_equities_weekend_suppress_window_kst():
@@ -2945,25 +3059,21 @@ def _is_coin_buy_window_now(now_coin: datetime) -> tuple[bool, datetime, datetim
     return coin_buy_start <= now_coin < coin_close, coin_buy_start, coin_close
 
 
-def _binance_v8_slot_key(now_kst) -> str:
-    """KST 당일 자정부터 경과 **분**을 ``BINANCE_V8_INTERVAL_MINUTES`` 로 나눈 슬롯 ID.
-
-    15/30/60 모두 :00/:15/:30/:45 틱과 일치하도록 **60의 약수**만 지원한다.
-    """
-    iv = BINANCE_V8_INTERVAL_MINUTES
-    total_min = int(now_kst.hour) * 60 + int(now_kst.minute)
-    slot_id = total_min // iv
-    return f"{now_kst.strftime('%Y-%m-%d')}-m{slot_id}"
-
-
 def _binance_should_run_v8_scan(state: dict, now_kst) -> bool:
-    """바이낸스 V8: ``BINANCE_V8_INTERVAL_MINUTES`` 마다 1회(해당 슬롯에서 아직 스캔 안 됐을 때)."""
-    cur = _binance_v8_slot_key(now_kst)
-    return state.get("last_binance_v8_scan_slot_key") != cur
+    """바이낸스 V8: 일봉(UTC 00:00 ≈ KST 09:00) 갱신 **직전** 창에서 분기 매매틱당 **일 1회**.
+
+    시간창은 ``_is_coin_buy_window_now`` 와 동일(``buy_window_minutes_before_close`` — 기본 30 → 08:30~09:00 KST).
+    """
+    d = now_kst.strftime("%Y-%m-%d")
+    if state.get("last_binance_v8_pre_daily_date") == d:
+        return False
+    in_win, _, _ = _is_coin_buy_window_now(now_kst)
+    return bool(in_win)
 
 
 def _binance_mark_v8_scan_done(state: dict, now_kst) -> None:
-    state["last_binance_v8_scan_slot_key"] = _binance_v8_slot_key(now_kst)
+    state["last_binance_v8_pre_daily_date"] = now_kst.strftime("%Y-%m-%d")
+    state.pop("last_binance_v8_scan_slot_key", None)
     state.pop("last_binance_v8_scan_hour_key", None)
 
 
@@ -4657,7 +4767,7 @@ def run_trading_bot():
         elif in_account_circuit_cooldown(state):
             print("  -> 🚨 코인 Phase5 계좌 서킷 쿨다운 — 신규 매수 중단.")
         else:
-            # 업비트: KST 일봉 창 직전 N분만 매수. 바이낸스: V8=설정 분 간격 / SWING=09:15~09:45 첫 틱·일1회
+            # 업비트: KST 일봉 창 직전 N분만 매수. 바이낸스: V8=일봉(09:00) 갱신 전 동일 창·일1회 / SWING=09:15~09:45
             now_coin = datetime.now(pytz.timezone("Asia/Seoul"))
             use_bn_sched = bool(coin_config.is_binance())
             do_bn_v8 = False
@@ -4674,7 +4784,7 @@ def run_trading_bot():
                 skip_buy = not do_bn_v8 and not do_bn_sw
                 if skip_buy:
                     print(
-                        f"  ⏳ [BINANCE 매수 대기] V8·상위{BINANCE_UNIVERSE_TOP}·{BINANCE_V8_INTERVAL_MINUTES}분마다 / "
+                        f"  ⏳ [BINANCE 매수 대기] V8·상위{BINANCE_UNIVERSE_TOP}·일봉 직전 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분(기본 08:30~09:00) 일1회 / "
                         f"SWING·09:15~09:45 첫틱·일1회 — 이번 틱 미해당 "
                         f"(지금 {now_coin.strftime('%H:%M')} KST)"
                     )

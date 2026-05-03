@@ -218,6 +218,7 @@ def get_held_stocks_us_detail(
                 result.append(
                     {
                         "code": item.get("ovrs_pdno", item.get("pdno", "")),
+                        "name": (item.get("ovrs_item_name") or item.get("prdt_name") or "").strip(),
                         "qty": qty,
                         "avg_p": to_float(item.get("ovrs_avg_pric", item.get("ovrs_avg_unpr", item.get("avg_unpr3", 0)))),
                         "current_p": current_p,

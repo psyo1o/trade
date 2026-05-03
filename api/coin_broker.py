@@ -4,6 +4,7 @@
 
 * 예산·서킷·Phase5 는 기존처럼 **원화(KRW) 환산** 기준을 유지한다.
 * 바이낸스 현물은 주문·호가·캔들이 USDT 이며, 매수 예산만 ``krw_per_usdt`` 로 환산한다.
+* GUI·텔레그램 코인 **가용·총평 숫자**(바이낸스)는 KRW 왕복 없이 ``binance_display_cash_and_total_usdt()`` 로 표시한다.
 """
 
 from __future__ import annotations
@@ -119,6 +120,33 @@ def get_quote_balance_direct() -> float | None:
         return upbit_api.upbit.get_balance("KRW")
     except Exception:
         return None
+
+
+def binance_display_cash_and_total_usdt() -> tuple[float, float]:
+    """GUI·텔레 표시 전용: **KRW 환산 없이** 가용 USDT + 코인 명목(USDT).
+
+    - 가용: ``fetch_balance`` 의 USDT ``free`` (``get_quote_balance_direct`` 와 동일).
+    - 총평: 가용 + ``get_balances()`` 행(USDT·KRW 제외)의 ``수량 × 현재가(USDT)``.
+
+    스냅샷·서킷용 원화 합산과 소수·먼지 필터 차이로 숫자가 아주 약간 다를 수 있다.
+    """
+    if not coin_config.is_binance():
+        return 0.0, 0.0
+    cash = float(get_quote_balance_direct() or 0.0)
+    pos_usdt = 0.0
+    for b in get_balances() or []:
+        cur = str(b.get("currency") or "").upper()
+        if cur in ("KRW", "VTHO"):
+            continue
+        if cur == "USDT":
+            continue
+        t = held_ticker_row(b)
+        if not t:
+            continue
+        qty = _float_bal(b.get("balance"))
+        px = float(get_current_price(t) or 0.0)
+        pos_usdt += qty * px
+    return cash, cash + pos_usdt
 
 
 def get_current_price(internal_ticker: str) -> float | None:

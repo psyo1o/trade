@@ -17,6 +17,7 @@ def build_rows_data(
     kr_name_dict,
     us_name_dict,
     get_kr_company_name,
+    get_us_company_name,
     safe_num,
     process_row_data,
 ):
@@ -30,7 +31,8 @@ def build_rows_data(
                 code = item.get("pdno", "")
                 price = item.get("pchs_avg_prc", item.get("pchs_avg_pric", "0"))
                 current_p = item.get("prpr", "0")
-                name = kr_name_dict.get(code) or get_kr_company_name(code) or code
+                prdt = (item.get("prdt_name") or item.get("prdt_name1") or "").strip()
+                name = prdt or kr_name_dict.get(code) or get_kr_company_name(code) or code
                 rows_data.append(process_row_data("🇰🇷 국장", name, str(qty_num), price, "KR", code, current_p))
     elif is_weekend_suppress() or not is_market_open("KR"):
         try:
@@ -40,7 +42,8 @@ def build_rows_data(
                 code = str(inf.get("code") or "").strip()
                 if not code:
                     continue
-                name = inf.get("name") or code
+                raw_n = (inf.get("name") or "").strip()
+                name = raw_n if raw_n and raw_n != code else (get_kr_company_name(code) or code)
                 qty_num = max(1, int(safe_num(inf.get("qty"), 1)))
                 bp = safe_num(pos_row.get(code, {}).get("buy_p"), 0.0)
                 rows_data.append(process_row_data("🇰🇷 국장", name, str(qty_num), bp, "KR", code, None))
@@ -53,7 +56,10 @@ def build_rows_data(
         if us_data:
             for item in us_data:
                 code, qty, avg_price, current_p = item["code"], item["qty"], item["avg_p"], item.get("current_p", 0.0)
-                name = us_name_dict.get(code, code)
+                nm = (item.get("name") or "").strip()
+                name = nm or us_name_dict.get(code, code)
+                if not nm or name == code:
+                    name = get_us_company_name(code) or name
                 rows_data.append(process_row_data("🇺🇸 미장", name, str(qty), f"${avg_price:,.2f}", "US", code, current_p))
         else:
             st_row = load_state(state_path)
@@ -62,7 +68,10 @@ def build_rows_data(
                 code = str(inf.get("code") or "").strip()
                 if not code:
                     continue
-                name = inf.get("name") or us_name_dict.get(code, code)
+                raw_un = (inf.get("name") or "").strip()
+                name = raw_un or us_name_dict.get(code, code)
+                if not raw_un or name == code:
+                    name = get_us_company_name(code) or name
                 qty_num = max(1, int(safe_num(inf.get("qty"), 1)))
                 bp = safe_num(pos_row.get(code, {}).get("buy_p"), 0.0)
                 rows_data.append(process_row_data("🇺🇸 미장", name, str(qty_num), f"${bp:,.2f}", "US", code, None))

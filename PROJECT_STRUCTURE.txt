@@ -53,12 +53,15 @@ run_bot.py
   - refresh_circuit_aux_from_brokers(state, path) … 브로커만으로 동일 키 재기록(adjust_capital 등)
   - 관측성: [KR …], [US …], [COIN …] 태그. 매수 스캔은 rules.calculate_pro_signals 안에서 [V8],
     스윙 보조는 check_swing_entry 실패 시 [스윙] 한 줄(run_bot에서 출력).
-  - 바이낸스: ``binance_v8_interval_minutes``(15/30/60)로 V8 상위 USDT 스캔 주기(슬롯=자정부터 분÷간격).
-    SWING은 KST 9시대 09:15/09:30/09:45 첫 틱에서 일 1회(구 09:05~09:14는 매매 :00/:15 슬롯과 무교집합이었음).
+  - 바이낸스 V8: 일봉(≈KST 09:00) 직전 ``buy_window_minutes_before_close`` 분 창(기본 08:30~09:00)에서 분기 틱 일 1회(`last_binance_v8_pre_daily_date`).
+    SWING은 KST 9시대 09:15/09:30/09:45 첫 틱에서 일 1회.
 
 run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI 사용 안내」)
   - PyQt5. import run_bot 순간 config 로드 → config 수정 후에는 GUI 재시작.
   - 상단: stats 라벨(약 3초 주기), 국/미/코인 예수·총평·보유수익률.
+    바이낸스일 때 코인 칸·보유표·장부 탭 코인 가격은 USDT로 표시(스냅샷·서킷·Phase5는 내부 KRW 환산 유지).
+    텔레 생존신고 코인 요약 USDT는 binance_display_cash_and_total_usdt()(원화 왕복 없음). TWAP 알림도 동일 규칙.
+    잔고 API 실패 시 코인 상단 라벨은 bot_state last_coin_display_snapshot 폴백(성공 시 저장).
   - "예수금 새로고침" = 일반 정책 조회 / "KIS 강제 새로고침" = KIS 1회 강제(자동 조회 최소 간격 약 25초).
   - 스핀: 국·미·코인 max_positions + "설정 실시간 적용" → run_bot.MAX_* 즉시 + bot_state settings 저장.
   - 실시간 현황 보유표 마지막 열: 수량 QLineEdit(기본=행 보유 전량, 비우면 전량) + 매도 버튼 → _on_manual_sell_click

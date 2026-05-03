@@ -1,8 +1,9 @@
 """
 account_snapshot — heartbeat·GUI가 공유하는 **계좌 라벨·보유 스냅샷** 조립.
 
-* ``build_account_snapshot_for_report``: 국·미 현금/총액/ROI 라벨, 코인 KRW 합산,
-  그리고 각 시장 ``holdings``/raw ``balances`` 를 한 번에 채운다.
+* ``build_account_snapshot_for_report``: 국·미 현금/총액/ROI 라벨, 코인 **KRW 환산** 합산(바이낸스 포함),
+  그리고 각 시장 ``holdings``/raw ``balances`` 를 한 번에 채운다. 코인 라벨은 성공 시 ``last_coin_display_snapshot`` 에 저장하고(업비트·바이낸스 동일), 실패 시 폴백·``display_fallback``.
+  바이낸스 상단 USDT: 폴백이면 라벨만 환산, 아니면 ``binance_display_cash_and_total_usdt()`` .
 * ``resolve_display_current_price``: API 현재가가 없을 때 yfinance·업비트 등으로 보조.
 
 로그 정책 (2026-04-22)
@@ -232,18 +233,57 @@ def build_account_snapshot_for_report(
         except Exception as e:
             print(f"  ⚠️ [snapshot] last_kis_display_snapshot 저장 실패(라벨은 메모리 값 유지): {type(e).__name__}: {e}")
 
-    krw_bal = int(deps["safe_num"](deps["upbit_get_balance"]("KRW"), 0.0))
-    upbit_bals = deps["upbit_get_balances"]() or []
-    coin_m = deps["calc_coin_holdings_metrics"](upbit_bals)
-    coin_total = int(krw_bal + float(coin_m.get("current", 0.0) or 0.0))
-    coin_roi = coin_m.get("roi")
+    _load_coin = deps.get("load_last_coin_display_snapshot")
+    _save_coin = deps.get("save_last_coin_display_snapshot")
+    coin_prev = _load_coin() if callable(_load_coin) else {}
+
+    krw_bal = 0
+    coin_total = 0
+    coin_roi = None
+    upbit_bals: list = []
+    coin_label_from_fallback = False
+    try:
+        krw_bal = int(deps["safe_num"](deps["upbit_get_balance"]("KRW"), 0.0))
+        upbit_bals = deps["upbit_get_balances"]() or []
+        coin_m = deps["calc_coin_holdings_metrics"](upbit_bals)
+        coin_total = int(krw_bal + float(coin_m.get("current", 0.0) or 0.0))
+        coin_roi = coin_m.get("roi")
+        if callable(_save_coin):
+            try:
+                _save_coin(int(krw_bal), int(coin_total), coin_roi)
+            except Exception as se:
+                print(
+                    f"  ⚠️ [snapshot COIN] last_coin_display_snapshot 저장 실패: "
+                    f"{type(se).__name__}: {se}"
+                )
+    except Exception as e:
+        coin_label_from_fallback = True
+        print(
+            f"  ⚠️ [snapshot COIN] 라벨용 잔고 조회 실패 — 직전 스냅샷으로 폴백: "
+            f"{type(e).__name__}: {e}"
+        )
+        fb = coin_prev if isinstance(coin_prev, dict) else {}
+        krw_bal = int(deps["safe_num"](fb.get("cash", 0), 0.0))
+        coin_total = int(deps["safe_num"](fb.get("total", 0), 0.0))
+        coin_roi = fb.get("roi")
+        if isinstance(fb.get("saved_at"), str) and fb["saved_at"].strip():
+            print(f"     (직전 코인 스냅샷 시각: {fb['saved_at'].strip()})")
+
+    coin_label: dict = {
+        "cash": int(krw_bal),
+        "total": int(coin_total),
+        "roi": coin_roi,
+    }
+    # 바이낸스 GUI·텔레: 라이브 USDT 조회가 (0,0)으로 나와도 직전 라벨을 덮어쓰지 않도록 표시
+    if coin_label_from_fallback:
+        coin_label["display_fallback"] = True
 
     return {
         "weather": weather,
         "labels": {
             "kr": {"cash": int(kr_cash), "total": int(kr_total), "roi": kr_roi},
             "us": {"cash": float(us_cash), "total": float(us_total), "roi": us_roi},
-            "coin": {"cash": int(krw_bal), "total": int(coin_total), "roi": coin_roi},
+            "coin": coin_label,
         },
         "holdings": {
             "kr": deps["get_kr_holdings_with_roi"](),

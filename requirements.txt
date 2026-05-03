@@ -9,7 +9,7 @@ pandas_market_calendars
 pandas
 numpy
 pytz
-yfinance
+yfinance>=0.2.48
 lxml
 ta
 pyupbit
