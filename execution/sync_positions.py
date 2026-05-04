@@ -15,6 +15,9 @@
     KIS 시드를 **아예 모으지 않고**, 해당 시장 종목에 대해 **평단 보정·유령 삭제·자동복구**를 하지 않는다.
     (공휴일·주말 장외에 브로커 응답이 들쭉날쭉할 때 장부가 날아가 보이는 것을 막기 위함.) 코인은 24시간이므로 기존대로.
 
+    **비장중 KIS 빈 보유 (2026-05):** 장 개시 전 매매틱(:00/:15/…)에서 KIS ``output1`` 이 비어 ``held_*=[]`` 가 되면
+    유령 판정 집합이 비어 장부가 통째로 지워질 수 있어, **비장중이고 API 보유 0건일 때** ``positions`` 키로 ``held`` 를 보강한다.
+
     **유령 판단 보강 (2026-05):** ``get_held_stocks_*`` 가 돌려준 ``held_*`` 리스트만으로 지우면,
     KIS 응답에서 **수량 필드 조합이 한쪽만 채워지는 행**(휴장·점검 직후 등) 때문에 ``held`` 가 비고
     ``live_seeds`` 에만 종목이 남는 순간이 생길 수 있다. 그때 장부 전량이 유령 처리된 뒤 다음 틱에
@@ -200,7 +203,6 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
     path = state_path if state_path is not None else DEFAULT_STATE_PATH
     if kis_equities_weekend_suppress_window_kst():
         print("💤 [주말 점검] 증권사 API 통신을 건너뛰고 기존 장부를 유지합니다.")
-    print(f"🔄 [장부 점검] 실제 잔고 (국장:{len(held_kr)} / 미장:{len(held_us)} / 코인:{len(held_coins)}) 대조 중...")
     if "positions" not in state:
         state["positions"] = {}
 
@@ -224,6 +226,31 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
             f"  💤 [휴장] {'·'.join(parts)} 휴장 — KIS 시드·평단보정·유령삭제·주식 자동복구 생략 "
             f"(장부 유지). 코인은 동기화 계속."
         )
+
+    # 비장중 KIS가 빈 보유([])를 주면 held_kr_set 이 비어 장부 국장·미장 줄이 유령으로 몰릴 수 있다.
+    # (KST :30 등 매매틱이 장 개시 전에도 돌기 때문) — 장부에 남아 있는 티커는 held 에 합쳐 유령 판정만 막는다.
+    if not kr_open and held_kr is not None and len(held_kr) == 0:
+        ledger_kr = [k for k in current_positions.keys() if str(k).isdigit()]
+        if ledger_kr:
+            print(
+                f"  📌 [장부 동기화] 국장 비장중 — KIS 보유 0건, 장부 {len(ledger_kr)}종을 유령 판정에서 제외하도록 held 보강"
+            )
+            held_kr.extend(ledger_kr)
+    if not us_open and held_us is not None and len(held_us) == 0:
+        ledger_us = [
+            k
+            for k in current_positions.keys()
+            if (not str(k).isdigit()) and (not is_coin_ticker(str(k)))
+        ]
+        if ledger_us:
+            print(
+                f"  📌 [장부 동기화] 미장 비장중 — KIS 보유 0건, 장부 {len(ledger_us)}종 held 보강"
+            )
+            held_us.extend(ledger_us)
+
+    print(
+        f"🔄 [장부 점검] 실제 잔고 (국장:{len(held_kr or [])} / 미장:{len(held_us or [])} / 코인:{len(held_coins or [])}) 대조 중..."
+    )
 
     # -----------------------------------------------------------------
     # 1) 자동 복구 및 평단가 동기화: 실보유 중인 종목의 정보 최신화

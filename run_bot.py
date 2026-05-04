@@ -506,8 +506,7 @@ UPBIT_KRW_AVAILABLE_CAP_RATIO = 0.999  # 주문 직전: min(목표액, get_balan
 UPBIT_COIN_MIN_ORDER_KRW = 5000.0      # KRW 마켓 최소 주문 금액(업비트 기준)
 # 바이낸스: 24h 거래대금(USDT) 상위 N (기본 30)
 BINANCE_UNIVERSE_TOP = int(config.get("binance_universe_top", 30))
-# 바이낸스 V8 스캔: _is_coin_buy_window_now(일봉 09:00 KST 직전 N분)과 동일 창에서 **일 1회** (기본 08:30~09:00).
-# 예전 `binance_v8_interval_minutes`(15분마다)는 제거됨 — state `last_binance_v8_pre_daily_date`로 중복 방지.
+# 코인(업비트·바이낸스 공통): ``_is_coin_buy_window_now`` 일봉 직전 창만 매수. V8→스윙 순서는 국·미장과 동일.
 
 
 def _coin_min_order_krw() -> float:
@@ -931,6 +930,31 @@ def get_held_coins():
     except Exception as e:
         print(f"❌ [코인 조회 실패] {type(e).__name__}: {e}")
         return None
+
+
+def fetch_equity_held_lists_for_position_sync():
+    """국·미 **정규장**일 때만 KIS로 보유 티커를 조회한다.
+
+    비장중에는 API를 호출하지 않고 ``[]`` 를 반환한다(보유 목록 갱신 생략).
+    ``sync_all_positions`` 는 비장중 KIS 시드를 쓰지 않으며 장부로 유령 판정을 보강한다.
+    """
+    skipped = []
+    if is_market_open("KR"):
+        held_kr = get_held_stocks_kr()
+    else:
+        skipped.append("국장")
+        held_kr = []
+    if is_market_open("US"):
+        held_us = get_held_stocks_us()
+    else:
+        skipped.append("미장")
+        held_us = []
+    if skipped:
+        print(
+            f"  💤 [보유 조회] {'·'.join(skipped)} 비장중 — KIS 보유 목록 갱신 생략 (코인·장부 동기화는 계속)"
+        )
+    return held_kr, held_us
+
 
 # =====================================================================
 # 5. 기상청 + MDD 브레이크 (ADX 횡보장 완벽 방어형)
@@ -2497,38 +2521,81 @@ def _telegram_sl_clause(market: str, curr_p: float, pos: dict) -> str:
     return f" · 매도선 {int(sl):,}원 (vs {pct:+.1f}%p)"
 
 
+def _kr_holdings_lines_from_ledger(state: dict, *, weekend_tag: bool) -> list:
+    """KIS 점검·장 개시 전 등 — ``gui_table_adapter`` 장부 폴백과 동일 소스로 보유 줄 생성."""
+    holdings = []
+    for code, pos in (state.get("positions") or {}).items():
+        if not str(code).isdigit():
+            continue
+        buy_p = _to_float(pos.get("buy_p", 0), 0)
+        if buy_p <= 0:
+            continue
+        curr_p = _resolve_curr_price_with_gui_override(pos, float(buy_p))
+        roi = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
+        kr_name = get_kr_company_name(code)
+        if weekend_tag:
+            tag = "(주말·장부평단)"
+            if float(pos.get("curr_p") or 0) > 0 and abs(curr_p - buy_p) > 1e-9:
+                tag = "(주말·마지막현재가)"
+        else:
+            tag = "(장외·장부평단)"
+            if float(pos.get("curr_p") or 0) > 0 and abs(curr_p - buy_p) > 1e-9:
+                tag = "(장외·마지막현재가)"
+        holdings.append(
+            _format_holding_line(
+                "KR",
+                code,
+                kr_name,
+                float(buy_p),
+                float(curr_p),
+                float(roi),
+                pos,
+                source_tag=tag,
+            )
+        )
+    return holdings
+
+
+def _us_holdings_lines_from_ledger(state: dict) -> list:
+    """미장 KIS 상세가 비었을 때(장 외 등) — GUI ``get_held_stocks_us_info`` 폴백과 동일 소스."""
+    is_weekend = bool(kis_equities_weekend_suppress_window_kst())
+    holdings = []
+    for ticker_raw, pos_u in (state.get("positions") or {}).items():
+        t = normalize_ticker(str(ticker_raw))
+        if not t or str(t).isdigit() or is_coin_ticker(t):
+            continue
+        if not isinstance(pos_u, dict):
+            pos_u = {}
+        buy_p = _to_float(pos_u.get("buy_p", 0), 0.0)
+        if buy_p <= 0:
+            continue
+        curr_p = _resolve_curr_price_with_gui_override(pos_u, float(buy_p))
+        roi = ((curr_p - buy_p) / buy_p) * 100
+        us_name = get_us_company_name(t)
+        tag = ""
+        if not is_weekend:
+            tag = "(장외·마지막현재가)" if float(pos_u.get("curr_p") or 0) > 0 and abs(curr_p - buy_p) > 1e-9 else "(장외·장부평단)"
+        holdings.append(
+            _format_holding_line(
+                "US",
+                t,
+                us_name,
+                float(buy_p),
+                float(curr_p),
+                float(roi),
+                pos_u,
+                source_tag=tag,
+            )
+        )
+    return holdings
+
+
 def get_kr_holdings_with_roi():
     """🇰🇷 국장 보유 종목 + 현재 수익률 (balance API 현재가 사용)"""
     try:
         state = load_state(STATE_PATH)
         if kis_equities_weekend_suppress_window_kst():
-            holdings = []
-            for code, pos in (state.get("positions") or {}).items():
-                if not str(code).isdigit():
-                    continue
-                buy_p = _to_float(pos.get("buy_p", 0), 0)
-                if buy_p <= 0:
-                    continue
-                # GUI·장부에 저장된 마지막 현재가가 있으면 텔레 보유 줄에도 동일 표시(없으면 평단)
-                curr_p = _resolve_curr_price_with_gui_override(pos, float(buy_p))
-                roi = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
-                kr_name = get_kr_company_name(code)
-                tag = "(주말·장부평단)"
-                if float(pos.get("curr_p") or 0) > 0 and abs(curr_p - buy_p) > 1e-9:
-                    tag = "(주말·마지막현재가)"
-                holdings.append(
-                    _format_holding_line(
-                        "KR",
-                        code,
-                        kr_name,
-                        float(buy_p),
-                        float(curr_p),
-                        float(roi),
-                        pos,
-                        source_tag=tag,
-                    )
-                )
-            return holdings
+            return _kr_holdings_lines_from_ledger(state, weekend_tag=True)
         bal = ensure_dict(get_balance_with_retry())
         kr_output1 = bal.get('output1', []) if isinstance(bal.get('output1'), list) else []
         
@@ -2542,7 +2609,13 @@ def get_kr_holdings_with_roi():
                 continue
             
             pos = state.get('positions', {}).get(code, {})
-            buy_p = _to_float(pos.get('buy_p', 0), 0)
+            buy_p = _to_float(pos.get("buy_p", 0), 0)
+            api_avg = _to_float(
+                stock.get("pchs_avg_prc", stock.get("pchs_avg_pric", 0)),
+                0.0,
+            )
+            if buy_p <= 0 and api_avg > 0:
+                buy_p = float(api_avg)
             if buy_p <= 0:
                 continue
             
@@ -2568,9 +2641,12 @@ def get_kr_holdings_with_roi():
                     pos,
                 )
             )
-        
+        # 장 개시 전: KIS output1이 비었거나(또는 장부 평단 미기입으로 전부 스킵) GUI는 장부 폴백을 쓴다 → 텔레도 동일
+        if not holdings and not bool(is_market_open("KR")):
+            return _kr_holdings_lines_from_ledger(state, weekend_tag=False)
+
         return holdings
-    except:
+    except Exception:
         return []
 
 def get_us_holdings_with_roi():
@@ -2580,8 +2656,10 @@ def get_us_holdings_with_roi():
         # GUI와 동일한 함수 사용
         us_data = get_held_stocks_us_detail()
         if not us_data:
+            if not bool(is_market_open("US")):
+                return _us_holdings_lines_from_ledger(state)
             return []
-        
+
         holdings = []
         is_weekend = bool(kis_equities_weekend_suppress_window_kst())
         is_us_open = bool(is_market_open("US"))
@@ -2765,7 +2843,7 @@ def heartbeat_report():
 # ---------------------------------------------------------------------
 # 이 블록은 **주문·조회·동기화**가 한 사이클에 모이므로, 디버깅 시 다음 순서로 로그를 추적하면 된다.
 #   1) ``_prepare_cycle_state`` — 장부 로드·키 정규화·KIS/업비트 토큰 갱신
-#   2) ``_sync_positions_for_cycle`` — 국·미·코인 실보유 조회 성공 시에만 ``sync_all_positions`` 호출
+#   2) ``_sync_positions_for_cycle`` — 코인 실조회 + 국·미는 장중에만 KIS 보유 조회 후 ``sync_all_positions``
 #      (실패 시 ``[장부 동기화 건너뜀]`` + 실패 시장 목록, ``sync_positions`` 모듈이 이어서 상세 출력)
 #   3) ``_build_market_context`` — 날씨·거시(macro_mult)·합산 서킷
 #   4) 시장별 엔진 — 매도 루프(방어) 후 매수 루프(진입). 매수는 **시간창·지수·날씨·예산·시그널·AI·TWAP** 순으로 게이트.
@@ -2789,12 +2867,13 @@ def _sync_positions_for_cycle(state: dict) -> None:
     """
     실계좌 보유와 ``bot_state.positions`` 를 맞춘다.
 
-    - 세 시장(국·미·코인) 조회가 **모두 성공**해야 ``sync_all_positions`` 를 호출한다.
+    - 코인은 항상 실조회. 국·미는 **정규장**일 때만 KIS 보유 목록을 조회하고, 비장중에는
+      ``[]`` 로 넘겨 API를 부르지 않는다.
+    - 세 조회가 **모두 성공**해야 ``sync_all_positions`` 를 호출한다(국·미 비장중 ``[]`` 는 성공).
     - 하나라도 ``None`` 이면 동기화를 **건너뛰고** 기존 장부를 유지한다(부분 정보로 유령 삭제하는 것을 방지).
       이 경우 반드시 ``[장부 동기화 건너뜀]`` 로그가 출력된다.
     """
-    held_kr = get_held_stocks_kr()
-    held_us = get_held_stocks_us()
+    held_kr, held_us = fetch_equity_held_lists_for_position_sync()
     held_coins = get_held_coins()
 
     if held_kr is not None and held_us is not None and held_coins is not None:
@@ -3057,45 +3136,6 @@ def _is_coin_buy_window_now(now_coin: datetime) -> tuple[bool, datetime, datetim
     coin_close = now_coin.replace(hour=9, minute=0, second=0, microsecond=0)
     coin_buy_start = coin_close - timedelta(minutes=BUY_WINDOW_MINUTES_BEFORE_CLOSE)
     return coin_buy_start <= now_coin < coin_close, coin_buy_start, coin_close
-
-
-def _binance_should_run_v8_scan(state: dict, now_kst) -> bool:
-    """바이낸스 V8: 일봉(UTC 00:00 ≈ KST 09:00) 갱신 **직전** 창에서 분기 매매틱당 **일 1회**.
-
-    시간창은 ``_is_coin_buy_window_now`` 와 동일(``buy_window_minutes_before_close`` — 기본 30 → 08:30~09:00 KST).
-    """
-    d = now_kst.strftime("%Y-%m-%d")
-    if state.get("last_binance_v8_pre_daily_date") == d:
-        return False
-    in_win, _, _ = _is_coin_buy_window_now(now_kst)
-    return bool(in_win)
-
-
-def _binance_mark_v8_scan_done(state: dict, now_kst) -> None:
-    state["last_binance_v8_pre_daily_date"] = now_kst.strftime("%Y-%m-%d")
-    state.pop("last_binance_v8_scan_slot_key", None)
-    state.pop("last_binance_v8_scan_hour_key", None)
-
-
-def _binance_should_run_swing_scan(state: dict, now_kst) -> bool:
-    """바이낸스 SWING: KST 09:00(UTC 일봉) 이후 **09:15·09:30·09:45** 분기 틱 중 첫 번째에서 **일 1회**.
-
-    과거 09:05~09:14 조건은 GUI/헤드리스 매매가 **:00/:15/:30/:45**에만 실행되어
-    **시간대가 겹치지 않아** 스윙이 사실상 동작하지 않았음.
-    """
-    d = now_kst.strftime("%Y-%m-%d")
-    if state.get("last_binance_swing_run_date") == d:
-        return False
-    if now_kst.hour != 9:
-        return False
-    # 분기 정렬(0,15,30,45)만 들어온다고 가정. 09:00은 일봉 직후라 제외하고 09:15부터.
-    if int(now_kst.minute) // 15 < 1:
-        return False
-    return True
-
-
-def _binance_mark_swing_scan_done(state: dict, now_kst) -> None:
-    state["last_binance_swing_run_date"] = now_kst.strftime("%Y-%m-%d")
 
 
 def _extract_held_coins_from_balances(balances) -> list[str]:
@@ -3380,7 +3420,7 @@ def run_trading_bot():
 
     순서 개요
         1) ``bot_state`` 로드·키 정규화, 브로커 토큰 갱신.
-        2) 실계좌 vs 장부 ``sync_all_positions`` (누락 자동복구·유령 삭제·평단 보정).
+        2) 실계좌 vs 장부 ``sync_all_positions`` (국·미 보유는 정규장에만 KIS 갱신; 코인·장부는 매 틱).
         3) 시장 날씨·거시 방어막·Phase5 월요일 주차 고점·합산 서킷(MDD).
         4) 보유 종목 위주 손절/익절·(조건 시) TWAP 청산 등.
         5) 스크리너 후보에 대해 섹터락·AI필터·매수 윈도·TWAP 매수.
@@ -3401,6 +3441,11 @@ def run_trading_bot():
     _sync_positions_for_cycle(state)
     weather, macro_mult, macro_reason = _build_market_context(state)
     state = load_state(STATE_PATH)
+
+    _cycle_buy_fills = 0
+    _cycle_buy_zone_kr = False
+    _cycle_buy_zone_us = False
+    _cycle_buy_zone_coin = False
 
     try:
         with open(BASE_DIR / "kr_targets.json", "r", encoding="utf-8") as f:
@@ -3722,6 +3767,7 @@ def run_trading_bot():
                     f"현재 {now_kr.strftime('%H:%M')})"
                 )
             else:
+                _cycle_buy_zone_kr = True
                 # 지수 급락 체크
                 kr_index_change = get_market_index_change("KR")
                 print(f"  📊 [KOSPI 지수] 변화율: {kr_index_change:+.2f}% 날씨는 {weather['KR']}")
@@ -3920,6 +3966,8 @@ def run_trading_bot():
                                     f"  ⏭️ {kr_name}({t}): [KR 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
                                     f"예산 {int(target_budget):,}원, 현재가 {int(curr_p):,}원 (TWAP 슬라이스·KIS·예수 확인)"
                                 )
+                            else:
+                                _cycle_buy_fills += 1
                             kr_cash = int(kr_box[0])
                         except Exception as e:
                             print(f"  ❌ [KR BUY 예외] {t}: {type(e).__name__}: {e}")
@@ -4265,6 +4313,7 @@ def run_trading_bot():
                     f"현재 {now_ny.strftime('%H:%M')})"
                 )
             else:
+                _cycle_buy_zone_us = True
                 # 지수 급락 체크
                 us_index_change = get_market_index_change("US")
                 print(f"  📊 [S&P500 지수] 변화율: {us_index_change:+.2f}% 날씨는 {weather['US']}")
@@ -4446,6 +4495,8 @@ def run_trading_bot():
                                         f"  ⏭️ {us_name}({t}): [US 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
                                         f"배정 ${target_budget:.2f}, 종가 ${curr_p:.2f} (TWAP·KIS·예수 확인)"
                                     )
+                                else:
+                                    _cycle_buy_fills += 1
                                 us_cash = float(us_box[0])
                             except Exception as e:
                                 print(f"  ❌ [US BUY 예외] {t}: {type(e).__name__}: {e}")
@@ -4767,38 +4818,20 @@ def run_trading_bot():
         elif in_account_circuit_cooldown(state):
             print("  -> 🚨 코인 Phase5 계좌 서킷 쿨다운 — 신규 매수 중단.")
         else:
-            # 업비트: KST 일봉 창 직전 N분만 매수. 바이낸스: V8=일봉(09:00) 갱신 전 동일 창·일1회 / SWING=09:15~09:45
+            # 업비트·바이낸스 동일: KST 일봉(09:00) 직전 N분 창 — 국·미 ``마감 직전 창`` 과 같은 패턴.
             now_coin = datetime.now(pytz.timezone("Asia/Seoul"))
-            use_bn_sched = bool(coin_config.is_binance())
-            do_bn_v8 = False
-            do_bn_sw = False
-            run_v8_signals = True
-            run_swing_signals = True
-            skip_buy = False
-
-            if use_bn_sched:
-                do_bn_v8 = _binance_should_run_v8_scan(state, now_coin)
-                do_bn_sw = _binance_should_run_swing_scan(state, now_coin)
-                run_v8_signals = do_bn_v8
-                run_swing_signals = do_bn_sw
-                skip_buy = not do_bn_v8 and not do_bn_sw
-                if skip_buy:
-                    print(
-                        f"  ⏳ [BINANCE 매수 대기] V8·상위{BINANCE_UNIVERSE_TOP}·일봉 직전 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분(기본 08:30~09:00) 일1회 / "
-                        f"SWING·09:15~09:45 첫틱·일1회 — 이번 틱 미해당 "
-                        f"(지금 {now_coin.strftime('%H:%M')} KST)"
-                    )
-            else:
-                is_coin_buy_time, _coin_buy_start, _coin_close = _is_coin_buy_window_now(now_coin)
-                skip_buy = not is_coin_buy_time
-                if skip_buy:
-                    print(
-                        f"  ⏳ [COIN 매수 대기] 일봉 기준점 직전 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분만 매수 "
-                        f"({_coin_buy_start.strftime('%H:%M')}~{_coin_close.strftime('%H:%M')} KST, "
-                        f"현재 {now_coin.strftime('%H:%M')})"
-                    )
+            is_coin_buy_time, _coin_buy_start, _coin_close = _is_coin_buy_window_now(now_coin)
+            skip_buy = not is_coin_buy_time
+            if skip_buy:
+                _coin_sched_tag = "BINANCE" if coin_config.is_binance() else "COIN"
+                print(
+                    f"  ⏳ [{_coin_sched_tag} 매수 대기] 일봉 기준점 직전 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분만 매수 "
+                    f"({_coin_buy_start.strftime('%H:%M')}~{_coin_close.strftime('%H:%M')} KST, "
+                    f"현재 {now_coin.strftime('%H:%M')})"
+                )
 
             if not skip_buy:
+                _cycle_buy_zone_coin = True
                 # 지수 급락 체크
                 coin_index_change = get_market_index_change("COIN")
                 print(f"  📊 [BTC 지수] 변화율: {coin_index_change:+.2f}% 날씨는 {coin_weather}")
@@ -4840,12 +4873,10 @@ def run_trading_bot():
                                 scan_targets = []
                                 _ohlcv_pref = {}
 
-                            _sched_note = ""
-                            if use_bn_sched:
-                                _sched_note = (
-                                    f" [V8={'ON' if do_bn_v8 else 'off'}, SWING={'ON' if do_bn_sw else 'off'}]"
-                                )
-                            print(f"  -> 🪙 코인 실시간 수급 상위 {len(scan_targets)}개 정밀 분석 시작!{_sched_note}")
+                            print(
+                                f"  -> 🪙 코인 실시간 수급 상위 {len(scan_targets)}개 정밀 분석 시작! "
+                                f"(매수 판단: V8→스윙, 국·미장과 동일)"
+                            )
                             for idx, t in enumerate(scan_targets, 1):
                                 if in_ticker_cooldown(state, t):
                                     print(
@@ -4931,24 +4962,18 @@ def run_trading_bot():
 
                                 strategy_type = "TREND_V8"
                                 entry_fib_level = 0.0
-                                is_buy = False
-                                sl_p = 0.0
-                                s_name = ""
-
-                                if run_v8_signals:
-                                    is_buy, sl_p, s_name = calculate_pro_signals(
-                                        ohlcv, coin_weather, t, get_coin_name(t), idx, len(scan_targets)
-                                    )
-                                    if is_buy:
-                                        print(f"  ✅ [V8-BUY] {t} 진입")
-                                if not is_buy and run_swing_signals:
+                                is_buy, sl_p, s_name = calculate_pro_signals(
+                                    ohlcv, coin_weather, t, get_coin_name(t), idx, len(scan_targets)
+                                )
+                                if is_buy:
+                                    print(f"  ✅ [V8-BUY] {t} 진입")
+                                else:
                                     sw_ok, sw_fib, sw_why = check_swing_entry(pd.DataFrame(ohlcv))
                                     if sw_ok:
                                         strategy_type = "SWING_FIB"
                                         entry_fib_level = float(sw_fib)
                                         sl_p = float(sw_fib)
                                         s_name = "SWING_FIB"
-                                        is_buy = True
                                         print(f"  ✅ [SWING-BUY] {t} entry_fib={entry_fib_level:,.2f}")
                                     else:
                                         _cn = get_coin_name(t)
@@ -4956,8 +4981,6 @@ def run_trading_bot():
                                         _disp = f"{_cn}({t})" if _cn and _cn != t else t
                                         print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
                                         continue
-                                if not is_buy:
-                                    continue
 
                                 if not can_open_new(t, state, max_positions=MAX_POSITIONS_COIN):
                                     print(f"  ⏭️ {t}: 포지션 개수 초과 ({MAX_POSITIONS_COIN}개) (패스)")
@@ -4999,15 +5022,18 @@ def run_trading_bot():
                                         f"  ⏭️ {t}: [COIN 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
                                         f"예산 {int(budget):,}원, 주문가능 추정 {int(krw_box[0]):,}원 (TWAP·최소주문·업비트 응답 확인)"
                                     )
+                                else:
+                                    _cycle_buy_fills += 1
                                 krw_bal = float(krw_box[0])
-
-                            if use_bn_sched and (do_bn_v8 or do_bn_sw):
-                                if do_bn_v8:
-                                    _binance_mark_v8_scan_done(state, now_coin)
-                                if do_bn_sw:
-                                    _binance_mark_swing_scan_done(state, now_coin)
     else:
         print("💤 코인은 점검 또는 데이터 조회 불가 상태입니다.")
+
+    if (_cycle_buy_zone_kr or _cycle_buy_zone_us or _cycle_buy_zone_coin) and _cycle_buy_fills == 0:
+        send_telegram(
+            "📭 [매수 패스] 이번 사이클: KR / US / COIN 중 매수 가능 시간·조건 구간이었으나 "
+            "신규 매수 체결이 없었습니다.\n"
+            "(시그널 없음·AI 필터·예산·최소주문·TWAP 미체결 등)"
+        )
 
     save_state(STATE_PATH, state)
     print("="*60)
@@ -5127,8 +5153,7 @@ def main() -> None:
         sys.exit(1)
     print("[초기화] 완료.")
 
-    held_kr = get_held_stocks_kr()
-    held_us = get_held_stocks_us()
+    held_kr, held_us = fetch_equity_held_lists_for_position_sync()
     held_coins = get_held_coins()
 
     state = load_state(STATE_PATH)

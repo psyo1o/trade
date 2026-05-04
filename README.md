@@ -179,12 +179,20 @@ flowchart TD
   B --> C[리스크: MDD / Phase5 서킷 / 거시 / 섹터 등]
   C --> D[매도 루프 KR → US → COIN]
   D --> E[매수 루프 KR → US → COIN]
-  E --> F[장부·이력 저장]
+  E --> F{매수 존·조건 충족인데 신규 체결 0건?}
+  F -->|예| G[텔레그램 매수 패스]
+  F -->|아니오| H[알림 생략]
+  G --> I[장부·이력 저장]
+  H --> I
 ```
+
+**동기화:** 국·미 **정규장이 아닐 때는 KIS로 보유 티커 목록을 새로 조회하지 않습니다**(`fetch_equity_held_lists_for_position_sync`). 코인 보유 조회와 장부 동기화는 매 사이클 계속합니다. 비장중에 KIS가 빈 보유를 주어도 장부 국·미 줄이 유령 삭제되지 않도록 `sync_all_positions` 에서 `held` 보강 등을 합니다.
 
 **매도 쪽 주의:** 포지션마다 `strategy_type` 이 있습니다. **`SWING_FIB`** 이면 스윙 전용 청산만 타고, 그 외는 **V8 계열**(분할 익절·타임스탑·하드스탑·샹들리에 등)을 탑니다.
 
-**매수 쪽:** 종목마다 **먼저 V8 신호**(`calculate_pro_signals`)를 보고, 실패 시 **스윙 보조**(`check_swing_entry`)를 봅니다.
+**매수 쪽:** 종목마다 **먼저 V8 신호**(`calculate_pro_signals`)를 보고, 실패 시 **스윙 보조**(`check_swing_entry`)를 봅니다. **코인(업비트·바이낸스 공통)** 도 동일한 **일봉 직전 KST 창** 안에서만 매수 판단하며, 진입 순서도 국·미와 같습니다.
+
+**텔레그램(운영 알림):** 이번 사이클에 KR·US·COIN 중 **어느 한쪽이라도 “매수 시간창·게이트까지 진입”**했는데 **신규 매수 TWAP 성공이 한 건도 없으면**, 사이클 종료 시 `📭 [매수 패스] …` 한 통을 보냅니다(`utils/telegram.py`의 일반 텍스트 `sendMessage`). 세 시장 모두 매수창 밖이면 보내지 않습니다.
 
 ---
 
@@ -196,8 +204,9 @@ flowchart TD
 - 읽고 쓰는 대표 파일: `config.json`, `bot_state.json`, `trade_history.json`.
 - **Phase 5** 합산 서킷용으로 브로커에서 가져온 국·미·코인 평가액을 **`circuit_aux_last_*`** 에 넣고, **`peak_total_equity` / `last_reset_week`** 로 **월요일(서울) 주차별 트레일링 MDD** 를 관리합니다. 고점은 **`peak_total_equity` 단일 키**가 소스이며, 옛 **`peak_equity_total_krw`** 가 남아 있으면 `execution/guard.py` 의 `load_state()` 에서 **한 번 이관 후 삭제**합니다.
 - US 스냅샷(`services/account_snapshot.py`)은 미장 예수금/총평가가 간헐적으로 튈 때 직전 `last_kis_display_snapshot.us`로 폴백해 텔레그램/GUI 표시를 안정화합니다.
-- KR/US 잔고 정책: **장중에만 KIS 실조회**, **장외(휴장/점검)에는 `last_kis_display_snapshot` 고정값 사용**. 코인은 기존대로 실조회합니다.  
-- **`sync_all_positions`:** `run_bot.is_market_open("KR")` / `"US"` 가 **False** 인 시장은 **KIS 시드·평단 보정·유령 삭제·주식 자동복구**를 하지 않아 **휴장일에 장부가 KIS만 보고 흔들리지 않게** 했습니다(코인 동기화는 계속). 주식 **자동복구**로 새 행을 넣을 때 **`buy_date`** 는 가능하면 **`trade_history.json`** 에서 해당 티커·시장의 **가장 최근 `BUY`의 `timestamp`** 를 씁니다(없을 때만 복구 시각).
+- KR/US 잔고 정책(GUI 스냅샷 등): **장중에만 KIS 실조회**, **장외(휴장/점검)에는 `last_kis_display_snapshot` 고정값 사용**. 코인은 기존대로 실조회합니다.  
+- **`_sync_positions_for_cycle` / `fetch_equity_held_lists_for_position_sync`:** 동기화 시 국·미가 **정규장이 아니면 KIS 보유 목록 API를 호출하지 않고** 빈 리스트로 넘깁니다. **`sync_all_positions`** 안에서 비장중·빈 보유 대비 **장부 키로 `held` 보강** 등으로 유령 일괄 삭제를 막습니다. 시장이 **False** 인 경우 **KIS 시드·평단 보정·유령 삭제·주식 자동복구** 루프는 실행하지 않습니다(코인 동기화는 계속). 주식 **자동복구**로 새 행을 넣을 때 **`buy_date`** 는 가능하면 **`trade_history.json`** 에서 해당 티커·시장의 **가장 최근 `BUY`의 `timestamp`** 를 씁니다(없을 때만 복구 시각).
+- **매수 패스 텔레그램:** 위 [한 사이클](#5-한-사이클-안에서-일어나는-일) 참고.
 - **매도 후 Layer2:** 전량 청산 시 `set_ticker_cooldown_after_sell`(전략·시장·사유 매트릭스). 수동 매도는 `_apply_manual_sell_state_update`·`_run_manual_sell_position_sync` 경로.
 - **관측성:** 예산·예수·TWAP·시장별 스킵은 `[KR …]`, `[US …]`, `[COIN …]` 등 태그 로그로 남깁니다. 모듈 상단 docstring에 grep용 태그 요약이 있습니다.
 
@@ -352,6 +361,7 @@ flowchart TD
 - **시장별:** `[KR …]`, `[US …]`, `[COIN …]` — 예산·예수·정수주 0·TWAP 미체결·BEAR+ADX 스킵 등.
 - **V8 스캔:** `🔍 [V8] [n/N] 종목 … ❌ 패스:` 또는 통과 시 `🔥 [V8] …`.
 - **스윙 보조:** V8 실패 뒤 `🔍 [스윙] … ❌ 패스: 사유` 또는 `✅ [SWING-BUY] …`.
+- **매수 패스(텔레그램):** KR/US/COIN 중 매수 가능 구간이었는데 이번 사이클에 신규 매수 체결이 없으면 `📭 [매수 패스] …`(본문은 코드 `run_bot.py` 와 동일). `telegram_token` / `telegram_chat_id` 필수.
 - **스냅샷/GUI:** `[snapshot …]`, 조회 폴백은 `📌` / `⚠️` 한 줄.
 - **Phase5:** `[Phase5 서킷]` 등 (구체 문자열은 런타임 로그 참고).
 
@@ -381,10 +391,10 @@ flowchart TD
 | `krw_per_usdt` | (선택) 1 USDT당 원화. 없으면 Yahoo `USDKRW=X` 등으로 추정(401 소음·실패 가능) — **직접 입력 권장**. |
 | `binance_min_cost_usdt` | (선택) 최소 주문 명목(USDT), 기본 10 근처 — CCXT 마켓 정보와 함께 최소금액 검사에 사용. |
 | `binance_universe_top` | (선택) 24h USDT 거래대금 상위 N개만 스캔, 기본 **30**. |
-| `buy_window_minutes_before_close` | (선택) 코인 **일봉 기준점(KST 09:00 = 바이낸스 UTC 일봉 경계)** 직전 N분만 매수 허용. 업비트 코인 매수 창과 동일하며, **바이낸스 V8 스캔도 이 창 안에서 일 1회**(기본 N=30 → **08:30~09:00** 분기 매매틱 중 첫 틱). |
+| `buy_window_minutes_before_close` | (선택) 코인 **일봉 기준점(KST 09:00 = 바이낸스 UTC 일봉 경계)** 직전 N분만 매수 허용. **업비트·바이낸스 동일 창**(기본 N=30 → **08:30~09:00** KST). 이 창 안에서는 **KST 분기 매매틱(`:00/:15/:30/:45`)마다** V8→스윙 매수 판단을 반복합니다. |
 | `coin_min_notional_usd` | (선택) 코인 **잔고·GUI** 에서 제외할 최소 **명목(USD)**. 기본 **1** (바이낸스: USDT, 업비트: 달러 환산 KRW). 가격 조회 실패 시 옛 **수량** 먼지 기준으로 폴백. |
 
-구현: `api/coin_config.py`, `api/coin_broker.py`(공통 진입), `api/binance_api.py`(CCXT). 의존성: **`ccxt`** (`requirements.txt`). 바이낸스 **시장가** 체결 시 터미널·로그에 `[BINANCE MARKET BUY]` / `[BINANCE MARKET SELL]` … `USDT` 형식이 붙습니다. **바이낸스 V8**은 일봉 갱신 직전 창에서 상위 N USDT를 스캔합니다(구 `binance_v8_interval_minutes` 15분 주기는 폐기). SWING은 **KST 9시대·분기 매매틱(09:15 / 09:30 / 09:45) 중 첫 틱에서 하루 1회** `check_swing_entry` 만 돌립니다(일봉 직후 09:00 틱은 제외). **수수료를 BNB로 할인**하려면 바이낸스 웹에서 켜 두면 됩니다(API와 별개).
+구현: `api/coin_config.py`, `api/coin_broker.py`(공통 진입), `api/binance_api.py`(CCXT). 의존성: **`ccxt`** (`requirements.txt`). 바이낸스 **시장가** 체결 시 터미널·로그에 `[BINANCE MARKET BUY]` / `[BINANCE MARKET SELL]` … `USDT` 형식이 붙습니다. **바이낸스**도 **업비트와 같은 일봉 직전 창**에서 상위 N USDT 종목에 대해 **V8 → 스윙** 순으로 진입을 판단합니다(구 `binance_v8_interval_minutes`·일 1회 제한·별도 스윙 시간대는 폐기). **수수료를 BNB로 할인**하려면 바이낸스 웹에서 켜 두면 됩니다(API와 별개).
 
 **Yahoo Finance (`yfinance`):** 미장 보조 시세·일부 환율 추정 등에 쓰이며 **공식 API가 아니라** Yahoo가 401·`Invalid Crumb`·접근 제한 메시지를 줄 수 있다(증권·코인 거래소 인증 오류와 무관). 완화: `pip install -U "yfinance>=0.2.48"`, **`krw_per_usdt`를 `config.json`에 직접 두면** 바이낸스 쪽 USDKRW Yahoo 호출이 줄어든다. 봇은 `yfinance`/`urllib3` 로거 레벨을 올려 터미널 소음을 줄인다 — 메시지가 **무조건 사라지진 않을 수 있다**(라이브러리가 `print` 하는 경우).
 
@@ -398,7 +408,7 @@ flowchart TD
 
 ### 시간·리스크
 
-- `buy_window_minutes_before_close` — 국·미·코인(일봉 09:00 KST 직전) 통합: **장·일봉 마감 N분 전만** 매수(코인: 업비트·바이낸스 V8 일1회 창에 동시 적용).
+- `buy_window_minutes_before_close` — 국·미·코인(일봉 09:00 KST 직전) 통합: **장·일봉 마감 N분 전만** 매수(코인: 업비트·바이낸스 **동일 창**, 창 안 매 틱 재판단).
 - `account_circuit_enabled`, `account_circuit_mdd_pct` — 이번 주 **`peak_total_equity`** 대비 합산 하락률(%) 임계(기본 15). `(peak - current) / peak * 100 >= 임계` 시 발동.
 - `account_circuit_cooldown_hours` — 쿨다운 후 **고점을 현재 총자산으로 1회 리셋**해 연쇄 발동을 줄임.
 

@@ -53,8 +53,9 @@ run_bot.py
   - refresh_circuit_aux_from_brokers(state, path) … 브로커만으로 동일 키 재기록(adjust_capital 등)
   - 관측성: [KR …], [US …], [COIN …] 태그. 매수 스캔은 rules.calculate_pro_signals 안에서 [V8],
     스윙 보조는 check_swing_entry 실패 시 [스윙] 한 줄(run_bot에서 출력).
-  - 바이낸스 V8: 일봉(≈KST 09:00) 직전 ``buy_window_minutes_before_close`` 분 창(기본 08:30~09:00)에서 분기 틱 일 1회(`last_binance_v8_pre_daily_date`).
-    SWING은 KST 9시대 09:15/09:30/09:45 첫 틱에서 일 1회.
+  - 코인 매수 창: 업비트·바이낸스 공통 ``_is_coin_buy_window_now`` (일봉 KST 09:00 직전 N분). 창 안에서는 매 분기 틱마다 V8→스윙 진입 판단(국·미와 동일 순서).
+  - 동기화: ``fetch_equity_held_lists_for_position_sync`` — 국·미 비정규장이면 KIS 보유 목록 조회 생략. ``sync_all_positions`` 에서 비장중 held 보강 등.
+  - 사이클 말: 매수 존에 들었으나 신규 체결 0건이면 텔레그램 ``[매수 패스]`` (utils/telegram.send_telegram).
 
 run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI 사용 안내」)
   - PyQt5. import run_bot 순간 config 로드 → config 수정 후에는 GUI 재시작.
@@ -145,7 +146,7 @@ execution/
     compute_ticker_cooldown_hours / set_ticker_cooldown_after_sell (Layer2 ticker_cooldowns:
     전략·시장·사유 매트릭스(h), 분할 잔량 시 미부여)
   sync_positions.py … 실계좌↔장부. KR/US 휴장(is_market_open False)이면 KIS 시드·유령·주식 자동복구 생략(코인은 계속).
-    자동복구 buy_date 는 trade_history 마지막 BUY 우선. held∪live_seeds 보수적 유령 판단 등
+    비장중 KIS 빈 보유 시 장부 키로 held 보강(유령 일괄 삭제 방지). 자동복구 buy_date 는 trade_history 마지막 BUY 우선. held∪live_seeds 보수적 유령 판단 등
   order_twap.py … Phase2 TWAP
   scale_out.py … V8 분할 익절(Scale-Out); post_partial_ledger(..., set_scale_out_done=True 기본),
     수동 부분 매도는 False로 자동 분할익절 플래그와 분리
@@ -177,9 +178,10 @@ tests/
        - 분할익절(Scale-Out, TWAP 임계 적용) → 타임스탑·하드스탑·샹들리에
        - 타임스탑 reason 태그: [V8_TIME_STOP_*], [SWING_TIME_STOP_*] — ticker_cooldowns는 guard.py
        - 타임스탑/하드스탑/샹들리에 전량 청산: 단일 시장가 주문(재시도). TWAP는 매수·분할익절 전용(의도 설계)
-  5) 매수 … KR → US → COIN (시간창·슬롯·필터 통과 시)
-       - V8 calculate_pro_signals 우선, 실패 시 check_swing_entry 보조
-  6) trade_history / bot_state 저장
+  5) 매수 … KR → US → COIN (시간창·필터 통과 시)
+       - V8 calculate_pro_signals 우선, 실패 시 check_swing_entry 보조 (코인도 동일·업비트=바이낸스 동일 일봉 직전 창)
+  6) (선택) 매수 존·조건 충족인데 신규 체결 0건 → 텔레그램 [매수 패스]
+  7) trade_history / bot_state 저장
 
 
 --------------------------------------------------------------------------------

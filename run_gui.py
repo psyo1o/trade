@@ -331,7 +331,12 @@ class BalanceUpdaterThread(QThread):
             if self.sync_first:
                 try:
                     state = load_state(STATE_PATH)
-                    sync_all_positions(state, run_bot.get_held_stocks_kr(), run_bot.get_held_stocks_us(), run_bot.get_held_coins(), STATE_PATH)
+                    _hk, _hu = run_bot.fetch_equity_held_lists_for_position_sync()
+                    _hc = run_bot.get_held_coins()
+                    if _hk is not None and _hu is not None and _hc is not None:
+                        sync_all_positions(state, _hk, _hu, _hc, STATE_PATH)
+                    else:
+                        print("  ⚠️ [GUI 장부 동기화 건너뜀] 실보유 조회 실패 — 기존 장부 유지")
                 except Exception as e:
                     print(f"⚠️ 장부 동기화 중 오류: {e}")
 
