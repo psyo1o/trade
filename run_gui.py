@@ -46,6 +46,7 @@ from utils.helpers import (
     get_us_company_name,
     is_coin_ticker,
     kis_equities_weekend_suppress_window_kst,
+    normalize_ticker,
     seconds_until_next_quarter_hour,
     seconds_until_next_half_hour,
 )
@@ -237,24 +238,6 @@ class CapitalAdjustThread(QThread):
             self.done.emit(False, f"{type(e).__name__}: {e}")
 
 
-def _gui_saved_curr_p_from_state(state_path, ticker_code):
-    """
-    ``bot_state.json`` ``positions[ticker].curr_p`` — ``update_max_price_if_higher`` 가
-    **해당 시장 정규장**에 GUI로 확인한 마지막 현재가. 휴장·KIS 점검 창에는 라이브 조회 대신 표시용으로 쓴다.
-    """
-    try:
-        st = load_state(state_path)
-        pos = st.get("positions") or {}
-        t = str(ticker_code).strip().upper()
-        row = pos.get(t)
-        if not isinstance(row, dict):
-            return None
-        v = float(row.get("curr_p") or 0)
-        return v if v > 0 else None
-    except Exception:
-        return None
-
-
 # =====================================================================
 # 🚀 [비동기 일꾼] API 통신 및 현재가(야후/업비트) 조회 전담 스레드
 # =====================================================================
@@ -404,32 +387,40 @@ class BalanceUpdaterThread(QThread):
         buy_p = float(price_str)
         current_price, roi = buy_p, 0.0
 
+        ledger_key = ""
         try:
             m = "KR" if market_code == "KR" else ("US" if market_code == "US" else "COIN")
-            cp_api = current_p_api
-            suppress_kis = bool(kis_equities_weekend_suppress_window_kst())
-            saved_p = _gui_saved_curr_p_from_state(STATE_PATH, ticker_code) if m in ("KR", "US") else None
-            if m in ("KR", "US"):
-                cp_api = run_bot.normalize_equity_current_p_api_for_display(
-                    market=m,
-                    buy_p=buy_p,
-                    current_p_api=current_p_api,
-                    is_market_open_now=bool(run_bot.is_market_open(m)),
-                    is_weekend=suppress_kis,
-                )
-            if suppress_kis and m in ("KR", "US"):
-                current_price = saved_p if saved_p is not None else buy_p
-            else:
-                current_price = run_bot.resolve_display_current_price(m, ticker_code, buy_p, cp_api)
+            # 국·미는 장부 키가 normalize_ticker(6자리·대문자) 기준 — pdno가 int/앞자리0 누락이면 조회 실패해 curr_p가 비었다고 나옴
+            ledger_key = (
+                normalize_ticker(str(ticker_code))
+                if m in ("KR", "US")
+                else str(ticker_code).strip().upper()
+            )
+            st = load_state(STATE_PATH)
+            pos = (st.get("positions") or {}).get(ledger_key, {})
+            if not isinstance(pos, dict):
+                pos = {}
+            current_price = run_bot.resolve_holding_display_price(
+                m, ledger_key, buy_p, current_p_api, pos
+            )
 
             if current_price > 0 and self.dashboard:
-                self.dashboard.update_max_price_if_higher(ticker_code, current_price)
+                self.dashboard.update_max_price_if_higher(ledger_key, current_price)
 
             if buy_p > 0: roi = ((current_price - buy_p) / buy_p) * 100
         except Exception as e:
             print(f"현재가 조회 에러 ({ticker_code}): {e}")
 
-        return {"market": market, "name": name, "qty": qty, "buy_p_float": buy_p, "current_price": current_price, "roi": roi, "m_code": market_code, "t_code": ticker_code}
+        return {
+            "market": market,
+            "name": name,
+            "qty": qty,
+            "buy_p_float": buy_p,
+            "current_price": current_price,
+            "roi": roi,
+            "m_code": market_code,
+            "t_code": ledger_key or str(ticker_code).strip().upper(),
+        }
 
 
 class _GuiBackgroundSignals(QObject):

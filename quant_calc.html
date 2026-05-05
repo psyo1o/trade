@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>🚀 V7.1 완전 자동화 자금 & 손익비 대시보드</title>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px; margin: 0; }
+        .container { max-width: 1100px; margin: auto; background-color: #1e1e1e; padding: 30px; border-radius: 12px; box-shadow: 0 8px 16px rgba(0,0,0,0.8); }
+        h1 { text-align: center; color: #4facfe; margin-bottom: 30px; }
+        .section-title { font-size: 1.2rem; color: #a8c0ff; border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 20px; }
+        
+        .global-inputs { display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap; }
+        .input-box { flex: 1; min-width: 200px; background: #2a2a2a; padding: 15px; border-radius: 8px; border: 1px solid #3a3a3a; }
+        .input-box label { display: block; font-size: 14px; margin-bottom: 8px; color: #bbb; }
+        .input-box input { width: 100%; font-size: 20px; padding: 10px; box-sizing: border-box; background: #121212; color: #00ffcc; border: 1px solid #444; border-radius: 5px; text-align: right; }
+        
+        .market-inputs { display: flex; gap: 15px; margin-bottom: 30px; }
+        .market-card { flex: 1; background: #2a2a2a; padding: 20px; border-radius: 8px; border-top: 4px solid #4facfe; text-align: center; }
+        .market-card.kr { border-top-color: #ff6b6b; }
+        .market-card.coin { border-top-color: #feca57; }
+        .market-card h3 { margin-top: 0; margin-bottom: 15px; }
+        .input-row { display: flex; justify-content: center; align-items: center; gap: 10px; }
+        .input-row label { font-size: 16px; color: #ccc; }
+        .input-row input { width: 80px; text-align: center; font-size: 18px; padding: 5px; border-radius: 4px; background: #121212; color: #fff; border: 1px solid #555;}
+        
+        .rr-summary { text-align: center; background: #121212; padding: 15px; border-radius: 8px; border: 1px dashed #feca57; margin-bottom: 20px; font-size: 1.1rem; }
+        .rr-summary span { font-weight: bold; color: #feca57; font-size: 1.3rem; }
+
+        table { width: 100%; border-collapse: collapse; background: #2a2a2a; border-radius: 8px; overflow: hidden; }
+        th, td { padding: 12px 10px; text-align: center; border-bottom: 1px solid #3a3a3a; vertical-align: middle; }
+        th { background-color: #333; color: #fff; font-size: 14px;}
+        td:first-child { font-weight: bold; }
+        
+        .twap-alert { color: #ff9f43; font-weight: bold; font-size: 14px;}
+        .twap-safe { color: #1dd1a1; font-size: 14px;}
+        .highlight { color: #00ffcc; font-weight: bold; font-size: 1.1rem;}
+        
+        .profit { color: #1dd1a1; font-weight: bold; }
+        .loss { color: #ff4757; font-weight: bold; }
+        
+        #totalRatioAlert { color: #ff4757; text-align: center; font-weight: bold; margin-bottom: 20px; display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>🚀 V7.1 자금 & 손익비 오토 시뮬레이터</h1>
+    
+    <div class="section-title">⚙️ 1. 글로벌 시드 & 엔진 설정</div>
+    <div class="global-inputs">
+        <div class="input-box">
+            <label>💰 총 운용 시드 (원)</label>
+            <input type="text" id="totalSeed" value="100,000,000" oninput="formatNumber(this); calculate();">
+        </div>
+        <div class="input-box">
+            <label>🔪 TWAP 기준금액 (원)</label>
+            <input type="text" id="twapThreshold" value="3,000,000" oninput="formatNumber(this); calculate();">
+        </div>
+        <div class="input-box" style="border-color: #1dd1a1;">
+            <label>📈 목표 익절 (%)</label>
+            <input type="number" id="takeProfit" value="10" step="0.5" oninput="calculate()" style="color: #1dd1a1;">
+        </div>
+        <div class="input-box" style="border-color: #ff4757;">
+            <label>📉 최대 손절 (%)</label>
+            <input type="number" id="stopLoss" value="5" step="0.5" oninput="calculate()" style="color: #ff4757;">
+        </div>
+    </div>
+
+    <div class="rr-summary">
+        현재 세팅된 포트폴리오의 <strong>손익비(Risk/Reward Ratio)</strong>는 <span id="rrRatioText">2.00</span> 입니다. 
+        <br><span style="font-size: 0.9rem; color: #888; font-weight: normal;">(1번 지면 1번 이길 때 잃은 돈의 몇 배를 버는가)</span>
+    </div>
+
+    <div class="section-title">📊 2. 시장별 자산 비중 (%) 입력</div>
+    <div id="totalRatioAlert">⚠️ 비중의 합이 100%가 아닙니다! 현재 합계: <span id="currentRatioSum">100</span>%</div>
+    
+    <div class="market-inputs">
+        <div class="market-card">
+            <h3>🇺🇸 미국 주식</h3>
+            <div class="input-row"><input type="number" id="usRatio" value="50" oninput="calculate()"><label>%</label></div>
+        </div>
+        <div class="market-card kr">
+            <h3>🇰🇷 한국 주식</h3>
+            <div class="input-row"><input type="number" id="krRatio" value="30" oninput="calculate()"><label>%</label></div>
+        </div>
+        <div class="market-card coin">
+            <h3>🪙 가상 화폐</h3>
+            <div class="input-row"><input type="number" id="coinRatio" value="20" oninput="calculate()"><label>%</label></div>
+        </div>
+    </div>
+
+    <div class="section-title">📈 3. V7.1 매매 시나리오 결과 (손익비 반영)</div>
+    <table>
+        <thead>
+            <tr>
+                <th>시장</th>
+                <th>시장 배정 예산</th>
+                <th>🤖 자동 슬롯</th>
+                <th>1종목당 투입액</th>
+                <th>예상 익절금액 (종목당)</th>
+                <th>최대 손실금액 (종목당)</th>
+                <th>TWAP 분할매매</th>
+            </tr>
+        </thead>
+        <tbody id="resultBody">
+            </tbody>
+    </table>
+</div>
+
+<script>
+    function formatNumber(input) {
+        let val = input.value.replace(/,/g, '');
+        if(isNaN(val) || val === '') val = 0;
+        input.value = parseInt(val).toLocaleString();
+    }
+
+    function getVal(id) {
+        return parseFloat(document.getElementById(id).value.replace(/,/g, '')) || 0;
+    }
+
+    function calculate() {
+        const seed = getVal('totalSeed');
+        const threshold = getVal('twapThreshold');
+        const tp = getVal('takeProfit');
+        const sl = getVal('stopLoss');
+        
+        // 손익비 계산 표시
+        const rrText = sl > 0 ? (tp / sl).toFixed(2) : "∞";
+        document.getElementById('rrRatioText').innerText = rrText;
+
+        const markets = [
+            { name: "🇺🇸 미장", ratio: getVal('usRatio') },
+            { name: "🇰🇷 국장", ratio: getVal('krRatio') },
+            { name: "🪙 코인", ratio: getVal('coinRatio') }
+        ];
+
+        const sumRatio = markets.reduce((a, b) => a + b.ratio, 0);
+        const alertBox = document.getElementById('totalRatioAlert');
+        if (sumRatio !== 100) {
+            alertBox.style.display = 'block';
+            document.getElementById('currentRatioSum').innerText = sumRatio;
+        } else {
+            alertBox.style.display = 'none';
+        }
+
+        let html = '';
+        markets.forEach(m => {
+            const alloc = seed * (m.ratio / 100);
+            let maxPos = 1;
+            
+            if (alloc === 0) maxPos = 0;
+            else if (alloc < 500000) maxPos = 1;
+            else if (alloc <= 1500000) maxPos = 2;
+            else if (alloc <= 3000000) maxPos = 3;
+            else if (alloc <= 10000000) maxPos = 5;
+            else if (alloc <= 30000000) maxPos = 7;
+            else maxPos = 10;
+
+            const perPos = maxPos > 0 ? alloc / maxPos : 0;
+            const expectedProfit = perPos * (tp / 100);
+            const expectedLoss = perPos * (sl / 100);
+            
+            let twapResult = `<span class="twap-safe">일괄 시장가</span>`;
+            if (perPos > threshold && threshold > 0) {
+                const n = Math.min(5, Math.max(2, Math.ceil(perPos / threshold)));
+                const sliceAmt = perPos / n;
+                twapResult = `<span class="twap-alert">🔥 ${n}분할<br>(${Math.floor(sliceAmt).toLocaleString()}원)</span>`;
+            } else if (perPos === 0) {
+                twapResult = "-";
+            }
+
+            html += `
+                <tr>
+                    <td>${m.name}</td>
+                    <td>${Math.floor(alloc).toLocaleString()} 원</td>
+                    <td style="color: #ff6b6b; font-size: 1.2rem; font-weight: bold;">${maxPos} 개</td>
+                    <td class="highlight">${Math.floor(perPos).toLocaleString()} 원</td>
+                    <td class="profit">+${Math.floor(expectedProfit).toLocaleString()} 원</td>
+                    <td class="loss">-${Math.floor(expectedLoss).toLocaleString()} 원</td>
+                    <td>${twapResult}</td>
+                </tr>
+            `;
+        });
+        document.getElementById('resultBody').innerHTML = html;
+    }
+
+    calculate();
+</script>
+</body>
+</html>

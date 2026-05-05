@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from api import coin_broker
+from utils.helpers import normalize_ticker
 
 
 def build_rows_data(
@@ -23,18 +24,21 @@ def build_rows_data(
 ):
     rows_data = []
 
-    # 국장 파싱
-    if isinstance(kr_bal, dict) and "output1" in kr_bal and isinstance(kr_bal["output1"], list):
-        for item in kr_bal["output1"]:
+    # 국장: 텔레그램(`get_kr_holdings_with_roi`)과 동일 — 주말·KIS 점검 창에는 API output1을 쓰지 않음
+    kr_out = kr_bal.get("output1") if isinstance(kr_bal, dict) else None
+    kr_list_ok = isinstance(kr_out, list) and len(kr_out) > 0
+    if kr_list_ok and not is_weekend_suppress():
+        for item in kr_out:
             qty_num = int(safe_num(item.get("hldg_qty", item.get("ccld_qty_smtl1", 0)), 0))
             if qty_num > 0:
-                code = item.get("pdno", "")
+                code = normalize_ticker(str(item.get("pdno", "") or ""))
                 price = item.get("pchs_avg_prc", item.get("pchs_avg_pric", "0"))
                 current_p = item.get("prpr", "0")
                 prdt = (item.get("prdt_name") or item.get("prdt_name1") or "").strip()
                 name = prdt or kr_name_dict.get(code) or get_kr_company_name(code) or code
                 rows_data.append(process_row_data("🇰🇷 국장", name, str(qty_num), price, "KR", code, current_p))
-    elif is_weekend_suppress() or not is_market_open("KR"):
+    # 스냅샷 output1이 비었는데 장중이면 위 분기를 안 타서 국장 행이 사라지는 버그 방지 → 재조회 소스(get_held_stocks_kr_info)로 폴백
+    elif is_weekend_suppress() or not is_market_open("KR") or not kr_list_ok:
         try:
             st_row = load_state(state_path)
             pos_row = st_row.get("positions") or {}

@@ -24,6 +24,10 @@
     **자동복구**로 보이는 사고를 막기 위해, 유령 여부는 ``held_*`` 와 ``live_seeds`` 키의 **합집합**
     기준으로 본다. 국장 시드 수량은 ``account_read_facade`` 와 동일하게 ``hldg_qty`` / ``ccld_qty_smtl1`` 를 OR로 본다.
 
+    **장중 API 빈 보유 (2026-05):** 장중인데 KIS ``output1``·시드가 **둘 다 비어 있고** 장부에만 종목이 남아 있으면
+    실제 전량 매도와 응답 누락을 구분할 수 없다. 이 경우 **유령 삭제는 이번 틱에서 하지 않는다**(다음 틱·수동 확인).
+    ``held`` 에 장부를 억지로 넣어 유령 삭제를 막으면, 실제 전량 청산 후에도 장부가 영원히 안 지워지는 부작용이 생긴다.
+
 주의
     API가 전부 성공해야 ``sync_all_positions`` 가 돌아간다. 하나라도 ``None`` 이면
     ``run_bot`` 쪽에서 동기화 전체를 스킵해 **빈 잔고로 유령만 싹 지우는 사고**를 막는다.
@@ -248,6 +252,15 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
             )
             held_us.extend(ledger_us)
 
+    # 코인: 잔고 API가 빈 배열만 주고 장부에 코인이 남은 경우(간헐 오류) 유령 일괄삭제 방지
+    if held_coins is not None and len(held_coins) == 0:
+        ledger_coin = [k for k in current_positions.keys() if is_coin_ticker(str(k))]
+        if ledger_coin:
+            print(
+                f"  📌 [장부 동기화] 코인 잔고 조회 0건 — 장부 코인 {len(ledger_coin)}종 held 보강"
+            )
+            held_coins.extend(ledger_coin)
+
     print(
         f"🔄 [장부 점검] 실제 잔고 (국장:{len(held_kr or [])} / 미장:{len(held_us or [])} / 코인:{len(held_coins or [])}) 대조 중..."
     )
@@ -256,6 +269,51 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
     # 1) 자동 복구 및 평단가 동기화: 실보유 중인 종목의 정보 최신화
     # -----------------------------------------------------------------
     live_seeds = _get_live_position_seeds(skip_kr=skip_kr_sync, skip_us=skip_us_sync)
+
+    has_ledger_kr = any(str(k).isdigit() for k in current_positions)
+    has_ledger_us = any(
+        (not str(k).isdigit()) and (not is_coin_ticker(str(k))) for k in current_positions
+    )
+    has_ledger_coin = any(is_coin_ticker(str(k)) for k in current_positions)
+    kr_in_seeds = any(str(k).isdigit() for k in live_seeds)
+    us_in_seeds = any(
+        (not str(k).isdigit()) and (not is_coin_ticker(str(k))) for k in live_seeds
+    )
+    coin_in_seeds = any(is_coin_ticker(str(k)) for k in live_seeds)
+
+    # 장중 + 브로커 held·시드 모두 비었는데 장부에만 남아 있으면 → 유령 삭제 보류(실매도 vs API누락 구분 불가)
+    kr_holdings_ambiguous = (
+        kr_open
+        and (not skip_kr_sync)
+        and (not kr_in_seeds)
+        and len(held_kr or []) == 0
+        and has_ledger_kr
+    )
+    us_holdings_ambiguous = (
+        us_open
+        and (not skip_us_sync)
+        and (not us_in_seeds)
+        and len(held_us or []) == 0
+        and has_ledger_us
+    )
+    coin_holdings_ambiguous = (
+        held_coins is not None
+        and len(held_coins) == 0
+        and (not coin_in_seeds)
+        and has_ledger_coin
+    )
+    if kr_holdings_ambiguous or us_holdings_ambiguous or coin_holdings_ambiguous:
+        parts = []
+        if kr_holdings_ambiguous:
+            parts.append("국장")
+        if us_holdings_ambiguous:
+            parts.append("미장")
+        if coin_holdings_ambiguous:
+            parts.append("코인")
+        print(
+            f"  ⏸️ [장부 동기화] {'·'.join(parts)} — API 보유·시드가 모두 비었으나 장부에 종목 있음. "
+            f"이번 틱 **유령 삭제만 보류**(전량 청산 직후면 다음 틱에서 반영되거나 수동 동기화)."
+        )
 
     # held_* 만으로 유령 삭제 시, KIS 필드 불일치로 held 가 비고 seeds 에만 남는 순간
     # 장부가 통째로 지워진 뒤 다음 사이클에 '자동복구'로 보이는 것을 방지한다.
@@ -345,13 +403,19 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
         if ticker.isdigit():
             if skip_kr_sync:
                 continue
+            if kr_holdings_ambiguous:
+                continue
             if ticker not in held_kr_set:
                 to_delete.append(ticker)
         elif is_coin_ticker(ticker):
+            if coin_holdings_ambiguous:
+                continue
             if ticker not in held_coins_set:
                 to_delete.append(ticker)
         else:
             if skip_us_sync:
+                continue
+            if us_holdings_ambiguous:
                 continue
             if ticker not in held_us_set:
                 to_delete.append(ticker)

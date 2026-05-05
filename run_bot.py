@@ -2447,6 +2447,54 @@ def normalize_equity_current_p_api_for_display(
     return cp
 
 
+def resolve_holding_display_price(
+    market: str,
+    ticker: str,
+    buy_p: float,
+    current_p_api,
+    pos,
+) -> float:
+    """KR/US/COIN 보유 한 줄 표시용 현재가 — GUI·텔레그램·생존신고 동일."""
+    m = str(market or "").strip().upper()
+    pos = pos if isinstance(pos, dict) else {}
+    bp = float(_to_float(buy_p, 0.0))
+    t = str(ticker).strip()
+
+    if m == "COIN":
+        live = float(resolve_display_current_price("COIN", t, bp, current_p_api))
+        return float(_resolve_curr_price_with_gui_override(pos, live))
+
+    if m not in ("KR", "US"):
+        return float(resolve_display_current_price(m, t, bp, current_p_api))
+
+    if kis_equities_weekend_suppress_window_kst():
+        return float(_resolve_curr_price_with_gui_override(pos, bp))
+    is_open = bool(is_market_open(m))
+    if m == "KR":
+        cp_n = normalize_equity_current_p_api_for_display(
+            market="KR",
+            buy_p=bp,
+            current_p_api=current_p_api,
+            is_market_open_now=is_open,
+            is_weekend=False,
+        )
+    else:
+        cp_n = normalize_us_current_p_api_for_display(
+            bp,
+            current_p_api,
+            is_market_open_now=is_open,
+            is_weekend=False,
+        )
+    live = float(resolve_display_current_price(m, t, bp, cp_n))
+    # 평일 장외: 장부에 저장된 마지막 현재가(curr_p)가 있으면 그걸 씀(코인과 동일). 장중만 라이브 그대로.
+    if not is_open:
+        return float(_resolve_curr_price_with_gui_override(pos, live))
+    return live
+
+
+resolve_equity_holding_display_price = resolve_holding_display_price
+
+
 def _coin_snapshot_get_balance(quote: str = "KRW"):
     """스냅샷용 예수: 바이낸스는 USDT 가용을 원화 환산해 표시."""
     try:
@@ -2619,14 +2667,13 @@ def get_kr_holdings_with_roi():
             if buy_p <= 0:
                 continue
             
-            cp_api = normalize_equity_current_p_api_for_display(
-                market="KR",
-                buy_p=buy_p,
-                current_p_api=stock.get("prpr"),
-                is_market_open_now=is_market_open("KR"),
-                is_weekend=bool(kis_equities_weekend_suppress_window_kst()),
+            curr_p = resolve_holding_display_price(
+                "KR",
+                code,
+                buy_p,
+                stock.get("prpr"),
+                pos,
             )
-            curr_p = resolve_display_current_price("KR", code, buy_p, cp_api)
                 
             roi = ((curr_p - buy_p) / buy_p) * 100
             kr_name = get_kr_company_name(code)
@@ -2653,6 +2700,8 @@ def get_us_holdings_with_roi():
     """🇺🇸 미장 보유 종목 + 현재 수익률"""
     try:
         state = load_state(STATE_PATH)
+        if kis_equities_weekend_suppress_window_kst():
+            return _us_holdings_lines_from_ledger(state)
         # GUI와 동일한 함수 사용
         us_data = get_held_stocks_us_detail()
         if not us_data:
@@ -2661,8 +2710,6 @@ def get_us_holdings_with_roi():
             return []
 
         holdings = []
-        is_weekend = bool(kis_equities_weekend_suppress_window_kst())
-        is_us_open = bool(is_market_open("US"))
         for item in us_data:
             ticker = normalize_ticker(item['code'])
             qty = item['qty']
@@ -2674,17 +2721,13 @@ def get_us_holdings_with_roi():
             pos_u = state.get("positions", {}).get(ticker, {})
             if not isinstance(pos_u, dict):
                 pos_u = {}
-            # 현재가: 공용 해석 함수 (주말·점검 창은 장부 curr_p 우선 — GUI와 동일)
-            cp_api = normalize_us_current_p_api_for_display(
+            curr_p = resolve_holding_display_price(
+                "US",
+                ticker,
                 buy_p,
                 item.get("current_p", 0),
-                is_market_open_now=is_us_open,
-                is_weekend=is_weekend,
+                pos_u,
             )
-            if is_weekend:
-                curr_p = _resolve_curr_price_with_gui_override(pos_u, float(buy_p))
-            else:
-                curr_p = resolve_display_current_price("US", ticker, buy_p, cp_api)
             
             roi = ((curr_p - buy_p) / buy_p) * 100
             us_name = get_us_company_name(ticker)
@@ -2699,7 +2742,10 @@ def get_us_holdings_with_roi():
                     pos_u if isinstance(pos_u, dict) else {},
                 )
             )
-        
+        # 국장과 동일: 비장중·평단 미기입으로 한 줄도 못 만들었으면 장부 폴백 (텔레·스냅샷과 일치)
+        if not holdings and not bool(is_market_open("US")):
+            return _us_holdings_lines_from_ledger(state)
+
         return holdings
     except Exception as e:
         print(f"⚠️ US 보유종목 조회 에러: {e}")
@@ -2734,8 +2780,7 @@ def get_coin_holdings_with_roi():
             if buy_p <= 0:
                 continue
 
-            # 현재가: 공용 해석 함수
-            curr_p = resolve_display_current_price("COIN", ticker, buy_p, None)
+            curr_p = resolve_holding_display_price("COIN", ticker, buy_p, None, pos)
 
             roi = ((curr_p - buy_p) / buy_p) * 100
             coin_name = get_coin_name(ticker)
@@ -5029,8 +5074,16 @@ def run_trading_bot():
         print("💤 코인은 점검 또는 데이터 조회 불가 상태입니다.")
 
     if (_cycle_buy_zone_kr or _cycle_buy_zone_us or _cycle_buy_zone_coin) and _cycle_buy_fills == 0:
+        _buy_pass_zones = []
+        if _cycle_buy_zone_kr:
+            _buy_pass_zones.append("KR")
+        if _cycle_buy_zone_us:
+            _buy_pass_zones.append("US")
+        if _cycle_buy_zone_coin:
+            _buy_pass_zones.append("COIN")
+        _buy_pass_zone_label = "·".join(_buy_pass_zones)
         send_telegram(
-            "📭 [매수 패스] 이번 사이클: KR / US / COIN 중 매수 가능 시간·조건 구간이었으나 "
+            f"📭 [매수 패스] 이번 사이클: {_buy_pass_zone_label} 매수 가능 시간·조건 구간이었으나 "
             "신규 매수 체결이 없었습니다.\n"
             "(시그널 없음·AI 필터·예산·최소주문·TWAP 미체결 등)"
         )
