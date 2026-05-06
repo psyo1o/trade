@@ -74,7 +74,7 @@ from run_bot import (
     refresh_brokers_if_needed,
     _to_float,
 )
-from execution.guard import load_state
+from execution.guard import load_state, save_state
 
 TRADE_HISTORY_PATH = Path(__file__).resolve().parent / "trade_history.json"
 
@@ -404,8 +404,15 @@ class BalanceUpdaterThread(QThread):
                 m, ledger_key, buy_p, current_p_api, pos
             )
 
-            if current_price > 0 and self.dashboard:
-                self.dashboard.update_max_price_if_higher(ledger_key, current_price)
+            # 최고가(max_p)·curr_p 저장은 거래소 라이브 시세 기준. 코인은 표시가 장부 curr_p 우선이라
+            # 여기까지 넘기면 신고가여도 갱신·로그가 안 될 수 있음.
+            px_for_max = (
+                float(run_bot.resolve_display_current_price(m, ledger_key, buy_p, current_p_api))
+                if m == "COIN"
+                else float(current_price)
+            )
+            if px_for_max > 0 and self.dashboard:
+                self.dashboard.update_max_price_if_higher(ledger_key, px_for_max)
 
             if buy_p > 0: roi = ((current_price - buy_p) / buy_p) * 100
         except Exception as e:
@@ -1303,13 +1310,12 @@ class BotDashboard(QMainWindow):
         GUI에서 확인된 현재가를 장부에 공유하고, 최고가보다 높으면 업데이트합니다.
         """
         try:
-            state_file = STATE_PATH
-            if not state_file.exists(): return
-            
-            import json
-            state = json.loads(state_file.read_text(encoding="utf-8"))
+            if not STATE_PATH.exists():
+                return
+
+            state = load_state(STATE_PATH)
             positions = state.get("positions", {})
-            
+
             ticker_key = str(ticker).strip().upper()
             # 최고가(max_p)는 정규장 중에만 갱신 (기존 정책 복원)
             market_type = "COIN" if is_coin_ticker(ticker_key) else ("KR" if ticker_key.isdigit() else "US")
@@ -1319,18 +1325,18 @@ class BotDashboard(QMainWindow):
             if ticker_key in positions:
                 pos = positions[ticker_key]
                 current_p_float = float(current_p)
-                
+
                 # 🔄 [핵심] 현재가를 장부에 상시 공유 (run_bot과 동기화용)
                 pos["curr_p"] = current_p_float
-                
+
                 old_max = float(pos.get("max_p", 0.0))
                 if current_p_float > old_max:
                     pos["max_p"] = current_p_float
                     msg = f"🚀 [GUI 감지] {ticker_key} 최고가 갱신! ({old_max:,.2f} ➔ {current_p_float:,.2f})"
-                    print(msg) 
-                
-                # 실시간 가격 공유를 위해 무조건 저장
-                state_file.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+                    print(msg)
+
+                # 원자적 저장 — write_text 직접 덮어쓰기는 매매 루프와 충돌해 JSON 깨짐·WinError 5 유발
+                save_state(STATE_PATH, state)
 
         except Exception as e:
             print(f"⚠️ 현재가 공유 오류 ({ticker}): {e}")
@@ -1354,9 +1360,8 @@ class BotDashboard(QMainWindow):
             state["settings"]["max_pos_kr"] = val_kr
             state["settings"]["max_pos_us"] = val_us
             state["settings"]["max_pos_coin"] = val_coin
-            
-            import json
-            STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            save_state(STATE_PATH, state)
             
             msg = f"🔥 국장({val_kr}개), 미장({val_us}개), 코인({val_coin}개) 설정이 변경되었습니다."
             print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")

@@ -276,6 +276,31 @@ flowchart TD
 2. V8이 실패하면 **`check_swing_entry`** (볼밴·RSI·피보나치 등)를 **추가로** 평가합니다. 실패 시 **`[스윙]`** 한 줄로 **왜 안 샀는지** 사유가 나옵니다.
 3. V8으로 통과하면 **`[V8-BUY]`**, 스윙으로만 통과하면 **`[SWING-BUY]`** 와 `entry_fib_level` 이 로그에 찍힙니다.
 
+#### 포지션 사이징 (Position Sizing)
+
+- 국장·미장·코인은 모두 **“프랍 데스크 스타일 1/N 모델”** 로 비중을 잡습니다.
+  - 국장: `base_ratio = 1 / MAX_POSITIONS_KR`
+  - 미장: `base_ratio = 1 / MAX_POSITIONS_US`
+  - 코인: `base_ratio = 1 / MAX_POSITIONS_COIN`
+- **개별 종목·티어·날씨로 비중을 키우는 로직(0.4·0.6 등 가산)은 없습니다.**  
+  과거 ADX·불장에 따라 비중을 키우던 분기와 `max_allowed_ratio` 캡은 제거되었습니다.
+- 최종 배정 예산은 시장별로 모두 동일한 공식으로 계산합니다.
+
+```python
+ratio = base_ratio                   # 1 / MAX_POSITIONS_*
+target_budget = total_equity * ratio * macro_mult
+```
+
+- 거시 방어막(`macro_mult`)이 0.0/0.5/1.0 등으로 변하면 **시장 전체 비중만** 줄거나 유지됩니다.
+- 예수금이 부족하면 기존처럼 **“영끌”** 로 조정합니다.
+
+```python
+if cash < target_budget:
+    target_budget = cash
+```
+
+- 시장별 최소 주문 금액(국장 5만 원 / 미장 50달러 / 코인 5천 원 상당) 미만이면 주문을 내지 않고 **“예산 부족/예수금 부족”** 로그만 남깁니다.
+
 ### 청산 (매도)
 
 - 장부 **`strategy_type`** 이 **`SWING_FIB`** 이면 먼저 **`check_swing_exit`** (`FULL` / `HALF` / `HOLD`)를 봅니다. **`HALF`·`FULL`** 이 나오면 스윙 규칙으로 부분·전량 매도 후 해당 사이클은 종료하고, **`HOLD`** 이면 그 아래 **분할 익절 → 타임스탑·하드스탑·샹들리에** 를 **같이** 탑니다 (스윙만 있다가 타임스탑에 걸리지 않도록 한 동작).
@@ -390,7 +415,8 @@ flowchart TD
 | `binance_access`, `binance_secret` | 바이낸스 API 키. |
 | `krw_per_usdt` | (선택) 1 USDT당 원화. 없으면 Yahoo `USDKRW=X` 등으로 추정(401 소음·실패 가능) — **직접 입력 권장**. |
 | `binance_min_cost_usdt` | (선택) 최소 주문 명목(USDT), 기본 10 근처 — CCXT 마켓 정보와 함께 최소금액 검사에 사용. |
-| `binance_universe_top` | (선택) 24h USDT 거래대금 상위 N개만 스캔, 기본 **30**. |
+| `binance_universe_top` | (선택) 바이낸스 24h USDT 거래대금 상위 N만 스캔, 기본 **50**. |
+| `upbit_universe_top` | (선택) 업비트 KRW 마켓 거래대금 상위 N만 스캔, 기본 **20**. |
 | `buy_window_minutes_before_close` | (선택) 코인 **일봉 기준점(KST 09:00 = 바이낸스 UTC 일봉 경계)** 직전 N분만 매수 허용. **업비트·바이낸스 동일 창**(기본 N=30 → **08:30~09:00** KST). 이 창 안에서는 **KST 분기 매매틱(`:00/:15/:30/:45`)마다** V8→스윙 매수 판단을 반복합니다. |
 | `coin_min_notional_usd` | (선택) 코인 **잔고·GUI** 에서 제외할 최소 **명목(USD)**. 기본 **1** (바이낸스: USDT, 업비트: 달러 환산 KRW). 가격 조회 실패 시 옛 **수량** 먼지 기준으로 폴백. |
 

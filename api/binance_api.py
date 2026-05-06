@@ -244,7 +244,7 @@ def order_avg_fill_usdt(order: dict[str, Any]) -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def top_usdt_symbols_by_quote_volume(limit: int = 30) -> list[str]:
+def top_usdt_symbols_by_quote_volume(limit: int = 50) -> list[str]:
     """거래대금(quote) 상위 → 내부 티커 ``USDT-XXX``."""
     ex = ensure_exchange()
     tickers = ex.fetch_tickers()

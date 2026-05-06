@@ -504,8 +504,10 @@ INDEX_CRASH_COIN = -3.5   # 코인 BTC 급락 기준 (%)
 # 업비트 코인 시장가 매수 — 가용 잔고 캡(수수료·반올림 오차로 InsufficientFundsBid 방지)
 UPBIT_KRW_AVAILABLE_CAP_RATIO = 0.999  # 주문 직전: min(목표액, get_balance(KRW) * 이 값)
 UPBIT_COIN_MIN_ORDER_KRW = 5000.0      # KRW 마켓 최소 주문 금액(업비트 기준)
-# 바이낸스: 24h 거래대금(USDT) 상위 N (기본 30)
-BINANCE_UNIVERSE_TOP = int(config.get("binance_universe_top", 30))
+# 바이낸스: 24h USDT 거래대금 상위 N (`binance_universe_top`, 기본 50)
+BINANCE_UNIVERSE_TOP = int(config.get("binance_universe_top", 50))
+# 업비트: KRW 마켓 거래대금 상위 N (`upbit_universe_top`, 기본 20 — 예전 하드코드(:20)와 동일)
+UPBIT_UNIVERSE_TOP = int(config.get("upbit_universe_top", 20))
 # 코인(업비트·바이낸스 공통): ``_is_coin_buy_window_now`` 일봉 직전 창만 매수. V8→스윙 순서는 국·미장과 동일.
 
 
@@ -3849,58 +3851,17 @@ def run_trading_bot():
 
                         try:
                             ohlcv_200 = get_ohlcv_yfinance(t)
-                            
-                            # 🛡️ [수술 1] 개별 종목 ADX 폭발 시 하락장 무시 및 비중 상향 로직
-                            ratio = 0.10 # 기본 비중
-                            try:
-                                if ohlcv_200 is not None and len(ohlcv_200) >= 15:
-                                    df = pd.DataFrame(ohlcv_200)
-                                    adx_indicator = ADXIndicator(
-                                        high=df['h'], low=df['l'], close=df['c'], window=14
-                                    )
-                                    adx_val = adx_indicator.adx().iloc[-1]
-                                    
-                                    # ADX 25 이상: 강한 추세 발생 (하락장이라도 독고다이 매수 허용)
-                                    if adx_val >= 25:
-                                        ratio, t_name = 0.60, "독고다이-ADX폭발"
-                                    else:
-                                        if weather['KR'] == "☀️ BULL":
-                                            if t in tier_1: ratio, t_name = 0.60, "1티어(우량대장)-불장"
-                                            elif t in tier_2: ratio, t_name = 0.40, "2티어(수급급등)-불장"
-                                            else: ratio, t_name = 0.10, "3티어(기타/패턴)-불장"
-                                        elif weather['KR'] == "☁️ SIDEWAYS":
-                                            if t in tier_1: ratio, t_name = 0.40, "1티어(우량대장)-횡보"
-                                            elif t in tier_2: ratio, t_name = 0.30, "2티어(수급급등)-횡보"
-                                            else: ratio, t_name = 0.10, "3티어(기타/패턴)-횡보"
-                                        else:
-                                            # 하락장(BEAR)인데 ADX도 낮으면 매수 안함
-                                            if weather['KR'] == "🌧️ BEAR":
-                                                print(
-                                                    f"  ⏭️ {kr_name}({t}): [KR 매수] BEAR·ADX<25 — "
-                                                    f"독고다이 예외 없이 비중 배정 전 스킵"
-                                                )
-                                                continue
-                                            ratio, t_name = 0.10, "기타-방어"
-                                else:
-                                    if weather['KR'] == "🌧️ BEAR":
-                                        print(
-                                            f"  ⏭️ {kr_name}({t}): [KR 매수] BEAR·일봉<15 — "
-                                            f"ADX 미산출 구간 스킵"
-                                        )
-                                        continue
-                                    ratio, t_name = 0.10, "기타-방어"
-                            except Exception:
-                                if weather['KR'] == "🌧️ BEAR":
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [KR 매수] BEAR·ADX 계산 예외 — "
-                                        f"방어 비중 없이 스킵"
-                                    )
-                                    continue
-                                ratio, t_name = 0.10, "기타-방어"
 
-                            # 🛡️ [수술 4] 시드 확장 대비 동적 비율 캡(Dynamic Cap) 로직
-                            max_allowed_ratio = 1.0 / max(1, MAX_POSITIONS_KR)
-                            ratio = min(ratio, max_allowed_ratio)
+                            # =================================================================
+                            # 포지션 사이징(국장): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
+                            #
+                            # - base_ratio = 1 / MAX_POSITIONS_KR (절대 고정)
+                            # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
+                            # - 최종 비중 조절은 macro_mult 에서만 담당
+                            # =================================================================
+                            base_ratio = 1.0 / max(1, int(MAX_POSITIONS_KR))
+                            ratio = float(base_ratio)
+                            t_name = "1/N 고정"
                             
                             target_budget = total_kr_equity * ratio * macro_mult
                             kr_min_budget = 50000.0 # 국장 최소 주문 (5만원)
@@ -4398,64 +4359,22 @@ def run_trading_bot():
                                     print(f"  ⏭️ {us_name}({t}): {sector_msg_us} (패스)")
                                     continue
 
-                                # 🛡️ [수술 1] 개별 종목 ADX 폭발 시 하락장 무시 및 비중 상향 로직
+                                # OHLCV: 신호 계산에 필요
                                 ohlcv = get_ohlcv_yfinance(t)
                                 if not ohlcv:
                                     print(f"  ⏭️ {us_name}({t}): OHLCV 데이터 부족 (패스)")
                                     continue
-                                
-                                try:
-                                    if len(ohlcv) >= 15:
-                                        df = pd.DataFrame(ohlcv)
-                                        adx_indicator = ADXIndicator(
-                                            high=df['h'], low=df['l'], close=df['c'], window=14
-                                        )
-                                        adx_val = adx_indicator.adx().iloc[-1]
-                                        
-                                        if adx_val >= 25:
-                                            ratio, t_name = 0.40, "독고다이-ADX폭발"
-                                        else:
-                                            if weather['US'] == "☀️ BULL":
-                                                if idx <= 50:
-                                                    ratio, t_name = 0.40, "1티어(S&P100-우량)-불장"
-                                                elif idx <= 100:
-                                                    ratio, t_name = 0.20, "2티어(S&P100-성장)-불장"
-                                                else:
-                                                    ratio, t_name = 0.20, "3티어(Ndx100-특수)-불장"
-                                            elif weather['US'] == "☁️ SIDEWAYS":
-                                                if idx <= 50:
-                                                    ratio, t_name = 0.30, "1티어(S&P100-우량)-횡보"
-                                                elif idx <= 100:
-                                                    ratio, t_name = 0.15, "2티어(S&P100-성장)-횡보"
-                                                else:
-                                                    ratio, t_name = 0.15, "3티어(Ndx100-특수)-횡보"
-                                            else:
-                                                if weather['US'] == "🌧️ BEAR":
-                                                    print(
-                                                        f"  ⏭️ {us_name}({t}): [US 매수] BEAR·ADX<25 — "
-                                                        f"비중 배정 전 스킵"
-                                                    )
-                                                    continue
-                                                ratio, t_name = 0.10, "방어-비중축소"
-                                    else:
-                                        if weather['US'] == "🌧️ BEAR":
-                                            print(
-                                                f"  ⏭️ {us_name}({t}): [US 매수] BEAR·일봉<15 — "
-                                                f"ADX 미산출 구간 스킵"
-                                            )
-                                            continue
-                                        ratio, t_name = 0.10, "방어-비중축소"
-                                except Exception:
-                                    if weather['US'] == "🌧️ BEAR":
-                                        print(
-                                            f"  ⏭️ {us_name}({t}): [US 매수] BEAR·ADX 계산 예외 — 스킵"
-                                        )
-                                        continue
-                                    ratio, t_name = 0.10, "방어-비중축소"
 
-                                # 🛡️ [수술 4] 시드 확장 대비 동적 비율 캡(Dynamic Cap) 로직
-                                max_allowed_ratio = 1.0 / max(1, MAX_POSITIONS_US)
-                                ratio = min(ratio, max_allowed_ratio)
+                                # =================================================================
+                                # 포지션 사이징(미장): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
+                                #
+                                # - base_ratio = 1 / MAX_POSITIONS_US (절대 고정)
+                                # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
+                                # - 최종 비중 조절은 macro_mult 에서만 담당
+                                # =================================================================
+                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_US))
+                                ratio = float(base_ratio)
+                                t_name = "1/N 고정"
 
                                 target_budget = total_us_equity * ratio * macro_mult
                                 us_min_budget = 50.0  # 최소 주문금액
@@ -4911,7 +4830,7 @@ def run_trading_bot():
                                         x["market"]
                                         for x in sorted(
                                             tickers_data, key=lambda x: x.get("acc_trade_price_24h", 0), reverse=True
-                                        )[:20]
+                                        )[: max(1, UPBIT_UNIVERSE_TOP)]
                                     ]
                                     _ohlcv_pref = {}
                             except Exception:
@@ -4942,49 +4861,16 @@ def run_trading_bot():
                                     print(f"  ⏭️ {t}: OHLCV 데이터 부족 (패스)")
                                     continue
                                 
-                                # 🛡️ [수술 1] 개별 종목 ADX 폭발 시 하락장 무시 및 비중 상향 로직
-                                try:
-                                    if len(ohlcv) >= 15:
-                                        df = pd.DataFrame(ohlcv)
-                                        adx_indicator = ADXIndicator(
-                                            high=df['h'], low=df['l'], close=df['c'], window=14
-                                        )
-                                        adx_val = adx_indicator.adx().iloc[-1]
-                                        
-                                        if adx_val >= 25:
-                                            ratio, t_name = 0.40, "독고다이-ADX폭발"
-                                        else:
-                                            if coin_weather == "☀️ BULL":
-                                                ratio, t_name = 0.40, "스나이퍼-불장"
-                                            elif coin_weather == "☁️ SIDEWAYS":
-                                                ratio, t_name = 0.30, "스나이퍼-횡보"
-                                            else:
-                                                if coin_weather == "🌧️ BEAR":
-                                                    print(
-                                                        f"  ⏭️ {t}: [COIN 매수] BEAR·ADX<25 — "
-                                                        f"비중 배정 전 스킵"
-                                                    )
-                                                    continue
-                                                ratio, t_name = 0.15, "스나이퍼-방어"
-                                    else:
-                                        if coin_weather == "🌧️ BEAR":
-                                            print(
-                                                f"  ⏭️ {t}: [COIN 매수] BEAR·일봉<15 — "
-                                                f"ADX 미산출 구간 스킵"
-                                            )
-                                            continue
-                                        ratio, t_name = 0.15, "스나이퍼-방어"
-                                except Exception:
-                                    if coin_weather == "🌧️ BEAR":
-                                        print(
-                                            f"  ⏭️ {t}: [COIN 매수] BEAR·ADX 계산 예외 — 스킵"
-                                        )
-                                        continue
-                                    ratio, t_name = 0.15, "스나이퍼-방어"
-
-                                # 🛡️ [수술 4] 시드 확장 대비 동적 비율 캡(Dynamic Cap) 로직
-                                max_allowed_ratio = 1.0 / max(1, MAX_POSITIONS_COIN)
-                                ratio = min(ratio, max_allowed_ratio)
+                                # =================================================================
+                                # 포지션 사이징(코인): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
+                                #
+                                # - base_ratio = 1 / MAX_POSITIONS_COIN (절대 고정)
+                                # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
+                                # - 최종 비중 조절은 macro_mult 에서만 담당
+                                # =================================================================
+                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_COIN))
+                                ratio = float(base_ratio)
+                                t_name = "1/N 고정"
 
                                 budget = total_coin_equity * ratio * macro_mult
                                 coin_min_budget = _coin_min_order_krw()

@@ -1760,12 +1760,13 @@ SWING 엔진 (일봉 눌림목): 바이낸스의 일봉 갱신(UTC 00:00 / KST 0
 작업을 반영했습니다. 요약만 정리합니다.
 
 ## 1) Config
-- `config.json`에 **`"binance_universe_top": 30`**(선택, 기본 30)을 쓰면 24h USDT 거래대금 상위 N개로 스캔합니다.  
+- `config.json`에 **`"binance_universe_top": 50`**(선택, 기본 50)을 쓰면 24h USDT 거래대금 상위 N개로 스캔합니다.  
+- `\"upbit_universe_top\"`(선택, 기본 20)은 업비트 KRW 마켓 거래대금 상위 N개만 스캔하는 데 사용됩니다.
 - 비동기 CCXT는 **주석**으로 `ccxt.async_support` 확장을 안내했고, 엔진은 기존처럼 **동기 CCXT**로 유지했습니다(스레드·GUI와 호환).
 
-## 2) 유니버스 Top 30
-- `api/binance_api.py` `top_usdt_symbols_by_quote_volume` 기본값 **30**.  
-- `run_bot`에서는 **`BINANCE_UNIVERSE_TOP`**(`config.get("binance_universe_top", 30)`)을 사용합니다.
+## 2) 유니버스 Top N
+- `api/binance_api.py` `top_usdt_symbols_by_quote_volume(limit=50)` — 24h USDT 거래대금 상위 50개.  
+- `run_bot`에서는 **`BINANCE_UNIVERSE_TOP`**(`config.get("binance_universe_top", 50)`)을 사용합니다.
 
 ## 3) 코인 매수 스케줄 (업비트·바이낸스 **동일**)
 - **바이낸스 전용 시간표·state 키는 없다.** (과거에 문서/채팅에 나온 `last_binance_v8_scan_*`, `last_binance_swing_run_date`, `_binance_v8_slot_key` / `_binance_should_run_v8_scan` / `_binance_mark_v8_scan_done` / swing 짝 — **현행 `*.py`에 없음·사용 안 함**.)
@@ -1794,10 +1795,11 @@ SWING 엔진 (일봉 눌림목): 바이낸스의 일봉 갱신(UTC 00:00 / KST 0
 
 **운영 참고**: GUI/헤드리스 모두 **KST :00/:15/:30/:45**에 엔진이 돌지만, 코인 **신규 매수**는 **`_is_coin_buy_window_now`가 참일 때만**(일봉 직전 창) 실행된다. MDD·Phase4 거시·계좌 서킷을 통과한 경우에만 진행한다. (`last_binance_v8_scan_*` 같은 **티커별 state 마킹은 사용하지 않음**.)
 
-선택 설정 예:
+선택 설정 예 (기본값과 동일):
 
 ```json
-"binance_universe_top": 30
+"binance_universe_top": 50,
+"upbit_universe_top": 20
 ```
 
 ---
