@@ -221,10 +221,36 @@ def _collect_orderbook_qtys(data: Any) -> Tuple[float, float]:
 
 
 def get_orderbook_summary_from_broker(broker: Any, ticker: str) -> Dict[str, float]:
+    """KR/US 매수 후보의 호가 잔량 합계.
+
+    - **KR** (티커가 6자리 숫자) — ``kis_api.fetch_kr_orderbook`` 으로
+      KIS ``inquire-asking-price-exp-ccn`` (TR ``FHKST01010200``) 를 직접 호출.
+      ``broker.fetch_price`` 가 부르는 ``inquire-price`` 엔드포인트는 호가 잔량을
+      내려주지 않아 항상 (0,0) 으로 떨어지던 문제를 차단한다.
+    - **US** — KIS 해외주식은 정식 호가 잔량 응답이 제한적이라 ``broker.fetch_price``
+      응답에서 가능한 만큼만 긁어내고, 매칭이 없으면 (0,0) 을 그대로 반환한다.
+      LLM 프롬프트가 (0,0) 을 “호가 데이터 미제공”으로 해석하도록 가드되어 있다.
+    """
     if broker is None:
         return {"bid_size_total": 0.0, "ask_size_total": 0.0}
+
+    sym = str(ticker or "").strip().upper()
+
+    if sym.isdigit():
+        try:
+            from api import kis_api  # 지연 임포트로 순환 의존 회피
+            ob = kis_api.fetch_kr_orderbook(broker, sym)
+            if isinstance(ob, dict):
+                return {
+                    "bid_size_total": _to_float(ob.get("bid_size_total", 0.0)),
+                    "ask_size_total": _to_float(ob.get("ask_size_total", 0.0)),
+                }
+        except Exception:
+            pass
+        return {"bid_size_total": 0.0, "ask_size_total": 0.0}
+
     try:
-        resp = broker.fetch_price(str(ticker or "").strip().upper())
+        resp = broker.fetch_price(sym)
     except Exception:
         return {"bid_size_total": 0.0, "ask_size_total": 0.0}
 
@@ -373,12 +399,21 @@ _FALSE_BREAKOUT_SCORE_RUBRIC = """
 """.strip()
 
 
+_ORDERBOOK_GUARD_NOTE = (
+    "주의(호가 데이터 가드): orderbook 의 bid_size_total · ask_size_total 가 둘 다 0 이라면 "
+    "거래소 비제공/조회 실패로 호가 데이터가 비어 있는 상태이므로, 호가 기반의 "
+    "유동성 부족·물량 떠넘기기(설거지)·허수 의심을 점수에 가산하지 말 것. "
+    "이 경우 캔들/거래량만으로 평가하라."
+)
+
+
 def _build_llm_prompt_v8(candles: List[Dict[str, float]], orderbook: Dict[str, float]) -> str:
     return (
         "당신은 기관 퀀트 트레이더다. 제공된 15분봉 시계열과 호가창 요약을 분석하여, "
         "이 돌파가 세력의 가짜 펌핑(휩소)·펌프 앤 덤프·물량 떠넘기기(설거지)일 위험도를 "
         "0~100 정수로 평가하라. 비정상적인 윗꼬리, 거래량 급증 후 급감, 매도 호가 대비 매수 호가의 허수(Spoofing) 징후에 가중치를 두어라.\n"
         f"{_FALSE_BREAKOUT_SCORE_RUBRIC}\n"
+        f"{_ORDERBOOK_GUARD_NOTE}\n"
         '출력은 JSON만: {"false_breakout_prob": <int>, "rationale": "짧은 한국어 1~3문장"}\n'
         f"candles_15m={candles}\n"
         f"orderbook={orderbook}\n"
@@ -392,6 +427,7 @@ def _build_llm_prompt_swing(candles: List[Dict[str, float]], orderbook: Dict[str
         "데드캣 바운스, 또는 거래량이 말라붙은 '좀비' 상태일 위험도를 0~100 정수로 평가하라. "
         "하락 모멘텀 지속성, 바닥 다지기(도지·거래량 축소 등) 부재에 가중치를 두어라.\n"
         f"{_FALSE_BREAKOUT_SCORE_RUBRIC}\n"
+        f"{_ORDERBOOK_GUARD_NOTE}\n"
         '출력은 JSON만: {"false_breakout_prob": <int>, "rationale": "짧은 한국어 1~3문장"}\n'
         '키 이름은 반드시 false_breakout_prob 이다(위험도가 높을수록 숫자를 크게).\n'
         f"candles_daily={candles}\n"

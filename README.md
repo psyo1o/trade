@@ -376,6 +376,13 @@ if cash < target_budget:
 
 **Gemini → OpenAI 폴백:** `ai_false_breakout_provider` 가 `gemini`(기본)일 때, Gemini가 키 없음·API 오류·JSON 실패 등으로 **LLM 점수를 내지 못하면**, `OPENAI_API_KEY`가 있고 `ai_false_breakout_openai_fallback` 이 `false`가 아니면(기본: 폴백 **켜짐**) **한 번** OpenAI를 호출한다. 로그 산출에 `openai (Gemini→OpenAI 폴백)` 이 붙는다. OpenAI 모델명은 `ai_false_breakout_openai_model`(기본 `gpt-4o-mini`). **OpenAI API는 “영구 무료”가 아니라** 신규 계정에 소액 무료 크레딧이 있을 수 있고, 소진 후에는 **종량제**다. 장기 무료에 가깝게 쓰려면 Google AI Studio(Gemini) 쪽이 유리한 경우가 많다.
 
+**호가 입력 (수정됨):** 그간 KR/US 매수 후보의 호가는 ``broker.fetch_price`` (KIS ``inquire-price``, TR ``FHKST01010100``) 응답에서 긁어내려 했지만 그 엔드포인트는 호가 잔량을 내려주지 않아 **항상 (0,0)** 으로 떨어졌다. 이로 인해 LLM이 “호가 0 = 비유동성 = 설거지 위험” 으로 자주 환각해 정상 시그널을 차단하는 일이 있었다. 현재는:
+
+- **KR**: ``api/kis_api.fetch_kr_orderbook`` 이 KIS ``inquire-asking-price-exp-ccn`` (TR ``FHKST01010200``) 를 직접 호출해 ``output1.total_bidp_rsqn`` / ``output1.total_askp_rsqn`` (없으면 ``bidp_rsqn1..10`` / ``askp_rsqn1..10`` 합산) 으로 호가 잔량을 채운다.
+- **US**: KIS 해외주식은 정식 호가 잔량을 거의 안 내려주므로 (0,0) 그대로 둔다.
+- **LLM 프롬프트**: ``orderbook`` 의 두 값이 모두 0 이면 “호가 데이터 미제공” 으로 해석하고 호가 기반 위험 가산을 금지하도록 가드 라인을 주입(``_ORDERBOOK_GUARD_NOTE``).
+- **룰베이스**: imbalance 가 0일 때 임계 (`< -0.12` / `< -0.14`) 를 넘지 않아 자연스럽게 가산 0 → 영향 없음.
+
 **MDD(시장·종목 단위)** 와 **매도 후 재진입 `ticker_cooldowns`** 는 Phase 번호 없이 `execution/guard.py` 쪽과 연동됩니다.
 
 ---
@@ -400,6 +407,7 @@ if cash < target_budget:
 - `upbit_access`, `upbit_secret`
 - `telegram_token`, `telegram_chat_id`
 - (선택) `telegram_connect_timeout_sec`(기본 30), `telegram_read_timeout_sec`(기본 60), `telegram_max_retries`(기본 5) — `utils/telegram.py` 에서 연결 타임아웃·재시도 조절
+- (선택) `telegram_error_alerts` (기본 `true`) — `QuantBot` 로거에 부착된 ``_TelegramAlertHandler`` 가 **GUI 콘솔에 찍히는 모든 라인**과 **헤드리스(`run_bot.py` 단독)의 stderr 트레이스백**을 동일하게 감시한다. 캡처 대상은 (1) `WARNING` 이상 레벨, (2) 본문에 `⚠️` / `🚨` / `🛑` 포함, (3) 파이썬 트레이스백 헤더 `Traceback (most recent call last):`, (4) ``XxxError: ...`` / ``XxxException: ...`` 마지막 줄. 이런 시그널 라인이 잡히면 직후 **1.5초 동안 이어지는 후속 라인(`File "...", line ...` / 코드 라인)** 도 같이 캡처되어 트레이스백이 통째로 한 통으로 묶인다. **묶음 윈도우 2초**, **분당 최대 6건**, 같은 본문 **5분 중복 차단**(폭주 방지). 본문에 “텔레그램/telegram” 이 들어간 라인은 무시하므로 송신 자체에서 찍는 재시도 경고는 다시 알림으로 가지 않는다. `false` 로 끄면 기존 `atexit` 종료 알림만 남는다.
 
 <a id="coin-exchange-config"></a>
 
@@ -417,6 +425,7 @@ if cash < target_budget:
 | `binance_min_cost_usdt` | (선택) 최소 주문 명목(USDT), 기본 10 근처 — CCXT 마켓 정보와 함께 최소금액 검사에 사용. |
 | `binance_universe_top` | (선택) 바이낸스 24h USDT 거래대금 상위 N만 스캔, 기본 **50**. |
 | `upbit_universe_top` | (선택) 업비트 KRW 마켓 거래대금 상위 N만 스캔, 기본 **20**. |
+| (스테이블/페그 자동 차단) | 바이낸스·업비트 스캔 모두 **USD/원화 페그 자산은 자동 제외**한다. (1) 알려진 정적 denylist (`USDC`, `USDT`, `FDUSD`, `TUSD`, `USDP`, `DAI`, `BUSD`, `GUSD`, `LUSD`, `MIM`, `FRAX`, `crvUSD`, `sUSD`, `USDD`, `USDE`, `USDB`, `USTC`, `USDX`, `USDS`, `PYUSD`, `USDT0`, `USR`, `USD0` 등). (2) 동적 페그 감지 — `last` 가 `[0.97, 1.03] USDT` 안이고 24h `(high - low) / last < 0.5%` 이거나 `last` 가 `1.0000` 근처(±0.0005)면 페그로 간주해 스킵. 업비트 KRW 마켓도 같은 사상으로 스프레드 0.5% 미만이면 제외. **이유**: 페그 자산은 변동성이 거의 0이라 V8/SWING 하드스탑(`buy_p` 손절선)에 매수 즉시 걸려 수수료·슬리피지로만 손실이 누적되는 함정이라(예: 과거 `USDT-U` 매수 직후 0.01% 하락에 손절). |
 | `buy_window_minutes_before_close` | (선택) 코인 **일봉 기준점(KST 09:00 = 바이낸스 UTC 일봉 경계)** 직전 N분만 매수 허용. **업비트·바이낸스 동일 창**(기본 N=30 → **08:30~09:00** KST). 이 창 안에서는 **KST 분기 매매틱(`:00/:15/:30/:45`)마다** V8→스윙 매수 판단을 반복합니다. |
 | `coin_min_notional_usd` | (선택) 코인 **잔고·GUI** 에서 제외할 최소 **명목(USD)**. 기본 **1** (바이낸스: USDT, 업비트: 달러 환산 KRW). 가격 조회 실패 시 옛 **수량** 먼지 기준으로 폴백. |
 

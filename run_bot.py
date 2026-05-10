@@ -418,7 +418,12 @@ import logging
 for _yn in ("yfinance", "urllib3"):
     logging.getLogger(_yn).setLevel(logging.ERROR)
 
-from utils.telegram import configure_telegram, register_telegram_atexit, send_telegram
+from utils.telegram import (
+    attach_telegram_error_alerts,
+    configure_telegram,
+    register_telegram_atexit,
+    send_telegram,
+)
 from utils.helpers import (
     is_coin_ticker,
     configure_kis_token_path,
@@ -439,6 +444,7 @@ with open(BASE_DIR / "config.json", "r", encoding="utf-8") as f:
 
 configure_telegram(config)
 register_telegram_atexit()
+attach_telegram_error_alerts()
 
 from api import kis_api, upbit_api
 from api import coin_broker, coin_config
@@ -4826,6 +4832,31 @@ def run_trading_bot():
                                         "https://api.upbit.com/v1/ticker?markets=" + ",".join(markets),
                                         timeout=10,
                                     ).json()
+                                    # 업비트 KRW 마켓의 USD/원화 페그 스테이블(KRW-USDT, KRW-DAI 등) 차단:
+                                    # 1) base 심볼이 알려진 스테이블이면 제외
+                                    # 2) 24h 고저 스프레드(=`high_price`/`low_price`) 가 종가의 0.5% 미만이면 제외
+                                    _UPBIT_STABLE_BASES = {
+                                        "USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD",
+                                        "USDS", "USDD", "USDE", "PYUSD",
+                                    }
+                                    def _upbit_skip(t: dict) -> bool:
+                                        try:
+                                            mkt = str(t.get("market", "") or "")
+                                            if not mkt.startswith("KRW-"):
+                                                return True
+                                            base = mkt.split("-", 1)[1].upper()
+                                            if base in _UPBIT_STABLE_BASES:
+                                                return True
+                                            last = float(t.get("trade_price") or 0)
+                                            high = float(t.get("high_price") or 0)
+                                            low = float(t.get("low_price") or 0)
+                                            if last > 0 and high > 0 and low > 0:
+                                                if (high - low) / last < 0.005:
+                                                    return True
+                                        except Exception:
+                                            return False
+                                        return False
+                                    tickers_data = [t for t in tickers_data if not _upbit_skip(t)]
                                     scan_targets = [
                                         x["market"]
                                         for x in sorted(

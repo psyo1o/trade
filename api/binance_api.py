@@ -244,8 +244,51 @@ def order_avg_fill_usdt(order: dict[str, Any]) -> tuple[float, float]:
     return 0.0, 0.0
 
 
+# 알려진 USD 페그 스테이블 — 트레이딩 유니버스에서 항상 제외.
+# (변동성이 거의 0이라 우리 V8/SWING 하드스탑에 즉시 걸려 손실만 누적된다.)
+USD_STABLE_DENYLIST: frozenset[str] = frozenset({
+    "USDC", "FDUSD", "TUSD", "USDP", "DAI",
+    "BUSD", "GUSD", "LUSD", "MIM", "FRAX", "CRVUSD", "SUSD",
+    "USDD", "USDE", "USDB", "USTC", "USDX", "USDS",
+    "PYUSD", "USDT0", "USR", "USD0",
+})
+
+
+def is_usd_pegged_ticker(ticker_data: dict, base_symbol: str) -> bool:
+    """24h 가격 범위로 모르는 USD 페그/스테이블도 동적으로 감지.
+
+    * ``last`` 가 0.97~1.03 USDT 안이고 24h 고저 스프레드가 last 의 0.5% 미만 → 페그로 간주.
+    * ``last`` 가 정확히 1.0000 으로 떨어져 있는 경우(소수 4째자리 일치)도 페그 의심.
+    * 두 조건 중 하나라도 충족하면 ``True``.
+    """
+    try:
+        last = float(ticker_data.get("last") or ticker_data.get("close") or 0.0)
+        high = float(ticker_data.get("high") or 0.0)
+        low = float(ticker_data.get("low") or 0.0)
+    except Exception:
+        return False
+    if last <= 0:
+        return False
+    if not (0.97 <= last <= 1.03):
+        return False
+    if high > 0 and low > 0:
+        spread = (high - low) / last
+        if spread < 0.005:  # 0.5% 미만 — 트레이딩 의미 없는 평탄 자산
+            return True
+    if abs(last - 1.0) < 0.0005:
+        return True
+    base = str(base_symbol or "").upper()
+    if base.startswith("USD") or base.endswith("USD"):
+        return True
+    return False
+
+
 def top_usdt_symbols_by_quote_volume(limit: int = 50) -> list[str]:
-    """거래대금(quote) 상위 → 내부 티커 ``USDT-XXX``."""
+    """거래대금(quote) 상위 → 내부 티커 ``USDT-XXX``.
+
+    USD 페그/스테이블 자산은 정적 denylist 와 24h 가격 범위 기반 동적 감지로 같이 걸러낸다
+    (페그 자산은 변동성이 거의 0이라 매수 즉시 하드스탑에 걸리는 함정이라).
+    """
     ex = ensure_exchange()
     tickers = ex.fetch_tickers()
     scored: list[tuple[float, str]] = []
@@ -253,7 +296,9 @@ def top_usdt_symbols_by_quote_volume(limit: int = 50) -> list[str]:
         if not sym.endswith("/USDT"):
             continue
         base = sym.split("/")[0].upper()
-        if base in ("USDC", "FDUSD", "TUSD", "USDP", "DAI"):
+        if base in USD_STABLE_DENYLIST:
+            continue
+        if is_usd_pegged_ticker(t, base):
             continue
         qv = float(t.get("quoteVolume") or t.get("quote_volume") or 0)
         scored.append((qv, sym))

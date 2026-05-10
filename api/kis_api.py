@@ -246,6 +246,60 @@ def get_us_cash_real(broker):
         return 0.0
 
 
+def fetch_kr_orderbook(broker, ticker):
+    """국내주식 호가 잔량 합계 조회 (TR ``FHKST01010200``).
+
+    ``broker.fetch_price`` 가 가는 ``inquire-price``(현재가) 엔드포인트는 호가 잔량을
+    내려주지 않으므로, AI 필터/유동성 점검용으로 ``inquire-asking-price-exp-ccn``
+    (예상체결+호가) 엔드포인트를 직접 호출한다.
+
+    Returns
+        ``{"bid_size_total": float, "ask_size_total": float}`` —
+        ``output1.total_bidp_rsqn`` / ``output1.total_askp_rsqn`` (1~10호가 누적 잔량).
+        해당 키가 비어 있으면 ``bidp_rsqn1..10`` / ``askp_rsqn1..10`` 을 직접 합산한다.
+        실패 시 ``{"bid_size_total": 0.0, "ask_size_total": 0.0}``.
+    """
+    try:
+        if broker is None:
+            return {"bid_size_total": 0.0, "ask_size_total": 0.0}
+        code = "".join(ch for ch in str(ticker or "").strip() if ch.isdigit()).zfill(6)
+        if not code or code == "000000":
+            return {"bid_size_total": 0.0, "ask_size_total": 0.0}
+
+        url = f"{broker.base_url}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {broker.access_token}",
+            "appkey": broker.api_key,
+            "appsecret": broker.api_secret,
+            "tr_id": "FHKST01010200",
+            "custtype": "P",
+        }
+        params = {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": code}
+        res = requests.get(url, headers=headers, params=params, timeout=8)
+        data = res.json() if hasattr(res, "json") else {}
+
+        out1 = data.get("output1") if isinstance(data, dict) else None
+        if not isinstance(out1, dict):
+            return {"bid_size_total": 0.0, "ask_size_total": 0.0}
+
+        def _f(v):
+            try:
+                return float(str(v).replace(",", "").strip() or 0)
+            except Exception:
+                return 0.0
+
+        bid_total = _f(out1.get("total_bidp_rsqn", 0))
+        ask_total = _f(out1.get("total_askp_rsqn", 0))
+        if bid_total <= 0:
+            bid_total = sum(_f(out1.get(f"bidp_rsqn{i}", 0)) for i in range(1, 11))
+        if ask_total <= 0:
+            ask_total = sum(_f(out1.get(f"askp_rsqn{i}", 0)) for i in range(1, 11))
+        return {"bid_size_total": bid_total, "ask_size_total": ask_total}
+    except Exception:
+        return {"bid_size_total": 0.0, "ask_size_total": 0.0}
+
+
 def get_kis_ohlcv(broker, code, timeframe='D', count=60):
     """KIS API로 OHLCV 가져오기"""
     try:
