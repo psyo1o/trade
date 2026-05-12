@@ -111,8 +111,7 @@ def get_quote_balance_direct() -> float | None:
     """거래소 API 직접 조회(주문 직전 가용)."""
     try:
         if coin_config.is_binance():
-            ex = binance_api.ensure_exchange()
-            bal = ex.fetch_balance()
+            bal = binance_api.fetch_balance()
             us = bal.get("USDT") or {}
             return float(us.get("free") or 0.0)
         if upbit_api.upbit is None:

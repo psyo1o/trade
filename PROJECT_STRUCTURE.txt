@@ -67,13 +67,13 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
   - 스핀: 국·미·코인 max_positions + "설정 실시간 적용" → run_bot.MAX_* 즉시 + bot_state settings 저장.
   - 실시간 현황 보유표 마지막 열: 수량 QLineEdit(기본=행 보유 전량, 비우면 전량) + 매도 버튼 → _on_manual_sell_click
     (보유 초과·정수 주/코인 소수 검증) → run_bot.manual_sell.
-  - 탭: 실시간 현황(보유표·수동매도), 매매 내역(trade_history), 장부(positions, 마지막 열은 tier),
+  - 탭: 실시간 현황(보유표·수동매도), 매매 내역(trade_history), 장부(positions, 마지막 열은 전략명=tier),
     고점 보정(입출금, adjust_capital 동일·CapitalAdjustThread).
     봇 브리핑 로그는 탭 아래 공통 영역(QSplitter, run_gui.py setSizes).
   - 매매: 기동 직후 즉시 1회 없음 → KST :00/:15/:30/:45 정렬 타이머만 (중복 실행 가드).
   - 기동 직후 약 150ms에 refresh_balance(sync_first=False) 1회로 화면만 선채움.
   - 매매 직전 refresh_balance로 max_p 맞춤 후 WorkerThread에서 엔진.
-  - 텔레 heartbeat: 기동 직후 전송 없음 → 다음 KST :00/:30 정렬 후 반복 (백그라운드).
+  - 텔레 heartbeat: 기동 직후 전송 없음 → KST :00/:30 슬롯 예약 후 해당 15분 매매 사이클 종료 뒤 전송 (백그라운드).
   - 스캐너: GUI 기동 시 start_scanner_scheduler 연동.
   - 네트워크 연속 실패 시 종료(BOT_DISABLE_NET_WATCH 로 감시 끔 가능).
   - 잔고 스레드: BalanceUpdaterThread + gui_table_adapter.build_rows_data.
@@ -146,6 +146,7 @@ execution/
     compute_ticker_cooldown_hours / set_ticker_cooldown_after_sell (Layer2 ticker_cooldowns:
     전략·시장·사유 매트릭스(h), 분할 잔량 시 미부여)
   sync_positions.py … 실계좌↔장부. KR/US 휴장(is_market_open False)이면 KIS 시드·유령·주식 자동복구 생략(코인은 계속).
+    바이낸스 코인은 평단 API 없음 → 현재가로 buy_p 덮지 않음, trade_history·장부 buy_p·GUI 수량 정합.
     비장중 KIS 빈 보유 시 장부 키로 held 보강(유령 일괄 삭제 방지). 자동복구 buy_date 는 trade_history 마지막 BUY 우선. held∪live_seeds 보수적 유령 판단 등
   order_twap.py … Phase2 TWAP
   scale_out.py … V8 분할 익절(Scale-Out); post_partial_ledger(..., set_scale_out_done=True 기본),

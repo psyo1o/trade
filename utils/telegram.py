@@ -144,12 +144,18 @@ class _TelegramAlertHandler(logging.Handler):
     - **폭주 방지**: 분당 최대 ``max_per_minute`` 건, 같은 본문은 ``dedup_window_sec`` 동안 1회만.
     - **루프 차단**: 본문에 ``텔레그램`` / ``telegram`` 이 들어간 라인은 무시
       (``send_telegram`` 자체에서 찍는 재시도 경고가 다시 트리거되는 것을 방지).
+    - **운영 로그 제외**: ``손실 구간`` 등 정기 보유 감시 문구는 GUI 로그에만 남기고 텔레그램에는 보내지 않음.
     """
 
     _ALERT_PREFIX_TOKENS = ("⚠️", "🚨", "🛑")
     _TRACEBACK_HEADER = "Traceback (most recent call last):"
     # ``ValueError: x`` / ``builtins.RuntimeError: y`` / ``KeyError`` 등
     _EXC_LINE_RE = re.compile(r"^\s*([A-Za-z_][\w\.]*)(Error|Exception|Warning)(:|\s|$)")
+    # 매 사이클 보유 감시용 INFO성 로그 — ``⚠️`` 가 있어도 텔레그램 에러 알림에서 제외
+    _ROUTINE_ALERT_SUPPRESS_SUBSTRINGS = (
+        "손실 구간:",
+        "손실 구간：",
+    )
 
     def __init__(
         self,
@@ -172,6 +178,9 @@ class _TelegramAlertHandler(logging.Handler):
         self._send_times: list[float] = []
         self._recent: dict[int, float] = {}
         self._sticky_until: float = 0.0
+
+    def _suppress_routine_alert(self, msg: str) -> bool:
+        return any(token in msg for token in self._ROUTINE_ALERT_SUPPRESS_SUBSTRINGS)
 
     def _is_alert(self, record: logging.LogRecord, msg: str) -> bool:
         now = time.time()
@@ -206,6 +215,8 @@ class _TelegramAlertHandler(logging.Handler):
         # 텔레그램 전송 자체에서 찍는 라인은 무시(루프 차단)
         low = msg.lower()
         if "텔레그램" in msg or "telegram" in low:
+            return
+        if self._suppress_routine_alert(msg):
             return
         with self._lock:
             if not self._is_alert(record, msg):

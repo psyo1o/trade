@@ -89,10 +89,6 @@ from execution.scale_out import (
 from execution.sync_positions import sync_all_positions
 from strategy.ai_filter import (
     evaluate_false_breakout_filter,
-    get_orderbook_summary_for_coin,
-    get_orderbook_summary_from_broker,
-    get_recent_15m_ohlcv,
-    get_recent_daily_ohlcv,
     summarize_ai_rationale,
 )
 from strategy.rules import (
@@ -1998,7 +1994,7 @@ def _execute_kr_market_buy_twap(
         "buy_p": wavg,
         "sl_p": sl_p,
         "max_p": wavg,
-        "tier": t_name,
+        "tier": s_name,
         "buy_time": time.time(),
         "qty": float(total_qty),
         "entry_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
@@ -2108,7 +2104,7 @@ def _execute_us_market_buy_twap(
         "buy_p": wavg,
         "sl_p": sl_p,
         "max_p": wavg,
-        "tier": t_name,
+        "tier": s_name,
         "buy_time": time.time(),
         "qty": float(total_qty),
         "entry_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
@@ -2124,6 +2120,30 @@ def _execute_us_market_buy_twap(
         print(f"  ⚠️ [US BUY TWAP] 매매내역 기록 실패: {log_err}")
     ensure_position_registered(t, state.get("positions", {}).get(t, {}), context="US BUY TWAP")
     return True
+
+
+def _coin_twap_filled_base_qty(order_resp, pay_krw: float, ticker: str, unit_price: float) -> float:
+    """코인 TWAP 슬라이스 체결 수량(base). 매매내역·장부는 코인 수량 기준."""
+    px = float(_to_float(unit_price, 0.0))
+    pay = float(_to_float(pay_krw, 0.0))
+    if order_resp and coin_config.is_binance():
+        try:
+            from api import binance_api as _bn
+
+            if isinstance(order_resp, dict):
+                _avg, filled = _bn.order_avg_fill_usdt(order_resp)
+                if float(filled or 0) > 0:
+                    return float(filled)
+        except Exception:
+            pass
+    if px <= 0:
+        px = float(_to_float(coin_broker.get_current_price(ticker), 0.0))
+    if px <= 0 or pay <= 0:
+        return 0.0
+    if coin_config.is_binance():
+        kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
+        return (pay / kpx) / px
+    return pay / px
 
 
 def _execute_coin_market_buy_twap(
@@ -2144,6 +2164,7 @@ def _execute_coin_market_buy_twap(
         print(f"  📉 [Phase2 TWAP COIN] {t} 예산 {int(budget_krw):,}원 → {len(slices)}분할")
 
     spent = 0.0
+    filled_base_qty = 0.0
     last_p = float(coin_broker.get_current_price(t) or 0.0)
     any_fill = False
     _min_krw = _coin_min_order_krw()
@@ -2172,6 +2193,7 @@ def _execute_coin_market_buy_twap(
                     f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {int(krw_slice):,}KRW"
                 )
             spent += float(krw_slice)
+            filled_base_qty += _coin_twap_filled_base_qty(None, float(krw_slice), t, last_p)
             krw_bal_holder[0] = float(krw_bal_holder[0]) - float(krw_slice)
             any_fill = True
         else:
@@ -2214,6 +2236,7 @@ def _execute_coin_market_buy_twap(
                 )
                 break
             spent += float(pay_krw)
+            filled_base_qty += _coin_twap_filled_base_qty(resp, float(pay_krw), t, last_p)
             after_raw = coin_broker.get_quote_balance_direct()
             if coin_config.is_binance():
                 kpx = float(coin_broker.get_krw_per_usdt())
@@ -2233,7 +2256,7 @@ def _execute_coin_market_buy_twap(
     if not any_fill or spent <= 0 or last_p <= 0:
         return False
 
-    coin_qty = spent / last_p
+    coin_qty = float(filled_base_qty) if filled_base_qty > 0 else _coin_twap_filled_base_qty(None, spent, t, last_p)
     coin_name = get_coin_name(t)
     if coin_config.is_binance():
         p_fmt = _fmt_telegram_coin_unit_usdt(last_p)
@@ -2264,7 +2287,7 @@ def _execute_coin_market_buy_twap(
     }
     persist_position_registration(state, t, payload, context="COIN BUY TWAP")
     try:
-        _record_trade_event("COIN", t, "BUY", spent, price=last_p, profit_rate=None, reason=s_name)
+        _record_trade_event("COIN", t, "BUY", coin_qty, price=last_p, profit_rate=None, reason=s_name)
     except Exception as log_err:
         print(f"  ⚠️ [COIN BUY TWAP] 매매내역 기록 실패: {log_err}")
     ensure_position_registered(t, state.get("positions", {}).get(t, {}), context="COIN BUY TWAP")
@@ -3428,22 +3451,16 @@ def _ai_false_breakout_buy_gate(
     ticker: str,
     market_tag: str,
     strategy_type: str,
-    orderbook: dict,
     threshold: int,
     log_label: str,
 ) -> bool:
-    """Phase 3 가짜 돌파·스윙 함정 필터. True = 통과(매수 진행), False = 차단."""
+    """Phase 3 뉴스 악재 필터. True = 통과(매수 진행), False = 차단."""
     if not AI_FALSE_BREAKOUT_ENABLED:
         return True
     st = str(strategy_type or "TREND_V8").upper()
-    if st == "SWING_FIB":
-        rows = get_recent_daily_ohlcv(ticker, market=market_tag, count=15)
-    else:
-        rows = get_recent_15m_ohlcv(ticker, market=market_tag, count=10)
     ai_eval = evaluate_false_breakout_filter(
         ticker=ticker,
-        candles=rows,
-        orderbook=orderbook,
+        market=market_tag,
         threshold=int(threshold),
         use_ai=True,
         ai_provider=AI_FALSE_BREAKOUT_PROVIDER,
@@ -3944,13 +3961,11 @@ def run_trading_bot():
                                 )
                                 continue
 
-                            # Phase 3: 매수 직전 AI 필터 (V8=15m+호가, 스윙=일봉+호가)
-                            orderbook_ai = get_orderbook_summary_from_broker(kis_api.broker_kr, t)
+                            # Phase 3: 매수 직전 뉴스 악재 필터
                             if not _ai_false_breakout_buy_gate(
                                 t,
                                 "KR",
                                 strategy_type,
-                                orderbook_ai,
                                 AI_FALSE_BREAKOUT_THRESHOLD,
                                 f"{kr_name}({t})",
                             ):
@@ -4432,12 +4447,10 @@ def run_trading_bot():
                                         f"(총자산 ${total_us_equity:.2f}, 비중캡 후 ratio={ratio:.4f}, macro×{macro_mult:.2f}, 예수금 ${us_cash:.2f})"
                                     )
                                     continue
-                                orderbook_ai = get_orderbook_summary_from_broker(kis_api.broker_us, t)
                                 if not _ai_false_breakout_buy_gate(
                                     t,
                                     "US",
                                     strategy_type,
-                                    orderbook_ai,
                                     AI_FALSE_BREAKOUT_THRESHOLD,
                                     f"{us_name}({t})",
                                 ):
@@ -4954,12 +4967,10 @@ def run_trading_bot():
                                     )
                                     continue
 
-                                orderbook_ai = get_orderbook_summary_for_coin(t)
                                 if not _ai_false_breakout_buy_gate(
                                     t,
                                     "COIN",
                                     strategy_type,
-                                    orderbook_ai,
                                     AI_FALSE_BREAKOUT_THRESHOLD_COIN,
                                     f"{get_coin_name(t)}({t})",
                                 ):
@@ -5007,6 +5018,20 @@ def run_trading_bot():
 
     save_state(STATE_PATH, state)
     print("="*60)
+
+
+def _kst_minute_is_half_hour_mark() -> bool:
+    """KST 벽시계 :00 / :30 슬롯 여부."""
+    now = datetime.now(pytz.timezone("Asia/Seoul"))
+    return int(now.minute) in (0, 30)
+
+
+def run_trading_bot_maybe_heartbeat(with_heartbeat: bool = False):
+    """KST 분봉 매매 사이클 실행. ``with_heartbeat`` 이면 사이클 종료 후 생존신고."""
+    run_trading_bot()
+    if with_heartbeat:
+        heartbeat_report()
+
 
 # =====================================================================
 # 7. 스케줄러 — ``schedule`` 패키지의 pending 잡을 백그라운드 스레드에서 소비
@@ -5141,24 +5166,23 @@ def main() -> None:
         error_msg = f"실보유 조회 실패 ({', '.join(failed_apis)} API 오류)"
         print(f"  ⚠️ [장부 동기화 건너뜀] {error_msg} - 기존 장부 유지")
 
-    heartbeat_report()
-    run_trading_bot()
-
-    schedule.every(4).hours.do(heartbeat_report)
+    run_trading_bot_maybe_heartbeat(with_heartbeat=_kst_minute_is_half_hour_mark())
 
     # 매매 사이클: KST 벽시계 :00 / :15 / :30 / :45 (기동 직후 위에서 1회 이미 실행됨)
     schedule.clear("trading")
     for minute_mark in (":00", ":15", ":30", ":45"):
+        with_heartbeat = minute_mark in (":00", ":30")
+        job = lambda hb=with_heartbeat: run_trading_bot_maybe_heartbeat(with_heartbeat=hb)
         try:
-            schedule.every().hour.at(minute_mark, "Asia/Seoul").do(run_trading_bot).tag("trading")
+            schedule.every().hour.at(minute_mark, "Asia/Seoul").do(job).tag("trading")
         except TypeError:
-            schedule.every().hour.at(minute_mark).do(run_trading_bot).tag("trading")
+            schedule.every().hour.at(minute_mark).do(job).tag("trading")
 
     start_scanner_scheduler()
 
     run_continuously()
     print("\n✅ 모든 시스템이 정상적으로 가동되었습니다.")
-    print("  [스케줄] 매매: 매시 KST :00 / :15 / :30 / :45 + 기동 직후 1회")
+    print("  [스케줄] 매매: 매시 KST :00 / :15 / :30 / :45 + 기동 직후 1회 (생존신고: :00·:30 사이클 종료 후)")
 
     while True:
         time.sleep(60)

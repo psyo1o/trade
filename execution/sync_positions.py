@@ -120,6 +120,39 @@ def _last_buy_timestamp_from_trade_history(
     return last_ts
 
 
+def _last_buy_price_from_trade_history(
+    ticker: str,
+    market: str,
+    *,
+    history_path: Path | None = None,
+) -> float:
+    """``trade_history.json`` 의 해당 티커 최근 BUY ``price`` (없으면 0)."""
+    path = history_path if history_path is not None else DEFAULT_TRADE_HISTORY_PATH
+    if not path.is_file():
+        return 0.0
+    key = normalize_ticker(ticker)
+    m = (market or "").strip().upper()
+    try:
+        raw = path.read_text(encoding="utf-8")
+        rows = json.loads(raw)
+    except (OSError, ValueError, TypeError):
+        return 0.0
+    if not isinstance(rows, list):
+        return 0.0
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("side", "")).upper() != "BUY":
+            continue
+        if str(row.get("market", "")).strip().upper() != m:
+            continue
+        t = normalize_ticker(str(row.get("ticker", "") or ""))
+        if t != key:
+            continue
+        return _to_float(row.get("price"), 0.0)
+    return 0.0
+
+
 def _get_live_position_seeds(*, skip_kr: bool = False, skip_us: bool = False):
     """실계좌 보유종목의 진입 기준가(평단)·수량 시드 수집
     - 국장/미장: API 응답의 평균단가·보유수량
@@ -188,10 +221,10 @@ def _get_live_position_seeds(*, skip_kr: bool = False, skip_us: bool = False):
                 if not ticker:
                     continue
                 avg_p = _to_float(b.get('avg_buy_price', 0))
-                if avg_p <= 0:
+                if avg_p <= 0 and not coin_config.is_binance():
                     cp = coin_broker.get_current_price(ticker)
                     avg_p = _to_float(cp, 0)
-                if avg_p > 0:
+                if qty > 0:
                     seeds[ticker] = {"avg_p": float(avg_p), "qty": float(qty)}
     except Exception:
         pass
@@ -333,7 +366,11 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
     for ticker, seed in live_seeds.items():
         real_avg_p = float(seed["avg_p"])
         live_qty = float(seed["qty"])
+        if real_avg_p <= 0 and is_coin_ticker(ticker):
+            real_avg_p = float(_last_buy_price_from_trade_history(ticker, "COIN") or 0.0)
         if ticker not in current_positions:
+            if real_avg_p <= 0 and is_coin_ticker(ticker):
+                continue
             # 신규 복구 로직: 코인과 주식 데이터 수집 분리
             if is_coin_ticker(ticker):
                 ohlcv = coin_broker.fetch_ohlcv(ticker, "day", 30)
@@ -372,7 +409,7 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
                 continue
             if (not str(ticker).isdigit()) and (not is_coin_ticker(str(ticker))) and skip_us_sync:
                 continue
-            if abs(float(pos.get('buy_p', 0)) - float(real_avg_p)) > 0.0001:
+            if real_avg_p > 0 and abs(float(pos.get('buy_p', 0)) - float(real_avg_p)) > 0.0001:
                 old_p = pos.get('buy_p')
                 pos['buy_p'] = float(real_avg_p)
                 # 만약 최고가가 매수가보다 낮아져 있다면 함께 보정

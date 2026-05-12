@@ -1,6 +1,6 @@
 # c-bot — 국·미·코인 자동매매 봇
 
-_문서 갱신: 2026-05-01 — 아래 내용은 저장소 코드(`run_bot.py`, `run_gui.py`, `execution/guard.py`, `execution/sync_positions.py` 등)와 맞춰 두었습니다._
+_문서 갱신: 2026-05-12 — 아래 내용은 저장소 코드(`run_bot.py`, `run_gui.py`, `execution/guard.py`, `execution/sync_positions.py` 등)와 맞춰 두었습니다._
 
 ---
 
@@ -118,11 +118,13 @@ py -3.11 adjust_capital.py
    - 잔고 갱신 시 `build_account_snapshot_for_report`·`gui_table_adapter` 경로로 행이 만들어집니다. **바이낸스**일 때 코인 행의 매수가·현재가는 **USDT** 단위로 표시합니다(업비트는 **원**).  
 
 2. **매매 내역**  
-   - `trade_history.json` 을 읽어 **시간·시장·종목·매수/매도·수량·가격·수익률·사유** 를 표로 보여 줍니다.
+   - `trade_history.json` 을 읽어 **시간·시장·종목·매수/매도·수량·가격·수익률·사유** 를 표로 보여 줍니다.  
+   - **코인 `BUY`의 `qty`** 는 **체결 코인 수량(base)** 입니다(원화·USDT 지출액이 아님). 과거에 잘못 기록된 행은 수동 보정이 필요합니다.
 
 3. **장부 (현재 포지션)**  
    - `bot_state.json` 의 `positions` 를 읽어 **매수가·손절가·최고가·수량·매수시간** 등을 표시합니다. 코인이 **바이낸스(USDT 마켓)** 이면 해당 가격 열은 **USDT** 로 보여 줍니다(업비트 코인은 **원**).  
-   - 마지막 열 헤더는 **「전략」** 이지만, 현재 코드 기준으로는 장부의 **`tier`** 문자열이 들어갑니다(비어 있으면 공란). V8/스윙 구분(`strategy_type`)을 화면에 꼭 보이게 하려면 추후 컬럼 추가가 필요합니다.
+   - **수량**은 실시간 보유 표와 같이 **실계좌 잔고**를 우선 표시합니다(`qty` 미기록·구형 장부도 동기화·조회로 맞춤).  
+   - 마지막 열 **「전략」** 은 매수 시 `tier`에 기록된 **V8·스윙 전략명**을 보여 줍니다. `1/N 고정` 같은 비중 라벨·`strategy_type`만 있는 구형 행은 화면에서 전략명으로 복원합니다.
 
 4. **고점 보정 (입출금)**  
    - `adjust_capital.py` 와 **동일한 로직**을 백그라운드 스레드(`CapitalAdjustThread`)로 실행합니다.  
@@ -134,7 +136,7 @@ py -3.11 adjust_capital.py
 |------|------|
 | **매매 엔진** | 기동 직후 즉시 실행 없이, **KST `:00` / `:15` / `:30` / `:45`** 마다 `run_trading_bot()` 실행. 이미 한 사이클이 돌고 있으면 중복 호출은 건너뜁니다. |
 | **매매 직전** | `do_trade()` 안에서 잔고 갱신(`refresh_balance`)으로 **최신 `max_p` 등**을 맞춘 뒤 `WorkerThread`에서 실제 `run_trading_bot()` 을 돌립니다. |
-| **텔레그램 heartbeat** | **기동 직후 전송 없음.** 다음 **KST `:00` / `:30`** 에 맞춰 전송·재스케줄 — UI 스레드를 막지 않도록 **별도 스레드**에서 `heartbeat_report()` 호출. |
+| **텔레그램 heartbeat** | **기동 직후 전송 없음.** 다음 **KST `:00` / `:30`** 슬롯을 예약한 뒤, **해당 슬롯의 15분 매매 사이클(`:00/:15/:30/:45`)이 끝난 다음** `heartbeat_report()` 를 보냅니다(UI 스레드 블로킹 방지용 백그라운드 스레드). |
 | **스캐너 스케줄** | GUI가 `run_bot` 을 불러올 때 `start_scanner_scheduler()` 가 한 번 붙습니다(국·미 스캔 시각은 README 앞부분·`PROJECT_STRUCTURE.txt` 참고). |
 | **네트워크 감시** | 일정 간격으로 외부망 연결을 검사하고, **연속 실패** 시 프로세스를 종료합니다. `run_bot.bat` 로 감싸 두었다면 **자동 재기동**에 맡기는 설계입니다. (끄려면 환경 변수 `BOT_DISABLE_NET_WATCH` 참고 — 코드 주석 확인.) |
 
@@ -163,7 +165,7 @@ c-bot/
 ├── execution/          # 동기화, TWAP, 분할익절, 서킷브레이커
 ├── services/           # 잔고 facade, 스냅샷, GUI 테이블 어댑터
 ├── utils/              # 로그, 텔레그램, 공통 헬퍼
-├── tests/              # 실험·회귀 테스트
+├── tests/              # 실험·회귀 테스트 (test_lab, test_kis_parsers, test_alt_data_research, test_news_fetch, diagnose_*)
 └── 조건검색/           # HTS 조건검색식 등(참고용 리소스)
 ```
 
@@ -407,7 +409,7 @@ if cash < target_budget:
 - `upbit_access`, `upbit_secret`
 - `telegram_token`, `telegram_chat_id`
 - (선택) `telegram_connect_timeout_sec`(기본 30), `telegram_read_timeout_sec`(기본 60), `telegram_max_retries`(기본 5) — `utils/telegram.py` 에서 연결 타임아웃·재시도 조절
-- (선택) `telegram_error_alerts` (기본 `true`) — `QuantBot` 로거에 부착된 ``_TelegramAlertHandler`` 가 **GUI 콘솔에 찍히는 모든 라인**과 **헤드리스(`run_bot.py` 단독)의 stderr 트레이스백**을 동일하게 감시한다. 캡처 대상은 (1) `WARNING` 이상 레벨, (2) 본문에 `⚠️` / `🚨` / `🛑` 포함, (3) 파이썬 트레이스백 헤더 `Traceback (most recent call last):`, (4) ``XxxError: ...`` / ``XxxException: ...`` 마지막 줄. 이런 시그널 라인이 잡히면 직후 **1.5초 동안 이어지는 후속 라인(`File "...", line ...` / 코드 라인)** 도 같이 캡처되어 트레이스백이 통째로 한 통으로 묶인다. **묶음 윈도우 2초**, **분당 최대 6건**, 같은 본문 **5분 중복 차단**(폭주 방지). 본문에 “텔레그램/telegram” 이 들어간 라인은 무시하므로 송신 자체에서 찍는 재시도 경고는 다시 알림으로 가지 않는다. `false` 로 끄면 기존 `atexit` 종료 알림만 남는다.
+- (선택) `telegram_error_alerts` (기본 `true`) — `QuantBot` 로거에 부착된 ``_TelegramAlertHandler`` 가 **GUI 콘솔에 찍히는 모든 라인**과 **헤드리스(`run_bot.py` 단독)의 stderr 트레이스백**을 동일하게 감시한다. 캡처 대상은 (1) `WARNING` 이상 레벨, (2) 본문에 `⚠️` / `🚨` / `🛑` 포함, (3) 파이썬 트레이스백 헤더 `Traceback (most recent call last):`, (4) ``XxxError: ...`` / ``XxxException: ...`` 마지막 줄. 이런 시그널 라인이 잡히면 직후 **1.5초 동안 이어지는 후속 라인(`File "...", line ...` / 코드 라인)** 도 같이 캡처되어 트레이스백이 통째로 한 통으로 묶인다. **묶음 윈도우 2초**, **분당 최대 6건**, 같은 본문 **5분 중복 차단**(폭주 방지). 본문에 “텔레그램/telegram” 이 들어간 라인은 무시하므로 송신 자체에서 찍는 재시도 경고는 다시 알림으로 가지 않는다. **정기 보유 감시** 문구(예: `손실 구간:` 수익률 로그)는 GUI·파일 로그에만 남기고 **텔레그램 에러 알림에는 보내지 않는다**. `false` 로 끄면 기존 `atexit` 종료 알림만 남는다.
 
 <a id="coin-exchange-config"></a>
 
@@ -423,6 +425,7 @@ if cash < target_budget:
 | `binance_access`, `binance_secret` | 바이낸스 API 키. |
 | `krw_per_usdt` | (선택) 1 USDT당 원화. 없으면 Yahoo `USDKRW=X` 등으로 추정(401 소음·실패 가능) — **직접 입력 권장**. |
 | `binance_min_cost_usdt` | (선택) 최소 주문 명목(USDT), 기본 10 근처 — CCXT 마켓 정보와 함께 최소금액 검사에 사용. |
+| `binance_recv_window` | (선택) CCXT 서명 요청 `recvWindow`(ms). 기본 **60000**. PC 시각이 어긋나 `-1021` 이 나면 `api/binance_api.py` 가 서버 시각 보정·1회 재시도한다. |
 | `binance_universe_top` | (선택) 바이낸스 24h USDT 거래대금 상위 N만 스캔, 기본 **50**. |
 | `upbit_universe_top` | (선택) 업비트 KRW 마켓 거래대금 상위 N만 스캔, 기본 **20**. |
 | (스테이블/페그 자동 차단) | 바이낸스·업비트 스캔 모두 **USD/원화 페그 자산은 자동 제외**한다. (1) 알려진 정적 denylist (`USDC`, `USDT`, `FDUSD`, `TUSD`, `USDP`, `DAI`, `BUSD`, `GUSD`, `LUSD`, `MIM`, `FRAX`, `crvUSD`, `sUSD`, `USDD`, `USDE`, `USDB`, `USTC`, `USDX`, `USDS`, `PYUSD`, `USDT0`, `USR`, `USD0` 등). (2) 동적 페그 감지 — `last` 가 `[0.97, 1.03] USDT` 안이고 24h `(high - low) / last < 0.5%` 이거나 `last` 가 `1.0000` 근처(±0.0005)면 페그로 간주해 스킵. 업비트 KRW 마켓도 같은 사상으로 스프레드 0.5% 미만이면 제외. **이유**: 페그 자산은 변동성이 거의 0이라 V8/SWING 하드스탑(`buy_p` 손절선)에 매수 즉시 걸려 수수료·슬리피지로만 손실이 누적되는 함정이라(예: 과거 `USDT-U` 매수 직후 0.01% 하락에 손절). |
@@ -470,6 +473,14 @@ if cash < target_budget:
 ### 코인 먼지 잔고
 
 기본은 **`config.json`의 `coin_min_notional_usd`**(없으면 **1 USDT** 명목 미만)을 잔고·GUI에서 제외합니다. 현재가 조회가 실패할 때만 **`COIN_MIN_POSITION_QTY`**(`utils/helpers.py`) 수량 폴백을 씁니다.
+
+### 바이낸스 `-1021` (Timestamp / recvWindow)
+
+`InvalidNonce` / `Timestamp for this request is outside of the recvWindow` 는 **PC 시각과 바이낸스 서버 시각 불일치**가 흔한 원인입니다. `binance_recv_window` 조정과 함께 Windows 시간 동기화를 확인하세요. 코드는 `api/binance_api.py` 에서 CCXT `adjustForTimeDifference`·시각 재동기화·잔고/주문 1회 재시도를 씁니다.
+
+### 바이낸스 코인 매수가·수량이 장부·GUI·이력과 어긋남
+
+바이낸스 잔고 API는 **평단(`avg_buy_price`)을 주지 않는다**. `execution/sync_positions.py` 는 **현재가로 `buy_p`를 덮지 않고**, 장부·`trade_history.json`·GUI가 **같은 `buy_p`·실보유 수량**을 쓰도록 맞춥니다. 코인 자동 매수 TWAP 체결 알림·`trade_history` `BUY` `qty`·장부 `qty` 는 **체결 코인 수량** 기준입니다.
 
 ### 분할 익절(Scale-Out)을 바꿀 때
 

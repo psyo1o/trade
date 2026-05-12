@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import ccxt  # type: ignore
 
@@ -29,22 +30,56 @@ _cfg: dict = {}
 
 log = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+
+
+def _sync_exchange_clock(ex: ccxt.binance) -> None:
+    """바이낸스 서버 시각과 로컬 시각 차이를 CCXT에 반영한다."""
+    try:
+        ex.load_time_difference()
+        return
+    except Exception as exc:
+        log.debug("load_time_difference 실패: %s", exc)
+    try:
+        server_ms = int(ex.fetch_time())
+        ex.options["timeDifference"] = server_ms - ex.milliseconds()
+    except Exception as exc:
+        log.warning("바이낸스 서버 시각 동기화 실패: %s", exc)
+
+
+def _with_time_sync_retry(op: Callable[[ccxt.binance], _T]) -> _T:
+    """서명 요청(-1021) 실패 시 시각 재동기화 후 1회 재시도."""
+    ex = ensure_exchange()
+    for attempt in (1, 2):
+        try:
+            return op(ex)
+        except ccxt.InvalidNonce as exc:
+            if attempt >= 2:
+                raise
+            log.warning("바이낸스 타임스탬프 오류, 시각 재동기화 후 재시도: %s", exc)
+            _sync_exchange_clock(ex)
+
 
 def init_binance(config: dict) -> ccxt.binance:
     global exchange, _cfg
     _cfg = dict(config or {})
     api_key = str(_cfg.get("binance_access") or "").strip()
     secret = str(_cfg.get("binance_secret") or "").strip()
+    rw = int(_cfg.get("binance_recv_window") or 60000)
+    if rw <= 0:
+        rw = 60000
     opts: dict[str, Any] = {
         "apiKey": api_key,
         "secret": secret,
         "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
+        "options": {
+            "defaultType": "spot",
+            "adjustForTimeDifference": True,
+            "recvWindow": rw,
+        },
     }
-    rw = int(_cfg.get("binance_recv_window") or 60000)
-    if rw > 0:
-        opts["recvWindow"] = rw
     exchange = ccxt.binance(opts)
+    _sync_exchange_clock(exchange)
     exchange.load_markets()
     log.info("바이낸스 현물 마켓 로드 완료 (%s개)", len(exchange.markets))
     return exchange
@@ -54,6 +89,12 @@ def ensure_exchange() -> ccxt.binance:
     if exchange is None:
         raise RuntimeError("binance_api.init_binance(config) 가 아직 호출되지 않았습니다.")
     return exchange
+
+
+def fetch_balance(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """서명 잔고 조회 — 시각 동기화·-1021 재시도 포함."""
+    query = dict(params or {})
+    return _with_time_sync_retry(lambda ex: ex.fetch_balance(query))
 
 
 def internal_to_ccxt(symbol: str) -> str:
@@ -86,8 +127,7 @@ def get_balances_like_upbit() -> list[dict[str, Any]]:
 
     * ``currency``, ``balance``, ``locked``, ``avg_buy_price`` (없으면 '0')
     """
-    ex = ensure_exchange()
-    bal = ex.fetch_balance()
+    bal = _with_time_sync_retry(lambda ex: ex.fetch_balance())
     out: list[dict[str, Any]] = []
     totals = bal.get("total") or {}
     for cur, total_amt in totals.items():
@@ -187,9 +227,11 @@ def market_buy_usdt(internal_ticker: str, spend_usdt: float) -> dict[str, Any]:
         raise ValueError("spend_usdt<=0")
     spend_adj = float(ex.cost_to_precision(sym, spend))
     try:
-        order = ex.create_order(sym, "market", "buy", spend_adj, None, {"quoteOrderQty": spend_adj})
+        order = _with_time_sync_retry(
+            lambda ex: ex.create_order(sym, "market", "buy", spend_adj, None, {"quoteOrderQty": spend_adj})
+        )
     except Exception:
-        order = ex.create_market_buy_order(sym, spend_adj)
+        order = _with_time_sync_retry(lambda ex: ex.create_market_buy_order(sym, spend_adj))
     od = order if isinstance(order, dict) else {"info": order}
     avg, filled = order_avg_fill_usdt(od)
     tot = float(od.get("cost") or 0) or (avg * filled if avg > 0 and filled > 0 else spend_adj)
@@ -213,7 +255,7 @@ def market_sell_base(internal_ticker: str, qty: float) -> dict[str, Any]:
     q = float(q_adj) if q_adj is not None else float(ex.amount_to_precision(sym, float(qty)))
     if q <= 0:
         raise ValueError("qty<=0")
-    order = ex.create_market_sell_order(sym, q)
+    order = _with_time_sync_retry(lambda ex: ex.create_market_sell_order(sym, q))
     od = order if isinstance(order, dict) else {"info": order}
     avg, filled = order_avg_fill_usdt(od)
     tot = float(od.get("cost") or 0) or (avg * filled if avg > 0 and filled > 0 else 0.0)

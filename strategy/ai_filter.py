@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-Phase 3 — 전략별 **휩쏘·하락 함정** 필터.
+Phase 3 — 뉴스 악재 센티먼트 필터.
 
-* ``TREND_V8``: 15분봉 + 호가 → 가짜 돌파·펌프 의심도(0~100).
-* ``SWING_FIB``: 일봉(10~15개) + 호가 → 칼날·데드캣·좀비 의심도(0~100).
-
-LLM 실패 시 전략별 **룰베이스**로 대체하며, 반환 dict에 산출 경로를 포함한다.
+LLM(Gemini/OpenAI)은 OHLCV·호가 숫자가 아니라 **최근 뉴스 헤드라인**만 보고
+단기 치명 악재 여부를 0~100 위험도로 평가한다. 뉴스 수집 실패·본문 없음 시
+LLM 호출 없이 위험도 0(통과)으로 룰베이스 매매를 방해하지 않는다.
 """
 from __future__ import annotations
 
 import os
 import re
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple
 
-import pyupbit
 import requests
 import yfinance as yf
+
+_NEWS_LOOKBACK_SEC = 24 * 3600
+_NAVER_NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+_ROOT_AI_KEYS_CACHE: Dict[str, str] | None = None
 
 
 def _to_float(v: Any, default: float = 0.0) -> float:
@@ -30,11 +35,8 @@ def _to_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
-_ROOT_AI_KEYS_CACHE: Dict[str, str] | None = None
-
-
 def _load_root_ai_keys_file() -> Dict[str, str]:
-    """프로젝트 루트 ``ai_keys.txt`` — ``KEY=value`` 한 줄씩 (``tests/ai_keys.txt`` 와 동일 형식)."""
+    """프로젝트 루트 ``ai_keys.txt`` — ``KEY=value`` 한 줄씩."""
     global _ROOT_AI_KEYS_CACHE
     if _ROOT_AI_KEYS_CACHE is not None:
         return _ROOT_AI_KEYS_CACHE
@@ -73,365 +75,157 @@ def normalize_ai_strategy_type(strategy_type: str | None) -> str:
     return "SWING_FIB" if s == "SWING_FIB" else "TREND_V8"
 
 
-def get_recent_15m_ohlcv(ticker: str, market: str, count: int = 10) -> List[Dict[str, float]]:
-    """최근 15분봉 ``count``개 → ``[{o,h,l,c,v}, ...]``."""
-    symbol = str(ticker or "").strip().upper()
-    if not symbol:
-        return []
-
-    if market.upper() == "COIN" or symbol.startswith("KRW-") or symbol.startswith("USDT-"):
-        try:
-            from api import coin_broker, coin_config
-
-            if coin_config.is_binance() or str(symbol).upper().startswith("USDT-"):
-                return coin_broker.fetch_ohlcv(str(symbol), "minute15", int(count))
-            df = pyupbit.get_ohlcv(symbol, interval="minute15", count=count)
-            if df is not None and not df.empty:
-                rows = []
-                for _, r in df.tail(count).iterrows():
-                    rows.append(
-                        {
-                            "o": _to_float(r.get("open", 0.0)),
-                            "h": _to_float(r.get("high", 0.0)),
-                            "l": _to_float(r.get("low", 0.0)),
-                            "c": _to_float(r.get("close", 0.0)),
-                            "v": _to_float(r.get("volume", 0.0)),
-                        }
-                    )
-                return rows
-        except Exception:
-            return []
-
-    candidates: List[str]
-    if market.upper() == "KR" and symbol.isdigit():
-        code = symbol.zfill(6)
-        candidates = [f"{code}.KS", f"{code}.KQ"]
-    else:
-        candidates = [symbol]
-
-    for cand in candidates:
-        try:
-            df = yf.Ticker(cand).history(interval="15m", period="5d")
-            if df is None or df.empty:
-                continue
-            rows = []
-            for _, r in df.tail(count).iterrows():
-                rows.append(
-                    {
-                        "o": _to_float(r.get("Open", 0.0)),
-                        "h": _to_float(r.get("High", 0.0)),
-                        "l": _to_float(r.get("Low", 0.0)),
-                        "c": _to_float(r.get("Close", 0.0)),
-                        "v": _to_float(r.get("Volume", 0.0)),
-                    }
-                )
-            return rows
-        except Exception:
-            continue
-    return []
+def _normalize_market(market: str | None) -> str:
+    return str(market or "").strip().upper()
 
 
-def get_recent_daily_ohlcv(ticker: str, market: str, count: int = 15) -> List[Dict[str, float]]:
-    """최근 일봉 ``count``개(기본 15) → ``[{o,h,l,c,v}, ...]``. 스윙 AI 필터용."""
-    symbol = str(ticker or "").strip().upper()
-    if not symbol:
-        return []
-    n = max(5, min(30, int(count)))
-
-    if market.upper() == "COIN" or symbol.startswith("KRW-") or symbol.startswith("USDT-"):
-        try:
-            from api import coin_broker, coin_config
-
-            if coin_config.is_binance() or str(symbol).upper().startswith("USDT-"):
-                return coin_broker.fetch_ohlcv(str(symbol), "day", int(n))
-            df = pyupbit.get_ohlcv(symbol, interval="day", count=n)
-            if df is not None and not df.empty:
-                rows = []
-                for _, r in df.tail(n).iterrows():
-                    rows.append(
-                        {
-                            "o": _to_float(r.get("open", 0.0)),
-                            "h": _to_float(r.get("high", 0.0)),
-                            "l": _to_float(r.get("low", 0.0)),
-                            "c": _to_float(r.get("close", 0.0)),
-                            "v": _to_float(r.get("volume", 0.0)),
-                        }
-                    )
-                return rows
-        except Exception:
-            return []
-
-    candidates: List[str]
-    if market.upper() == "KR" and symbol.isdigit():
-        code = symbol.zfill(6)
-        candidates = [f"{code}.KS", f"{code}.KQ"]
-    else:
-        candidates = [symbol]
-
-    for cand in candidates:
-        try:
-            df = yf.Ticker(cand).history(interval="1d", period="400d")
-            if df is None or df.empty:
-                continue
-            rows = []
-            for _, r in df.tail(n).iterrows():
-                rows.append(
-                    {
-                        "o": _to_float(r.get("Open", 0.0)),
-                        "h": _to_float(r.get("High", 0.0)),
-                        "l": _to_float(r.get("Low", 0.0)),
-                        "c": _to_float(r.get("Close", 0.0)),
-                        "v": _to_float(r.get("Volume", 0.0)),
-                    }
-                )
-            return rows
-        except Exception:
-            continue
-    return []
-
-
-def _collect_orderbook_qtys(data: Any) -> Tuple[float, float]:
-    bid_total = 0.0
-    ask_total = 0.0
-
-    def walk(node: Any):
-        nonlocal bid_total, ask_total
-        if isinstance(node, dict):
-            for k, v in node.items():
-                key = str(k).lower()
-                if isinstance(v, (dict, list)):
-                    walk(v)
-                    continue
-                num = _to_float(v, 0.0)
-                if num <= 0:
-                    continue
-                is_qty = any(x in key for x in ("qty", "qnty", "volume", "vol", "rsqn", "tot", "sum"))
-                if not is_qty:
-                    continue
-                if "bid" in key or "bids" in key:
-                    bid_total += num
-                if "ask" in key or "asks" in key or "offer" in key:
-                    ask_total += num
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(data)
-    return bid_total, ask_total
-
-
-def get_orderbook_summary_from_broker(broker: Any, ticker: str) -> Dict[str, float]:
-    """KR/US 매수 후보의 호가 잔량 합계.
-
-    - **KR** (티커가 6자리 숫자) — ``kis_api.fetch_kr_orderbook`` 으로
-      KIS ``inquire-asking-price-exp-ccn`` (TR ``FHKST01010200``) 를 직접 호출.
-      ``broker.fetch_price`` 가 부르는 ``inquire-price`` 엔드포인트는 호가 잔량을
-      내려주지 않아 항상 (0,0) 으로 떨어지던 문제를 차단한다.
-    - **US** — KIS 해외주식은 정식 호가 잔량 응답이 제한적이라 ``broker.fetch_price``
-      응답에서 가능한 만큼만 긁어내고, 매칭이 없으면 (0,0) 을 그대로 반환한다.
-      LLM 프롬프트가 (0,0) 을 “호가 데이터 미제공”으로 해석하도록 가드되어 있다.
-    """
-    if broker is None:
-        return {"bid_size_total": 0.0, "ask_size_total": 0.0}
-
+def _yf_news_symbol(ticker: str, market: str) -> str | None:
     sym = str(ticker or "").strip().upper()
+    mk = _normalize_market(market)
+    if mk == "KR" or sym.isdigit():
+        return None
+    if sym.startswith("USDT-"):
+        base = sym.split("-", 1)[1]
+        return f"{base}-USD"
+    if sym.startswith("KRW-"):
+        base = sym.split("-", 1)[1]
+        return f"{base}-USD"
+    return sym
 
-    if sym.isdigit():
+
+def _news_item_timestamp(item: dict) -> float | None:
+    for key in ("providerPublishTime", "pubDate", "published_at", "publishedAt", "datetime"):
+        raw = item.get(key)
+        if raw is None:
+            continue
         try:
-            from api import kis_api  # 지연 임포트로 순환 의존 회피
-            ob = kis_api.fetch_kr_orderbook(broker, sym)
-            if isinstance(ob, dict):
-                return {
-                    "bid_size_total": _to_float(ob.get("bid_size_total", 0.0)),
-                    "ask_size_total": _to_float(ob.get("ask_size_total", 0.0)),
-                }
+            if isinstance(raw, (int, float)):
+                ts = float(raw)
+                if ts > 1e12:
+                    ts /= 1000.0
+                return ts
+            if isinstance(raw, str):
+                s = raw.strip()
+                if s.isdigit():
+                    if len(s) >= 12:
+                        try:
+                            dt = datetime.strptime(s[:12], "%Y%m%d%H%M")
+                            return dt.replace(tzinfo=timezone(timedelta(hours=9))).timestamp()
+                        except Exception:
+                            pass
+                    ts = float(s)
+                    if ts > 1e12:
+                        ts /= 1000.0
+                    return ts
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
         except Exception:
-            pass
-        return {"bid_size_total": 0.0, "ask_size_total": 0.0}
+            continue
+    return None
 
+
+def _extract_yfinance_news_fields(item: dict) -> tuple[str, float | None]:
+    if not isinstance(item, dict):
+        return "", None
+    payload = item.get("content") if isinstance(item.get("content"), dict) else item
+    title = str(payload.get("title") or payload.get("headline") or item.get("title") or "").strip()
+    ts = _news_item_timestamp(payload)
+    if ts is None:
+        ts = _news_item_timestamp(item)
+    return title, ts
+
+
+def _fetch_yfinance_news_text(symbol: str, max_headlines: int = 10) -> str:
+    sym = str(symbol or "").strip()
+    if not sym:
+        return ""
     try:
-        resp = broker.fetch_price(sym)
+        items = yf.Ticker(sym).news or []
     except Exception:
-        return {"bid_size_total": 0.0, "ask_size_total": 0.0}
+        return ""
 
-    bid, ask = _collect_orderbook_qtys(resp)
-    return {"bid_size_total": bid, "ask_size_total": ask}
-
-
-def get_orderbook_summary_for_coin(ticker: str) -> Dict[str, float]:
-    symbol = str(ticker or "").strip().upper()
-    if symbol.startswith("USDT-"):
-        try:
-            from api import coin_broker
-
-            return coin_broker.orderbook_summary(symbol)
-        except Exception:
-            return {"bid_size_total": 0.0, "ask_size_total": 0.0}
-    if not symbol.startswith("KRW-"):
-        return {"bid_size_total": 0.0, "ask_size_total": 0.0}
-    try:
-        ob = pyupbit.get_orderbook(symbol)
-        units = []
-        if isinstance(ob, list) and ob:
-            units = ob[0].get("orderbook_units", [])
-        elif isinstance(ob, dict):
-            units = ob.get("orderbook_units", [])
-        bid_total = 0.0
-        ask_total = 0.0
-        for u in units or []:
-            bid_total += _to_float(u.get("bid_size", 0.0))
-            ask_total += _to_float(u.get("ask_size", 0.0))
-        return {"bid_size_total": bid_total, "ask_size_total": ask_total}
-    except Exception:
-        return {"bid_size_total": 0.0, "ask_size_total": 0.0}
-
-
-def _rule_based_trend_v8(candles: List[Dict[str, float]], orderbook: Dict[str, float]) -> int:
-    """15m 전제: 윗꼬리·거래량 급감·실패 돌파·호가 역전 가중."""
-    if not candles or len(candles) < 3:
-        return 50
-
-    recent = candles[-3:]
-    highs = [_to_float(c.get("h", 0.0)) for c in candles]
-    closes = [_to_float(c.get("c", 0.0)) for c in candles]
-    volumes = [_to_float(c.get("v", 0.0)) for c in candles]
-
-    max_recent_high = max(_to_float(c.get("h", 0.0)) for c in recent)
-    last_close = closes[-1]
-    avg_vol = sum(volumes[:-1]) / max(1, len(volumes) - 1)
-    last_vol = volumes[-1]
-
-    body = abs(_to_float(recent[-1].get("c", 0.0)) - _to_float(recent[-1].get("o", 0.0)))
-    upper_wick = _to_float(recent[-1].get("h", 0.0)) - max(
-        _to_float(recent[-1].get("c", 0.0)),
-        _to_float(recent[-1].get("o", 0.0)),
-    )
-    wick_ratio = upper_wick / max(1e-9, body + upper_wick)
-
-    resistance = max(highs[:-1]) if len(highs) > 1 else highs[-1]
-    failed_break = 1 if (max_recent_high >= resistance and last_close < resistance) else 0
-
-    bid = _to_float(orderbook.get("bid_size_total", 0.0))
-    ask = _to_float(orderbook.get("ask_size_total", 0.0))
-    imbalance = (bid - ask) / max(1e-9, bid + ask)
-
-    score = 35
-    if wick_ratio > 0.55:
-        score += 20
-    if last_vol < avg_vol * 0.85:
-        score += 15
-    if failed_break:
-        score += 20
-    if imbalance < -0.12:
-        score += 15
-
-    return max(0, min(100, int(round(score))))
-
-
-def _rule_based_swing_fib(daily: List[Dict[str, float]], orderbook: Dict[str, float]) -> int:
-    """일봉 전제: 연속 음봉·저점 이탈·거래량 고갈·매도벽 가중."""
-    if not daily or len(daily) < 5:
-        return 50
-
-    closes = [_to_float(c.get("c", 0.0)) for c in daily]
-    opens = [_to_float(c.get("o", 0.0)) for c in daily]
-    lows = [_to_float(c.get("l", 0.0)) for c in daily]
-    vols = [_to_float(c.get("v", 0.0)) for c in daily]
-
-    score = 30
-
-    consec_red = 0
-    for i in range(len(daily) - 1, -1, -1):
-        if closes[i] < opens[i]:
-            consec_red += 1
-        else:
+    now_ts = time.time()
+    lines: list[str] = []
+    for item in items:
+        title, ts = _extract_yfinance_news_fields(item)
+        if not title:
+            continue
+        if ts is not None and (now_ts - ts) > _NEWS_LOOKBACK_SEC:
+            continue
+        lines.append(title)
+        if len(lines) >= max(1, int(max_headlines)):
             break
-    score += min(28, consec_red * 7)
-
-    if len(lows) >= 5:
-        recent_low = lows[-1]
-        base = lows[-6:-1] if len(lows) >= 6 else lows[:-1]
-        prior_min = min(base) if base else recent_low
-        if prior_min > 0 and recent_low < prior_min * 0.995:
-            score += 18
-
-    avg_vol = sum(vols[:-1]) / max(1, len(vols) - 1)
-    last_vol = vols[-1]
-    if avg_vol > 0 and last_vol < avg_vol * 0.38:
-        score += 22
-
-    if len(closes) >= 4:
-        if closes[-1] < closes[-2] < closes[-3]:
-            score += 14
-
-    bid = _to_float(orderbook.get("bid_size_total", 0.0))
-    ask = _to_float(orderbook.get("ask_size_total", 0.0))
-    imbalance = (bid - ask) / max(1e-9, bid + ask)
-    if imbalance < -0.14:
-        score += 12
-
-    return max(0, min(100, int(round(score))))
+    return "\n".join(lines)
 
 
-def _rule_based_by_strategy(
-    candles: List[Dict[str, float]],
-    orderbook: Dict[str, float],
-    strategy_type: str,
-) -> int:
-    st = normalize_ai_strategy_type(strategy_type)
-    if st == "SWING_FIB":
-        return _rule_based_swing_fib(candles, orderbook)
-    return _rule_based_trend_v8(candles, orderbook)
+def _fetch_kr_naver_news_headlines(ticker: str, limit: int = 5) -> str:
+    code = "".join(ch for ch in str(ticker or "") if ch.isdigit()).zfill(6)
+    if not code or code == "000000":
+        return ""
+    url = f"https://api.stock.naver.com/news/stock/{code}?page=1&pageSize={max(5, int(limit))}"
+    try:
+        res = requests.get(
+            url,
+            headers={
+                **_NAVER_NEWS_HEADERS,
+                "Referer": "https://m.stock.naver.com/",
+            },
+            timeout=8,
+        )
+        if res.status_code >= 400:
+            return ""
+        data = res.json()
+    except Exception:
+        return ""
+
+    now_ts = time.time()
+    titles: list[str] = []
+    blocks = data if isinstance(data, list) else [data]
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        for item in block.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("titleFull") or item.get("title") or "").strip()
+            if not title or title in titles:
+                continue
+            ts = _news_item_timestamp(item)
+            if ts is not None and (now_ts - ts) > _NEWS_LOOKBACK_SEC:
+                continue
+            titles.append(title)
+            if len(titles) >= max(1, int(limit)):
+                return "\n".join(titles)
+    return "\n".join(titles)
 
 
-# 봇 임계(ai_false_breakout_threshold 등)와 채점 일치를 위해 LLM 프롬프트에 동일 주입
-_FALSE_BREAKOUT_SCORE_RUBRIC = """
-[필수 지시사항: 0~100점 위험도(prob) 절대 평가 가이드]
-점수 산정 시 다음의 기준을 엄격하게 따르세요. (높을수록 위험함)
+def collect_recent_news_text(ticker: str, market: str, max_headlines: int = 10) -> str:
+    """시장별 최근 뉴스 헤드라인 텍스트.
 
-0 ~ 30점 (안전): 강력한 펀더멘털이나 수급이 뒷받침된 완벽한 진짜 돌파 또는 찐바닥 다지기. (매수 적극 권장)
-
-31 ~ 69점 (보통): 시장의 일반적인 노이즈나 약간의 윗꼬리가 있지만, 상승/반등 추세 자체는 살아있는 상태. (주식/코인 모두 통과 구간)
-
-70 ~ 79점 (경고): 호가창 허수나 거래량 급감 등 휩소(가짜 돌파) 징후가 뚜렷함. (주식 시장에서는 여기서부터 매수를 차단해야 하는 레벨)
-
-80 ~ 100점 (치명적 위험): 악질적인 세력의 펌프 앤 덤프(설거지), 또는 지지선이 완전히 붕괴된 떨어지는 칼날. (모든 시장에서 무조건 진입 차단)
-""".strip()
-
-
-_ORDERBOOK_GUARD_NOTE = (
-    "주의(호가 데이터 가드): orderbook 의 bid_size_total · ask_size_total 가 둘 다 0 이라면 "
-    "거래소 비제공/조회 실패로 호가 데이터가 비어 있는 상태이므로, 호가 기반의 "
-    "유동성 부족·물량 떠넘기기(설거지)·허수 의심을 점수에 가산하지 말 것. "
-    "이 경우 캔들/거래량만으로 평가하라."
-)
+    * KR — 네이버 금융 종목 뉴스 상위 5개
+    * US / COIN — ``yfinance`` ``Ticker.news`` (최근 24시간, 영문 헤드라인)
+    """
+    mk = _normalize_market(market)
+    if mk == "KR":
+        return _fetch_kr_naver_news_headlines(ticker, limit=5).strip()
+    symbol = _yf_news_symbol(ticker, mk)
+    if not symbol:
+        return ""
+    return _fetch_yfinance_news_text(symbol, max_headlines=max_headlines).strip()
 
 
-def _build_llm_prompt_v8(candles: List[Dict[str, float]], orderbook: Dict[str, float]) -> str:
+def _build_llm_prompt_news(news_text: str) -> str:
     return (
-        "당신은 기관 퀀트 트레이더다. 제공된 15분봉 시계열과 호가창 요약을 분석하여, "
-        "이 돌파가 세력의 가짜 펌핑(휩소)·펌프 앤 덤프·물량 떠넘기기(설거지)일 위험도를 "
-        "0~100 정수로 평가하라. 비정상적인 윗꼬리, 거래량 급증 후 급감, 매도 호가 대비 매수 호가의 허수(Spoofing) 징후에 가중치를 두어라.\n"
-        f"{_FALSE_BREAKOUT_SCORE_RUBRIC}\n"
-        f"{_ORDERBOOK_GUARD_NOTE}\n"
+        "당신은 헤지펀드의 리스크 관리자입니다. 다음은 이 종목의 최근 뉴스 헤드라인입니다. "
+        "이 텍스트 안에 주가에 단기적으로 치명적인 타격을 줄 수 있는 명백한 악재"
+        "(예: 횡령, 배임, 대규모 유상증자, 상장폐지 위기, CEO 구속 등)가 포함되어 있는지 분석하십시오. "
+        "악재가 확실하다면 위험도 점수를 80~100점 사이로, 단순 노이즈거나 호재/중립이라면 0~30점 사이로 반환하십시오.\n"
         '출력은 JSON만: {"false_breakout_prob": <int>, "rationale": "짧은 한국어 1~3문장"}\n'
-        f"candles_15m={candles}\n"
-        f"orderbook={orderbook}\n"
-    )
-
-
-def _build_llm_prompt_swing(candles: List[Dict[str, float]], orderbook: Dict[str, float]) -> str:
-    return (
-        "당신은 기관 퀀트 트레이더다. 제공된 일봉(Daily) 캔들과 호가창을 분석하여, "
-        "이 타점이 바닥을 다지고 반등할 자리가 아니라 지지선 붕괴 후 수직 낙하하는 '떨어지는 칼날', "
-        "데드캣 바운스, 또는 거래량이 말라붙은 '좀비' 상태일 위험도를 0~100 정수로 평가하라. "
-        "하락 모멘텀 지속성, 바닥 다지기(도지·거래량 축소 등) 부재에 가중치를 두어라.\n"
-        f"{_FALSE_BREAKOUT_SCORE_RUBRIC}\n"
-        f"{_ORDERBOOK_GUARD_NOTE}\n"
-        '출력은 JSON만: {"false_breakout_prob": <int>, "rationale": "짧은 한국어 1~3문장"}\n'
-        '키 이름은 반드시 false_breakout_prob 이다(위험도가 높을수록 숫자를 크게).\n'
-        f"candles_daily={candles}\n"
-        f"orderbook={orderbook}\n"
+        f"news_text={news_text}\n"
     )
 
 
@@ -444,7 +238,7 @@ def _parse_llm_json(text: str) -> Tuple[int, str] | None:
     raw = m.group(0) if m else text.strip()
     try:
         payload = json.loads(raw)
-        prob = int(payload.get("false_breakout_prob", 50))
+        prob = int(payload.get("false_breakout_prob", 0))
         reason = str(payload.get("rationale", "no_rationale"))
         return max(0, min(100, prob)), reason
     except Exception:
@@ -452,7 +246,6 @@ def _parse_llm_json(text: str) -> Tuple[int, str] | None:
 
 
 def _openai_model_from_config(config: dict | None) -> str:
-    """``config.json`` 의 ``ai_false_breakout_openai_model`` (기본 ``gpt-4o-mini``)."""
     if isinstance(config, dict):
         m = str(config.get("ai_false_breakout_openai_model", "") or "").strip()
         if m:
@@ -460,32 +253,22 @@ def _openai_model_from_config(config: dict | None) -> str:
     return "gpt-4o-mini"
 
 
-def _openai_prob(
-    candles: List[Dict[str, float]],
-    orderbook: Dict[str, float],
+def _openai_news_prob(
+    news_text: str,
     config: dict | None,
-    strategy_type: str,
     model_name: str | None = None,
 ) -> Tuple[int, str, bool]:
     api_key = _get_secret("OPENAI_API_KEY", config)
-    st = normalize_ai_strategy_type(strategy_type)
     if not api_key:
-        prob = _rule_based_by_strategy(candles, orderbook, st)
-        return prob, "fallback:OPENAI_API_KEY 없음 → rule_based", False
+        return 0, "skip:OPENAI_API_KEY 없음 → 위험도 0", False
 
-    prompt = (
-        _build_llm_prompt_swing(candles, orderbook)
-        if st == "SWING_FIB"
-        else _build_llm_prompt_v8(candles, orderbook)
-    )
-
+    prompt = _build_llm_prompt_news(news_text)
     mdl = (model_name or "").strip() or _openai_model_from_config(config)
 
     try:
         from openai import OpenAI  # type: ignore
     except Exception:
-        prob = _rule_based_by_strategy(candles, orderbook, st)
-        return prob, "fallback:openai 패키지 없음 → rule_based", False
+        return 0, "skip:openai 패키지 없음 → 위험도 0", False
 
     client = OpenAI(api_key=api_key)
     try:
@@ -493,35 +276,30 @@ def _openai_prob(
         text = (resp.output_text or "").strip()
         parsed = _parse_llm_json(text)
         if parsed is None:
-            prob = _rule_based_by_strategy(candles, orderbook, st)
-            return prob, "fallback:openai JSON 파싱 실패 → rule_based", False
+            return 0, "skip:openai JSON 파싱 실패 → 위험도 0", False
         prob, reason = parsed
         return prob, reason, True
     except Exception as e:
-        prob = _rule_based_by_strategy(candles, orderbook, st)
-        return prob, f"fallback:{type(e).__name__} → rule_based", False
+        return 0, f"skip:{type(e).__name__} → 위험도 0", False
 
 
-def _gemini_prob(
-    candles: List[Dict[str, float]],
-    orderbook: Dict[str, float],
+def _gemini_news_prob(
+    news_text: str,
     config: dict | None,
-    strategy_type: str,
     model_name: str = "gemini-2.5-flash",
 ) -> Tuple[int, str, bool]:
     api_key = _get_secret("GOOGLE_API_KEY", config)
-    st = normalize_ai_strategy_type(strategy_type)
     if not api_key:
-        prob = _rule_based_by_strategy(candles, orderbook, st)
-        return prob, "fallback:GOOGLE_API_KEY 없음 → rule_based", False
+        return 0, "skip:GOOGLE_API_KEY 없음 → 위험도 0", False
 
-    prompt = (
-        _build_llm_prompt_swing(candles, orderbook)
-        if st == "SWING_FIB"
-        else _build_llm_prompt_v8(candles, orderbook)
-    )
-
-    model_candidates = [model_name, "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"]
+    prompt = _build_llm_prompt_news(news_text)
+    model_candidates = [
+        model_name,
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+    ]
     last_err = ""
     for mdl in model_candidates:
         try:
@@ -547,9 +325,8 @@ def _gemini_prob(
             last_err = f"{mdl}:{type(e).__name__}"
             continue
 
-    prob = _rule_based_by_strategy(candles, orderbook, st)
-    msg = f"fallback:Gemini 모델/응답 실패 ({last_err}) → rule_based" if last_err else "fallback:Gemini 실패 → rule_based"
-    return prob, msg, False
+    msg = f"skip:Gemini 실패 ({last_err}) → 위험도 0" if last_err else "skip:Gemini 실패 → 위험도 0"
+    return 0, msg, False
 
 
 def summarize_ai_rationale(text: str, max_chars: int = 160) -> str:
@@ -557,7 +334,6 @@ def summarize_ai_rationale(text: str, max_chars: int = 160) -> str:
     s = str(text or "").strip().replace("\n", " ")
     if not s:
         return "(사유 없음)"
-    # 문장 단위로 최대 2개까지
     parts = re.split(r"(?<=[.!?。])\s+", s)
     if len(parts) >= 2 and len(parts[0]) + len(parts[1]) <= max_chars:
         out = (parts[0] + " " + parts[1]).strip()
@@ -569,78 +345,91 @@ def summarize_ai_rationale(text: str, max_chars: int = 160) -> str:
 
 def evaluate_false_breakout_filter(
     ticker: str,
-    candles: List[Dict[str, float]] | None = None,
-    orderbook: Dict[str, float] | None = None,
+    market: str,
     threshold: int = 70,
     use_ai: bool = True,
     ai_provider: str = "gemini",
     config: dict | None = None,
     strategy_type: str | None = None,
     *,
-    candles_15m_10: List[Dict[str, float]] | None = None,
+    candles: Any = None,
+    orderbook: Any = None,
+    candles_15m_10: Any = None,
 ) -> Dict[str, Any]:
-    """
-    위험도 ``false_breakout_prob`` (0~100) 가 ``threshold`` 이상이면 매수 차단.
-
-    LLM 호출 시 ``_FALSE_BREAKOUT_SCORE_RUBRIC`` 으로 0~100 의미를 봇 임계와 정렬한다.
-
-    Returns
-        evaluation_engine: 점수 산출 경로 ``gemini`` | ``openai`` | ``rule_based``
-        llm_success: 외부 LLM이 유효 JSON을 반환했으면 True
-        strategy_type: ``TREND_V8`` | ``SWING_FIB``
-        openai_fallback_used: 주 제공자가 Gemini인데 실패 후 OpenAI로 재시도해 성공했으면 True
-    """
-    rows = candles if candles is not None else (candles_15m_10 or [])
-    ob = orderbook if orderbook is not None else {}
+    """뉴스 악재 위험도 ``false_breakout_prob`` (0~100) 가 ``threshold`` 이상이면 매수 차단."""
     st = normalize_ai_strategy_type(strategy_type)
-
     provider_in = str(ai_provider or "gemini").strip().lower()
+    news_text = collect_recent_news_text(ticker, market)
+
+    if not news_text.strip():
+        return {
+            "ticker": ticker,
+            "market": _normalize_market(market),
+            "false_breakout_prob": 0,
+            "threshold": int(threshold),
+            "blocked": False,
+            "rationale": "skip:뉴스 없음/수집 실패 → 위험도 0",
+            "provider": provider_in if use_ai else "skip",
+            "strategy_type": st,
+            "evaluation_engine": "skip_no_news",
+            "llm_success": False,
+            "openai_fallback_used": False,
+        }
+
+    if not use_ai:
+        return {
+            "ticker": ticker,
+            "market": _normalize_market(market),
+            "false_breakout_prob": 0,
+            "threshold": int(threshold),
+            "blocked": False,
+            "rationale": "skip:use_ai=False → 위험도 0",
+            "provider": "skip",
+            "strategy_type": st,
+            "evaluation_engine": "skip_no_ai",
+            "llm_success": False,
+            "openai_fallback_used": False,
+        }
+
     llm_success = False
-    evaluation_engine = "rule_based"
+    evaluation_engine = "skip"
     openai_fallback_used = False
 
     fallback_after_gemini = True
     if isinstance(config, dict) and "ai_false_breakout_openai_fallback" in config:
         fallback_after_gemini = bool(config.get("ai_false_breakout_openai_fallback"))
 
-    if not use_ai:
-        prob = _rule_based_by_strategy(rows, ob, st)
-        rationale = "rule_based(use_ai=False)"
-    elif provider_in == "openai":
-        prob, rationale, llm_success = _openai_prob(rows, ob, config, st)
-        evaluation_engine = "openai" if llm_success else "rule_based"
+    if provider_in == "openai":
+        prob, rationale, llm_success = _openai_news_prob(news_text, config)
+        evaluation_engine = "openai" if llm_success else "skip"
     else:
-        prob, rationale, llm_success = _gemini_prob(rows, ob, config, st)
-        evaluation_engine = "gemini" if llm_success else "rule_based"
+        prob, rationale, llm_success = _gemini_news_prob(news_text, config)
+        evaluation_engine = "gemini" if llm_success else "skip"
 
         if (
             not llm_success
             and fallback_after_gemini
             and _get_secret("OPENAI_API_KEY", config).strip()
         ):
-            prob_o, rationale_o, ok_o = _openai_prob(rows, ob, config, st)
+            prob_o, rationale_o, ok_o = _openai_news_prob(news_text, config)
             if ok_o:
                 prob, rationale = prob_o, f"[Gemini 실패→OpenAI 폴백] {rationale_o}"
                 llm_success = True
                 evaluation_engine = "openai"
                 openai_fallback_used = True
 
-    blocked = prob >= int(threshold)
-    provider_label = provider_in if use_ai else "rule_based"
+    blocked = int(prob) >= int(threshold)
 
     return {
         "ticker": ticker,
-        "false_breakout_prob": prob,
+        "market": _normalize_market(market),
+        "false_breakout_prob": int(prob),
         "threshold": int(threshold),
         "blocked": blocked,
         "rationale": rationale,
-        "provider": provider_label,
+        "provider": provider_in,
         "strategy_type": st,
         "evaluation_engine": evaluation_engine,
         "llm_success": llm_success,
         "openai_fallback_used": openai_fallback_used,
     }
-
-
-# 호환: 구 이름
-_rule_based_false_breakout_prob = _rule_based_trend_v8

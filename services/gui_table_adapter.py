@@ -89,6 +89,12 @@ def build_rows_data(
         coin_broker = None
         coin_config = None
 
+    try:
+        st_coin = load_state(state_path)
+        pos_coin = (st_coin.get("positions") or {}) if isinstance(st_coin, dict) else {}
+    except Exception:
+        pos_coin = {}
+
     for coin in upbit_bals:
         cur = str(coin.get("currency") or "").upper()
         if cur in ("KRW", "VTHO"):
@@ -101,7 +107,9 @@ def build_rows_data(
             else:
                 code = f"KRW-{coin['currency']}"
             qty = str(safe_num(coin.get("balance"), 0.0))
-            price = str(safe_num(coin.get("avg_buy_price", 0), 0.0))
+            api_bp = safe_num(coin.get("avg_buy_price", 0), 0.0)
+            ledger_bp = safe_num((pos_coin.get(code) or {}).get("buy_p"), 0.0)
+            price = str(api_bp if api_bp > 0 else ledger_bp)
             rows_data.append(process_row_data("🪙 코인", coin["currency"], qty, price, "COIN", code, None))
 
     return rows_data

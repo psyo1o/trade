@@ -10,7 +10,7 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
     * 바이낸스 코인 상단 **예수금·총평가** 숫자는 ``binance_display_cash_and_total_usdt()`` 등. 보유/장부 단가는 USDT. 스냅샷·서킷은 엔진과 동일 원화 환산.
     * 매매는 시작 즉시 실행하지 않고, **KST :00 / :15 / :30 / :45** 정렬 스케줄에만 맞춰 `run_trading_bot`을 실행한다.
     * ``QTimer.singleShot`` 겹침으로 로그가 두 줄씩 나오는 것을 막기 위해 **단일 ``QTimer`` + 실행 중 가드**를 쓴다.
-    * 네트워크 감시·생존신고(heartbeat)는 **백그라운드 스레드**에서 돌리고, 텔레는 **기동 직후 즉시 발송 없이** **KST :00 / :30** 벽시계에 맞춘다.
+    * 네트워크 감시는 **백그라운드 스레드**에서 돌린다. 생존신고(heartbeat) 텔레그램은 **KST :00 / :30** 30분마다 예약하고, **해당 슬롯의 15분 매매 사이클이 끝난 뒤** 보낸다.
 
 로그
     * ``RedirectText`` 가 ``utils.logger.get_quant_logger()`` 로 ``logs/bot.log`` 에도 한 줄씩 넘긴다.
@@ -145,6 +145,77 @@ def _gui_coin_unit_price_str(usdt: float) -> str:
         return "0 USDT"
     s = f"{x:.8f}".rstrip("0").rstrip(".")
     return f"{s} USDT" if s else "0 USDT"
+
+
+def _position_strategy_label(pos_info: dict) -> str:
+    """장부 전략 열: 사이징 라벨(1/N) 대신 매수 전략명을 표시."""
+    tier = str((pos_info or {}).get("tier") or "").strip()
+    sizing_labels = {"1/N 고정", "1/N"}
+    if tier and tier not in sizing_labels:
+        return tier
+    st = str((pos_info or {}).get("strategy_type") or "TREND_V8").strip().upper()
+    if st == "SWING_FIB":
+        return "SWING_FIB"
+    return "V6 스나이퍼(수급+MACD+RSI+상투방지)"
+
+
+def _ledger_row_key(ticker: str) -> str:
+    t = str(ticker or "").strip()
+    if t.isdigit():
+        return normalize_ticker(t)
+    if is_coin_ticker(t):
+        return t.upper()
+    return normalize_ticker(t)
+
+
+def _build_live_qty_lookup() -> dict[str, float]:
+    """실시간 보유 표와 동일한 실계좌 수량 맵."""
+    out: dict[str, float] = {}
+    try:
+        from api import coin_broker
+
+        for b in coin_broker.get_balances() or []:
+            t = coin_broker.held_ticker_row(b)
+            if not t:
+                continue
+            out[str(t).strip().upper()] = float(_to_float(b.get("balance"), 0.0))
+    except Exception:
+        pass
+    try:
+        for inf in get_held_stocks_kr_info() or []:
+            code = normalize_ticker(str(inf.get("code") or ""))
+            q = float(_to_float(inf.get("qty"), 0.0))
+            if code and q > 0:
+                out[code] = q
+    except Exception:
+        pass
+    try:
+        rows = get_held_stocks_us_detail() or []
+        if rows:
+            for item in rows:
+                code = normalize_ticker(str(item.get("code") or ""))
+                q = float(_to_float(item.get("qty"), 0.0))
+                if code and q > 0:
+                    out[code] = q
+        else:
+            for inf in get_held_stocks_us_info() or []:
+                code = normalize_ticker(str(inf.get("code") or ""))
+                q = float(_to_float(inf.get("qty"), 0.0))
+                if code and q > 0:
+                    out[code] = q
+    except Exception:
+        pass
+    return out
+
+
+def _format_position_qty_for_table(market_label: str, qty: float) -> str:
+    q = float(_to_float(qty, 0.0))
+    if market_label == "🇰🇷 국장":
+        return str(int(round(q)))
+    if market_label == "🇺🇸 미장" and abs(q - round(q)) < 1e-6:
+        return str(int(round(q)))
+    text = f"{q:.8f}".rstrip("0").rstrip(".")
+    return text if text else "0"
 
 
 def get_current_stats(state_file: Path, roi_info=None):
@@ -400,6 +471,8 @@ class BalanceUpdaterThread(QThread):
             pos = (st.get("positions") or {}).get(ledger_key, {})
             if not isinstance(pos, dict):
                 pos = {}
+            if m == "COIN" and buy_p <= 0:
+                buy_p = float(_to_float(pos.get("buy_p", 0), 0.0))
             current_price = run_bot.resolve_holding_display_price(
                 m, ledger_key, buy_p, current_p_api, pos
             )
@@ -478,6 +551,11 @@ class BotDashboard(QMainWindow):
         self._align_trade_timer.setSingleShot(True)
         self._align_trade_timer.timeout.connect(self._aligned_trade_tick)
         self._trade_worker_busy = False
+        self._heartbeat_halfhour_timer = QTimer(self)
+        self._heartbeat_halfhour_timer.setSingleShot(True)
+        self._heartbeat_halfhour_timer.timeout.connect(self._half_hour_heartbeat_due)
+        self._heartbeat_pending_after_trade = False
+        self._heartbeat_due_slot = ""
         self._refresh_inflight = False
         self._refresh_done_callbacks = []
 
@@ -505,12 +583,11 @@ class BotDashboard(QMainWindow):
             traceback.print_exc()
         
         # 시작 직후 화면은 1회 즉시 갱신(스냅샷 폴백 포함)하고, 매매는 정각 스케줄에서만 실행.
-        # heartbeat는 API 다발이라 메인 스레드에서 돌리지 않음 — 기동 직후 즉시 전송 없이 KST :00 / :30 정렬
-        self._schedule_next_heartbeat_aligned()
         QTimer.singleShot(150, lambda: self.refresh_balance(sync_first=False))
 
         # 시작 직후 매매는 실행하지 않고, 분봉 정각(:00/:15/:30/:45 KST)부터 반복
         self._schedule_next_aligned_trade()
+        self._schedule_next_heartbeat_aligned()
 
     def _check_network_and_maybe_restart(self):
         """연속으로 외부망이 안 되면 프로세스 종료 -> run_bot.bat가 GUI 재실행. 검사는 백그라운드."""
@@ -541,10 +618,33 @@ class BotDashboard(QMainWindow):
         finally:
             self._net_check_inflight = False
 
+    def _kst_halfhour_slot(self) -> str:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+        hh30 = 0 if now.minute < 30 else 30
+        return now.strftime("%Y-%m-%d %H:") + f"{hh30:02d}"
+
     def _schedule_next_heartbeat_aligned(self):
-        """다음 KST :00 또는 :30에 ``send_heartbeat`` 예약 (기동 시각과 무관)."""
-        delay_ms = int(max(1.0, seconds_until_next_half_hour("Asia/Seoul")) * 1000)
-        QTimer.singleShot(delay_ms, self.send_heartbeat)
+        """다음 KST :00 또는 :30에 생존신고 예약(기동 시각과 무관)."""
+        delay_ms = max(1, int(seconds_until_next_half_hour("Asia/Seoul") * 1000))
+        self._heartbeat_halfhour_timer.stop()
+        self._heartbeat_halfhour_timer.start(delay_ms)
+
+    def _half_hour_heartbeat_due(self):
+        """30분 슬롯 도래 — 해당 슬롯의 15분 매매 사이클 종료 후 전송하도록 표시."""
+        self._heartbeat_due_slot = self._kst_halfhour_slot()
+        self._heartbeat_pending_after_trade = True
+        self._schedule_next_heartbeat_aligned()
+
+    def _flush_pending_heartbeat(self):
+        if not self._heartbeat_pending_after_trade:
+            return
+        if self._heartbeat_due_slot != self._kst_halfhour_slot():
+            return
+        self._heartbeat_pending_after_trade = False
+        self._heartbeat_due_slot = ""
+        self.send_heartbeat()
 
     def send_heartbeat(self):
         """run_bot heartbeat_report — 네트워크 지연 시에도 UI가 멈추지 않게 스레드에서 실행."""
@@ -560,11 +660,9 @@ class BotDashboard(QMainWindow):
 
     def _on_heartbeat_done(self):
         print("📲 텔레그램으로 예수금 및 시장 현황 보고서를 발송했습니다.")
-        self._schedule_next_heartbeat_aligned()
 
     def _on_heartbeat_failed(self, msg: str):
         print(f"⚠️ 텔레그램 보고서 생성 또는 발송에 실패했습니다: {msg}")
-        self._schedule_next_heartbeat_aligned()
 
     def initUI(self):
         self.setWindowTitle('🚀 64비트 3콤보 트레이딩 대시보드 (완전체)')
@@ -987,6 +1085,7 @@ class BotDashboard(QMainWindow):
         self.ledger_table.setRowCount(0)
         state = load_state(STATE_PATH)
         positions = state.get("positions", {})
+        live_qty_by_key = _build_live_qty_lookup()
         
         for ticker, pos_info in positions.items():
             if not ticker or not isinstance(pos_info, dict):
@@ -1027,9 +1126,11 @@ class BotDashboard(QMainWindow):
             else:
                 profit_rate = 0.0
             
-            tier = pos_info.get('tier', '')
+            strategy_label = _position_strategy_label(pos_info)
             buy_time = pos_info.get('buy_time', '')
-            qty = pos_info.get('qty', 1)  # 수량은 positions에 없을 수 있음
+            row_key = _ledger_row_key(ticker)
+            qty_val = float(_to_float(live_qty_by_key.get(row_key), _to_float(pos_info.get("qty"), 0.0)))
+            qty_text = _format_position_qty_for_table(market, qty_val)
             
             # 테이블에 행 추가
             self.ledger_table.setItem(row, 0, QTableWidgetItem(market))
@@ -1064,7 +1165,7 @@ class BotDashboard(QMainWindow):
             self.ledger_table.setItem(row, 3, QTableWidgetItem(sl_p_str))
             self.ledger_table.setItem(row, 4, QTableWidgetItem(f"{profit_rate:+.2f}%"))
             self.ledger_table.setItem(row, 5, QTableWidgetItem(max_p_str))
-            self.ledger_table.setItem(row, 6, QTableWidgetItem(str(qty)))
+            self.ledger_table.setItem(row, 6, QTableWidgetItem(qty_text))
             
             # 매수시간 포맷 (buy_date 우선 사용)
             buy_date_str = pos_info.get('buy_date', '')
@@ -1086,7 +1187,7 @@ class BotDashboard(QMainWindow):
                 except:
                     buy_time_display_str = ""
             self.ledger_table.setItem(row, 7, QTableWidgetItem(buy_time_display_str))
-            self.ledger_table.setItem(row, 8, QTableWidgetItem(tier or ""))
+            self.ledger_table.setItem(row, 8, QTableWidgetItem(strategy_label))
 
     def append_log(self, text):
         blob = (text or "").replace("\r", "").rstrip()
@@ -1129,6 +1230,7 @@ class BotDashboard(QMainWindow):
 
     def _on_trade_worker_finished(self):
         self._trade_worker_busy = False
+        self._flush_pending_heartbeat()
 
     def do_trade(self):
         if self._trade_worker_busy:
@@ -1266,7 +1368,11 @@ class BotDashboard(QMainWindow):
 
             self.table.setItem(row, 0, QTableWidgetItem(d['market']))
             self.table.setItem(row, 1, QTableWidgetItem(display_name))
-            self.table.setItem(row, 2, QTableWidgetItem(d['qty']))
+            self.table.setItem(
+                row,
+                2,
+                QTableWidgetItem(_format_position_qty_for_table(d["market"], float(_to_float(d["qty"], 0.0)))),
+            )
             self.table.setItem(row, 3, QTableWidgetItem(price_str))
             self.table.setItem(row, 4, QTableWidgetItem(curr_str))
             self.table.setItem(row, 5, QTableWidgetItem(f"{d['roi']:+.2f}%"))
