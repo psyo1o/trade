@@ -307,11 +307,8 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
     if hurst_window >= 50:
         hurst_prices = close_series.tail(hurst_window).tolist()
         hurst_h = calculate_hurst_exponent(hurst_prices)
-        if hurst_h < 0.5:
-            if hurst_h < 0.45:
-                hurst_reason = f"강한 횡보/역추세 (H={hurst_h:.3f}<0.45)"
-            else:
-                hurst_reason = f"추세 미형성 Random Walk (H={hurst_h:.3f}<0.50)"
+        if hurst_h < 0.45:
+            hurst_reason = f"강한 횡보/역추세 (H={hurst_h:.3f}<0.45)"
             print(
                 f"   🔍 {_v8}{progress} {display_name} ❌ 패스: Hurst 차단 — {hurst_reason}"
             )

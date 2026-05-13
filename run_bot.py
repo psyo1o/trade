@@ -86,7 +86,7 @@ from execution.scale_out import (
     scale_out_trigger_ok,
     stock_scale_out_min_notional_ok,
 )
-from execution.sync_positions import sync_all_positions
+from execution.sync_positions import sync_all_positions, _last_buy_price_from_trade_history
 from strategy.ai_filter import (
     evaluate_false_breakout_filter,
     summarize_ai_rationale,
@@ -109,6 +109,7 @@ from services.account_snapshot import (
 from services import account_read_facade
 from strategy.sector_lock import allow_kr_sector_entry, allow_us_sector_entry, seed_us_sector_cache
 from strategy.macro_guard import get_macro_guard_snapshot
+from strategy.alpha_sizing import sort_targets_by_relative_strength, volatility_target_ratio
 from execution.order_twap import plan_krw_slices, plan_usd_slices
 import screener
 
@@ -1784,10 +1785,17 @@ def _calc_us_holdings_metrics(balance_data):
         return {"invested": total_invested, "current": total_current, "profit": profit, "roi": roi}
     except: return {"invested": 0.0, "current": 0.0, "profit": 0.0, "roi": 0.0}
 
-def _calc_coin_holdings_metrics(balances):
-    """코인 포지션 지표"""
+def _calc_coin_holdings_metrics(balances, positions=None):
+    """코인 포지션 지표. 바이낸스는 avg_buy_price가 없어 장부·매매내역 평단을 쓴다."""
     if not balances:
         return {"invested": 0.0, "current": 0.0, "profit": 0.0, "roi": 0.0}
+    if positions is None:
+        try:
+            positions = load_state(STATE_PATH).get("positions", {}) or {}
+        except Exception:
+            positions = {}
+    if not isinstance(positions, dict):
+        positions = {}
     try:
         total_invested = 0.0
         total_current = 0.0
@@ -1811,6 +1819,11 @@ def _calc_coin_holdings_metrics(balances):
             total_current += current
 
             avg_buy_price = _to_float(b.get('avg_buy_price', 0))
+            if avg_buy_price <= 0:
+                pos = positions.get(ticker) if isinstance(positions.get(ticker), dict) else {}
+                avg_buy_price = _to_float(pos.get("buy_p", 0), 0.0)
+            if avg_buy_price <= 0:
+                avg_buy_price = float(_last_buy_price_from_trade_history(ticker, "COIN") or 0.0)
             if avg_buy_price > 0:
                 if coin_config.is_binance():
                     invested = qty * avg_buy_price * kpx
@@ -2807,6 +2820,8 @@ def get_coin_holdings_with_roi():
             # 매수가가 없으면 avg_buy_price 사용
             if buy_p <= 0:
                 buy_p = _to_float(b.get('avg_buy_price', 0), 0)
+            if buy_p <= 0:
+                buy_p = float(_last_buy_price_from_trade_history(ticker, "COIN") or 0.0)
 
             if buy_p <= 0:
                 continue
@@ -2967,7 +2982,68 @@ def _sync_positions_for_cycle(state: dict) -> None:
     print(f"  ⚠️ [장부 동기화 건너뜀] {error_msg} - 기존 장부 유지")
 
 
-def _build_market_context(state: dict) -> tuple[dict, float, str]:
+def _macro_market_buy_allowed(macro_snap: dict, market: str) -> bool:
+    allowed = (macro_snap or {}).get("market_buy_allowed") or {}
+    return bool(allowed.get(str(market or "").strip().upper(), True))
+
+
+def _benchmark_ticker_for_rs(market: str) -> str:
+    mk = str(market or "").strip().upper()
+    if mk == "KR":
+        return "^KS11"
+    if mk == "COIN":
+        return coin_config.btc_benchmark_ticker()
+    return "^GSPC"
+
+
+def _sort_buy_targets_by_rs(tickers: list[str], market: str) -> list[str]:
+    if not tickers:
+        return []
+    try:
+        bench = _benchmark_ticker_for_rs(market)
+        mk = str(market or "").strip().upper()
+
+        def _fetch(ticker: str) -> list:
+            if mk == "COIN":
+                return coin_broker.fetch_ohlcv(ticker, "day", 120) or []
+            return get_ohlcv_yfinance(ticker) or []
+
+        ordered = sort_targets_by_relative_strength(
+            list(tickers),
+            market,
+            fetch_ohlcv=_fetch,
+            fetch_benchmark_ohlcv=_fetch,
+            benchmark_ticker=bench,
+        )
+        print(f"  -> [RS] {market} 후보 {len(ordered)}개 10일 상대강도 순 정렬 (벤치={bench})")
+        return ordered
+    except Exception as e:
+        print(f"  ⚠️ [RS] {market} 정렬 실패 — 원본 순서 유지: {type(e).__name__}: {e}")
+        return list(tickers)
+
+
+def _position_ratio_with_vol_target(
+    base_ratio: float,
+    ohlcv: list,
+    *,
+    target_vol: float,
+    ticker: str = "",
+) -> tuple[float, str]:
+    br = float(base_ratio)
+    if not ohlcv:
+        return br, "1/N 고정"
+    try:
+        atr_val = float(get_safe_atr(ticker, ohlcv) or 0.0)
+        close_px = float(ohlcv[-1].get("c", 0) or 0.0)
+        ratio = volatility_target_ratio(br, atr_val, close_px, target_vol=float(target_vol))
+        if ratio + 1e-12 < br:
+            return float(ratio), f"vol-target(ATR%, cap 1/N={br:.4f})"
+    except Exception:
+        pass
+    return br, "1/N 고정"
+
+
+def _build_market_context(state: dict) -> tuple[dict, float, str, dict]:
     """시장 날씨/거시 컨텍스트 계산 + 계좌 서킷 점검."""
     weather = get_real_weather(kis_api.broker_kr, kis_api.broker_us)
     print(f"🌡️ 시장 날씨: 국장 {weather['KR']} / 미장 {weather['US']} / 코인 {weather['COIN']}")
@@ -2981,6 +3057,23 @@ def _build_market_context(state: dict) -> tuple[dict, float, str]:
             f"FGI={_macro_snap.get('fgi')} ({_macro_snap.get('fgi_source')}) "
             f"-> {_macro_snap.get('mode')} (예산×{macro_mult}) | {macro_reason}"
         )
+        pcr = _macro_snap.get("us_put_call_ratio")
+        whale = _macro_snap.get("coin_whale_long_short_ratio")
+        fx_spot = _macro_snap.get("usd_krw_spot")
+        fx_mom = _macro_snap.get("usd_krw_momentum_ratio")
+        if pcr is not None or whale is not None or fx_spot is not None or fx_mom is not None:
+            print(
+                f"  🛡️ [Phase4 글로벌] PCR={pcr if pcr is not None else 'n/a'} "
+                f"고래롱숏={whale if whale is not None else 'n/a'} "
+                f"환율={fx_spot if fx_spot is not None else 'n/a'} "
+                f"환율모멘텀={fx_mom if fx_mom is not None else 'n/a'}"
+            )
+        for mk in ("KR", "US", "COIN"):
+            if not _macro_market_buy_allowed(_macro_snap, mk):
+                print(
+                    f"  🚫 [Phase4 글로벌] {mk} 신규 매수 차단 — "
+                    f"{(_macro_snap.get('market_buy_block_reason') or {}).get(mk, '')}"
+                )
     else:
         print(f"  🛡️ [Phase4 거시] 비활성 | {macro_reason}")
 
@@ -2999,7 +3092,7 @@ def _build_market_context(state: dict) -> tuple[dict, float, str]:
         print(f"  ⚠️ [Phase5 보조값] circuit_aux 갱신 실패 — 이번 루프 서킷 판정은 건너뜀: {type(e).__name__}: {e}")
 
     _maybe_run_account_circuit(state)
-    return weather, macro_mult, macro_reason
+    return weather, macro_mult, macro_reason, _macro_snap
 
 
 def _build_kr_targets(scanned_targets: list[str], market_cap_200: list[str], top_vol_50: list[str]) -> list[str]:
@@ -3509,7 +3602,8 @@ def run_trading_bot():
 
     state = _prepare_cycle_state()
     _sync_positions_for_cycle(state)
-    weather, macro_mult, macro_reason = _build_market_context(state)
+    weather, macro_mult, macro_reason, macro_snap = _build_market_context(state)
+    _alpha_target_vol = float(config.get("alpha_target_vol", 0.02))
     state = load_state(STATE_PATH)
 
     _cycle_buy_fills = 0
@@ -3533,6 +3627,7 @@ def run_trading_bot():
     top_vol_50 = realtime_trade_all[:50] 
 
     final_targets = _build_kr_targets(scanned_targets, market_cap_200, top_vol_50)
+    final_targets = _sort_buy_targets_by_rs(final_targets, "KR")
 
     # -------------------------------------------------------------------------
     # 국장(KR) 엔진 — 장중·주말점검 아님일 때만 KIS 호출. 매도는 항상(손절 방어),
@@ -3838,168 +3933,178 @@ def run_trading_bot():
                 )
             else:
                 _cycle_buy_zone_kr = True
-                # 지수 급락 체크
-                kr_index_change = get_market_index_change("KR")
-                print(f"  📊 [KOSPI 지수] 변화율: {kr_index_change:+.2f}% 날씨는 {weather['KR']}")
-                if kr_index_change <= INDEX_CRASH_KR:
-                    print(f"  🚫 [KR 매수 중단] KOSPI {kr_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_KR}%)")
-                elif weather['KR'] == "🌧️ BEAR":
-                    print(f"  🛑 [KR 매수 중단] 현재 국장 날씨는 {weather['KR']} 입니다. (현금 관망)")
+                if not _macro_market_buy_allowed(macro_snap, "KR"):
+                    print(
+                        f"  -> 🚨 국장 Phase4 글로벌 방어막: 신규 매수 중단. "
+                        f"({(macro_snap.get('market_buy_block_reason') or {}).get('KR', '')})"
+                    )
                 else:
-                    total_kr = len(final_targets)
-                    print(f"  -> 🇰🇷 국장 사냥감 {total_kr}개 정밀 분석 시작!")
-                    for idx, t in enumerate(final_targets, 1):
-                        kr_name = get_kr_company_name(t)  # 종목명 미리 조회
-                        if in_ticker_cooldown(state, t):
-                            print(
-                                f"  ⏭️ {kr_name}({t}): 매도 후 쿨다운(톱날 방지) 만료 "
-                                f"{ticker_cooldown_human(state, t)} 이전 (패스)"
+                    # 지수 급락 체크
+                    kr_index_change = get_market_index_change("KR")
+                    print(f"  📊 [KOSPI 지수] 변화율: {kr_index_change:+.2f}% 날씨는 {weather['KR']}")
+                    if kr_index_change <= INDEX_CRASH_KR:
+                        print(f"  🚫 [KR 매수 중단] KOSPI {kr_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_KR}%)")
+                    elif weather['KR'] == "🌧️ BEAR":
+                        print(f"  🛑 [KR 매수 중단] 현재 국장 날씨는 {weather['KR']} 입니다. (현금 관망)")
+                    else:
+                        total_kr = len(final_targets)
+                        print(f"  -> 🇰🇷 국장 사냥감 {total_kr}개 정밀 분석 시작!")
+                        for idx, t in enumerate(final_targets, 1):
+                            kr_name = get_kr_company_name(t)  # 종목명 미리 조회
+                            if in_ticker_cooldown(state, t):
+                                print(
+                                    f"  ⏭️ {kr_name}({t}): 매도 후 쿨다운(톱날 방지) 만료 "
+                                    f"{ticker_cooldown_human(state, t)} 이전 (패스)"
+                                )
+                                continue
+                            if in_cooldown(state, t):
+                                print(f"  ⏭️ {kr_name}({t}): 쿨다운 중 (패스)")
+                                continue
+                            if t in held_kr:
+                                print(f"  ⏭️ {kr_name}({t}): 이미 보유중 (패스)")
+                                continue
+                            sector_ok_kr, sector_msg_kr = allow_kr_sector_entry(
+                                t,
+                                state.get("positions", {}),
+                                MAX_POSITIONS_KR,
+                                normalize_ticker,
                             )
-                            continue
-                        if in_cooldown(state, t):
-                            print(f"  ⏭️ {kr_name}({t}): 쿨다운 중 (패스)")
-                            continue
-                        if t in held_kr:
-                            print(f"  ⏭️ {kr_name}({t}): 이미 보유중 (패스)")
-                            continue
-                        sector_ok_kr, sector_msg_kr = allow_kr_sector_entry(
-                            t,
-                            state.get("positions", {}),
-                            MAX_POSITIONS_KR,
-                            normalize_ticker,
-                        )
-                        if not sector_ok_kr:
-                            print(f"  ⏭️ {kr_name}({t}): {sector_msg_kr} (패스)")
-                            continue
+                            if not sector_ok_kr:
+                                print(f"  ⏭️ {kr_name}({t}): {sector_msg_kr} (패스)")
+                                continue
 
-                        try:
-                            ohlcv_200 = get_ohlcv_yfinance(t)
+                            try:
+                                ohlcv_200 = get_ohlcv_yfinance(t)
 
-                            # =================================================================
-                            # 포지션 사이징(국장): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
-                            #
-                            # - base_ratio = 1 / MAX_POSITIONS_KR (절대 고정)
-                            # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
-                            # - 최종 비중 조절은 macro_mult 에서만 담당
-                            # =================================================================
-                            base_ratio = 1.0 / max(1, int(MAX_POSITIONS_KR))
-                            ratio = float(base_ratio)
-                            t_name = "1/N 고정"
+                                # =================================================================
+                                # 포지션 사이징(국장): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
+                                #
+                                # - base_ratio = 1 / MAX_POSITIONS_KR (절대 고정)
+                                # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
+                                # - 최종 비중 조절은 macro_mult 에서만 담당
+                                # =================================================================
+                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_KR))
+                                ratio, t_name = _position_ratio_with_vol_target(
+                                    base_ratio,
+                                    ohlcv_200,
+                                    target_vol=_alpha_target_vol,
+                                    ticker=t,
+                                )
                             
-                            target_budget = total_kr_equity * ratio * macro_mult
-                            kr_min_budget = 50000.0 # 국장 최소 주문 (5만원)
+                                target_budget = total_kr_equity * ratio * macro_mult
+                                kr_min_budget = 50000.0 # 국장 최소 주문 (5만원)
 
-                            # 🧹 [수술 2] 예수금 영끌(Sweep) 및 철통 방어 로직
-                            if target_budget < kr_min_budget:
-                                print(
-                                    f"  ⏭️ {kr_name}({t}): [KR 예산 부족] 배정예산 {int(target_budget):,}원 < "
-                                    f"최소 {int(kr_min_budget):,}원 (총자산 {int(total_kr_equity):,}원×비중·macro, 예수금 {int(kr_cash):,}원)"
-                                )
-                                continue
-                            if kr_cash < kr_min_budget:
-                                print(
-                                    f"  ⏭️ {kr_name}({t}): [KR 예수금 부족] 가용 {int(kr_cash):,}원 < 최소 {int(kr_min_budget):,}원 — 매수 불가"
-                                )
-                                continue
-                            if kr_cash < target_budget:
-                                print(f"  🧹 [예수금 영끌 발동] {kr_name}({t}): 예산({int(target_budget):,}원) 부족. 지갑에 남은 전액({int(kr_cash):,}원) 풀매수 장전!")
-                                target_budget = kr_cash
+                                # 🧹 [수술 2] 예수금 영끌(Sweep) 및 철통 방어 로직
+                                if target_budget < kr_min_budget:
+                                    print(
+                                        f"  ⏭️ {kr_name}({t}): [KR 예산 부족] 배정예산 {int(target_budget):,}원 < "
+                                        f"최소 {int(kr_min_budget):,}원 (총자산 {int(total_kr_equity):,}원×비중·macro, 예수금 {int(kr_cash):,}원)"
+                                    )
+                                    continue
+                                if kr_cash < kr_min_budget:
+                                    print(
+                                        f"  ⏭️ {kr_name}({t}): [KR 예수금 부족] 가용 {int(kr_cash):,}원 < 최소 {int(kr_min_budget):,}원 — 매수 불가"
+                                    )
+                                    continue
+                                if kr_cash < target_budget:
+                                    print(f"  🧹 [예수금 영끌 발동] {kr_name}({t}): 예산({int(target_budget):,}원) 부족. 지갑에 남은 전액({int(kr_cash):,}원) 풀매수 장전!")
+                                    target_budget = kr_cash
 
-                            strategy_type = "TREND_V8"
-                            entry_fib_level = 0.0
-                            is_buy, sl_p, s_name = calculate_pro_signals(ohlcv_200, weather['KR'], t, kr_name, idx, total_kr)
-                            if is_buy:
-                                print(f"  ✅ [V8-BUY] {kr_name}({t}) 진입")
-                            else:
-                                sw_ok, sw_fib, sw_why = check_swing_entry(pd.DataFrame(ohlcv_200))
-                                if sw_ok:
-                                    strategy_type = "SWING_FIB"
-                                    entry_fib_level = float(sw_fib)
-                                    sl_p = float(sw_fib)
-                                    s_name = "SWING_FIB"
-                                    print(f"  ✅ [SWING-BUY] {kr_name}({t}) entry_fib={entry_fib_level:,.2f}")
+                                strategy_type = "TREND_V8"
+                                entry_fib_level = 0.0
+                                is_buy, sl_p, s_name = calculate_pro_signals(ohlcv_200, weather['KR'], t, kr_name, idx, total_kr)
+                                if is_buy:
+                                    print(f"  ✅ [V8-BUY] {kr_name}({t}) 진입")
                                 else:
-                                    _prog = f"[{idx}/{total_kr}]" if total_kr > 0 else ""
-                                    _disp = f"{kr_name}({t})" if kr_name and kr_name != t else t
-                                    print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
+                                    sw_ok, sw_fib, sw_why = check_swing_entry(pd.DataFrame(ohlcv_200))
+                                    if sw_ok:
+                                        strategy_type = "SWING_FIB"
+                                        entry_fib_level = float(sw_fib)
+                                        sl_p = float(sw_fib)
+                                        s_name = "SWING_FIB"
+                                        print(f"  ✅ [SWING-BUY] {kr_name}({t}) entry_fib={entry_fib_level:,.2f}")
+                                    else:
+                                        _prog = f"[{idx}/{total_kr}]" if total_kr > 0 else ""
+                                        _disp = f"{kr_name}({t})" if kr_name and kr_name != t else t
+                                        print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
+                                        continue
+                            
+                                if not can_open_new(t, state, max_positions=MAX_POSITIONS_KR):
+                                    print(
+                                        f"  ⏭️ {kr_name}({t}): [MAX_POSITIONS:KR] "
+                                        f"국장 한도 {MAX_POSITIONS_KR}개 도달 (패스)"
+                                    )
+                                    continue
+
+                                # 🚨 [추가 수술] 국장 전용 시가 갭(Gap) 과다 상승 필터 (5%)
+                                try:
+                                    if ohlcv_200 and len(ohlcv_200) >= 2:
+                                        last_close = float(ohlcv_200[-2]['c']) # 어제 종가
+                                        today_open = float(ohlcv_200[-1]['o']) # 오늘 시가
+                                        if last_close > 0:
+                                            gap_ratio = ((today_open - last_close) / last_close) * 100
+                                            if gap_ratio >= 5.0:
+                                                print(f"  ⏭️ {kr_name}({t}): 갭상승 과다 ({gap_ratio:.2f}%) - 필터링 (패스)")
+                                                continue
+                                except Exception as gap_err:
+                                    print(f"  ⚠️ 갭상승 체크 중 오류: {gap_err}")
+
+                                # 현재가: yfinance 데이터 사용 (이미 조회했으니 추가 API 없음)
+                                curr_p = 0.0
+                                if ohlcv_200 and len(ohlcv_200) > 0:
+                                    curr_p = float(ohlcv_200[-1]['c'])
+                        
+                                if curr_p <= 0:
+                                    print(f"  ⏭️ {kr_name}({t}): 현재가 조회 실패 (패스)")
+                                    continue
+                                qty = int(target_budget / curr_p)
+                                if qty <= 0:
+                                    print(
+                                        f"  ⏭️ {kr_name}({t}): [KR 매수 스킵] 시그널 통과했으나 수량 0 — "
+                                        f"배정예산 {int(target_budget):,}원 < 1주 기준(~{int(curr_p):,}원) "
+                                        f"(총자산 {int(total_kr_equity):,}원, ratio={ratio:.4f}, macro×{macro_mult:.2f}, 예수금 {int(kr_cash):,}원)"
+                                    )
+                                    continue
+
+                                # Phase 3: 매수 직전 뉴스 악재 필터
+                                if not _ai_false_breakout_buy_gate(
+                                    t,
+                                    "KR",
+                                    strategy_type,
+                                    AI_FALSE_BREAKOUT_THRESHOLD,
+                                    f"{kr_name}({t})",
+                                ):
                                     continue
                             
-                            if not can_open_new(t, state, max_positions=MAX_POSITIONS_KR):
-                                print(
-                                    f"  ⏭️ {kr_name}({t}): [MAX_POSITIONS:KR] "
-                                    f"국장 한도 {MAX_POSITIONS_KR}개 도달 (패스)"
+                                # 매수 주문 (Phase2 TWAP: 대액 시 분할)
+                                kr_box = [float(kr_cash)]
+                                entry_atr = float(get_safe_atr(t, ohlcv_200) or 0.0)
+                                ok_kr_buy = _execute_kr_market_buy_twap(
+                                    t,
+                                    kr_name,
+                                    float(target_budget),
+                                    curr_p,
+                                    sl_p,
+                                    entry_atr,
+                                    t_name,
+                                    s_name,
+                                    state,
+                                    kr_box,
+                                    strategy_type=strategy_type,
+                                    entry_fib_level=entry_fib_level,
                                 )
-                                continue
-
-                            # 🚨 [추가 수술] 국장 전용 시가 갭(Gap) 과다 상승 필터 (5%)
-                            try:
-                                if ohlcv_200 and len(ohlcv_200) >= 2:
-                                    last_close = float(ohlcv_200[-2]['c']) # 어제 종가
-                                    today_open = float(ohlcv_200[-1]['o']) # 오늘 시가
-                                    if last_close > 0:
-                                        gap_ratio = ((today_open - last_close) / last_close) * 100
-                                        if gap_ratio >= 5.0:
-                                            print(f"  ⏭️ {kr_name}({t}): 갭상승 과다 ({gap_ratio:.2f}%) - 필터링 (패스)")
-                                            continue
-                            except Exception as gap_err:
-                                print(f"  ⚠️ 갭상승 체크 중 오류: {gap_err}")
-
-                            # 현재가: yfinance 데이터 사용 (이미 조회했으니 추가 API 없음)
-                            curr_p = 0.0
-                            if ohlcv_200 and len(ohlcv_200) > 0:
-                                curr_p = float(ohlcv_200[-1]['c'])
-                        
-                            if curr_p <= 0:
-                                print(f"  ⏭️ {kr_name}({t}): 현재가 조회 실패 (패스)")
-                                continue
-                            qty = int(target_budget / curr_p)
-                            if qty <= 0:
-                                print(
-                                    f"  ⏭️ {kr_name}({t}): [KR 매수 스킵] 시그널 통과했으나 수량 0 — "
-                                    f"배정예산 {int(target_budget):,}원 < 1주 기준(~{int(curr_p):,}원) "
-                                    f"(총자산 {int(total_kr_equity):,}원, ratio={ratio:.4f}, macro×{macro_mult:.2f}, 예수금 {int(kr_cash):,}원)"
-                                )
-                                continue
-
-                            # Phase 3: 매수 직전 뉴스 악재 필터
-                            if not _ai_false_breakout_buy_gate(
-                                t,
-                                "KR",
-                                strategy_type,
-                                AI_FALSE_BREAKOUT_THRESHOLD,
-                                f"{kr_name}({t})",
-                            ):
-                                continue
-                            
-                            # 매수 주문 (Phase2 TWAP: 대액 시 분할)
-                            kr_box = [float(kr_cash)]
-                            entry_atr = float(get_safe_atr(t, ohlcv_200) or 0.0)
-                            ok_kr_buy = _execute_kr_market_buy_twap(
-                                t,
-                                kr_name,
-                                float(target_budget),
-                                curr_p,
-                                sl_p,
-                                entry_atr,
-                                t_name,
-                                s_name,
-                                state,
-                                kr_box,
-                                strategy_type=strategy_type,
-                                entry_fib_level=entry_fib_level,
-                            )
-                            if not ok_kr_buy:
-                                print(
-                                    f"  ⏭️ {kr_name}({t}): [KR 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
-                                    f"예산 {int(target_budget):,}원, 현재가 {int(curr_p):,}원 (TWAP 슬라이스·KIS·예수 확인)"
-                                )
-                            else:
-                                _cycle_buy_fills += 1
-                            kr_cash = int(kr_box[0])
-                        except Exception as e:
-                            print(f"  ❌ [KR BUY 예외] {t}: {type(e).__name__}: {e}")
-                            traceback.print_exc()
-                            continue        
+                                if not ok_kr_buy:
+                                    print(
+                                        f"  ⏭️ {kr_name}({t}): [KR 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
+                                        f"예산 {int(target_budget):,}원, 현재가 {int(curr_p):,}원 (TWAP 슬라이스·KIS·예수 확인)"
+                                    )
+                                else:
+                                    _cycle_buy_fills += 1
+                                kr_cash = int(kr_box[0])
+                            except Exception as e:
+                                print(f"  ❌ [KR BUY 예외] {t}: {type(e).__name__}: {e}")
+                                traceback.print_exc()
+                                continue        
     else:
         _log_kr_market_closed_or_suppressed()
 
@@ -4341,150 +4446,161 @@ def run_trading_bot():
                 )
             else:
                 _cycle_buy_zone_us = True
-                # 지수 급락 체크
-                us_index_change = get_market_index_change("US")
-                print(f"  📊 [S&P500 지수] 변화율: {us_index_change:+.2f}% 날씨는 {weather['US']}")
-                if us_index_change <= INDEX_CRASH_US:
-                    print(f"  🚫 [US 매수 중단] S&P500 {us_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_US}%)")
-                elif weather['US'] == "🌧️ BEAR":
-                    print(f"  🛑 [US 매수 중단] 현재 미장 날씨는 {weather['US']} 입니다. (현금 관망)")
+                if not _macro_market_buy_allowed(macro_snap, "US"):
+                    print(
+                        f"  -> 🚨 미장 Phase4 글로벌 방어막: 신규 매수 중단. "
+                        f"({(macro_snap.get('market_buy_block_reason') or {}).get('US', '')})"
+                    )
                 else:
-                    if weather['US'] != "🌧️ BEAR":
-                        # 2) 미장 타겟: S&P100 시총 + Ndx100\\S&P100 상위 50 (총 150, ``us_universe_cache.json``)
-                        night_targets = get_top_market_cap_tickers(150)
-                        total_us = len(night_targets)
-                        print(f"  -> 🇺🇸 미장 유니버스(S&P100+Ndx50) {total_us}개 정밀 분석 시작!")
-                        
-                        for idx, t in enumerate(night_targets, 1):
-                            try:
-                                us_name = get_us_company_name(t)  # 종목명 미리 조회
-                                if in_ticker_cooldown(state, t):
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): 매도 후 쿨다운(톱날 방지) 만료 "
-                                        f"{ticker_cooldown_human(state, t)} 이전 (패스)"
-                                    )
-                                    continue
-                                if in_cooldown(state, t):
-                                    print(f"  ⏭️ {us_name}({t}): 쿨다운 중 (패스)")
-                                    continue
-                                if t in held_us:
-                                    print(f"  ⏭️ {us_name}({t}): 이미 보유중 (패스)")
-                                    continue
-                                sector_ok_us, sector_msg_us = allow_us_sector_entry(
-                                    t,
-                                    state.get("positions", {}),
-                                    MAX_POSITIONS_US,
-                                    normalize_ticker,
-                                )
-                                if not sector_ok_us:
-                                    print(f"  ⏭️ {us_name}({t}): {sector_msg_us} (패스)")
-                                    continue
-
-                                # OHLCV: 신호 계산에 필요
-                                ohlcv = get_ohlcv_yfinance(t)
-                                if not ohlcv:
-                                    print(f"  ⏭️ {us_name}({t}): OHLCV 데이터 부족 (패스)")
-                                    continue
-
-                                # =================================================================
-                                # 포지션 사이징(미장): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
-                                #
-                                # - base_ratio = 1 / MAX_POSITIONS_US (절대 고정)
-                                # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
-                                # - 최종 비중 조절은 macro_mult 에서만 담당
-                                # =================================================================
-                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_US))
-                                ratio = float(base_ratio)
-                                t_name = "1/N 고정"
-
-                                target_budget = total_us_equity * ratio * macro_mult
-                                us_min_budget = 50.0  # 최소 주문금액
-                                
-                                # 🧹 [수술 2] 예수금 영끌(Sweep) 및 철통 방어 로직
-                                if target_budget < us_min_budget:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): [US 예산 부족] 배정예산 ${target_budget:.2f} < "
-                                        f"최소 ${us_min_budget:.0f} (총자산 ${total_us_equity:.2f}×비중·macro, 예수금 ${us_cash:.2f})"
-                                    )
-                                    continue
-                                if us_cash < us_min_budget:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): [US 예수금 부족] 가용 ${us_cash:.2f} < 최소 ${us_min_budget:.0f} — 매수 불가"
-                                    )
-                                    continue
-                                if us_cash < target_budget:
-                                    print(f"  🧹 [미장 영끌 발동] {us_name}({t}): 예산(${target_budget:.2f}) 부족. 지갑에 남은 전액(${us_cash:.2f}) 풀매수 장전!")
-                                    target_budget = us_cash
-
-                                strategy_type = "TREND_V8"
-                                entry_fib_level = 0.0
-                                is_buy, sl_p, s_name = calculate_pro_signals(ohlcv, weather['US'], t, us_name, idx, total_us)
-                                if is_buy:
-                                    print(f"  ✅ [V8-BUY] {us_name}({t}) 진입")
-                                else:
-                                    sw_ok, sw_fib, sw_why = check_swing_entry(pd.DataFrame(ohlcv))
-                                    if sw_ok:
-                                        strategy_type = "SWING_FIB"
-                                        entry_fib_level = float(sw_fib)
-                                        sl_p = float(sw_fib)
-                                        s_name = "SWING_FIB"
-                                        print(f"  ✅ [SWING-BUY] {us_name}({t}) entry_fib={entry_fib_level:.2f}")
-                                    else:
-                                        _prog = f"[{idx}/{total_us}]" if total_us > 0 else ""
-                                        _disp = f"{us_name}({t})" if us_name and us_name != t else t
-                                        print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
+                    # 지수 급락 체크
+                    us_index_change = get_market_index_change("US")
+                    print(f"  📊 [S&P500 지수] 변화율: {us_index_change:+.2f}% 날씨는 {weather['US']}")
+                    if us_index_change <= INDEX_CRASH_US:
+                        print(f"  🚫 [US 매수 중단] S&P500 {us_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_US}%)")
+                    elif weather['US'] == "🌧️ BEAR":
+                        print(f"  🛑 [US 매수 중단] 현재 미장 날씨는 {weather['US']} 입니다. (현금 관망)")
+                    else:
+                        if weather['US'] != "🌧️ BEAR":
+                            # 2) 미장 타겟: S&P100 시총 + Ndx100\\S&P100 상위 50 (총 150, ``us_universe_cache.json``)
+                            night_targets = get_top_market_cap_tickers(150)
+                            night_targets = _sort_buy_targets_by_rs(night_targets, "US")
+                            total_us = len(night_targets)
+                            print(f"  -> 🇺🇸 미장 유니버스(S&P100+Ndx50) {total_us}개 정밀 분석 시작!")
+                            
+                            for idx, t in enumerate(night_targets, 1):
+                                try:
+                                    us_name = get_us_company_name(t)  # 종목명 미리 조회
+                                    if in_ticker_cooldown(state, t):
+                                        print(
+                                            f"  ⏭️ {us_name}({t}): 매도 후 쿨다운(톱날 방지) 만료 "
+                                            f"{ticker_cooldown_human(state, t)} 이전 (패스)"
+                                        )
                                         continue
-                                if not can_open_new(t, state, max_positions=MAX_POSITIONS_US):
-                                    print(f"  ⏭️ {us_name}({t}): 포지션 개수 초과 ({MAX_POSITIONS_US}개) (패스)")
-                                    continue
-
-                                curr_p = float(ohlcv[-1]['c'])
-                                qty = int(target_budget / curr_p) if curr_p > 0 else 0
-                                if qty <= 0:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): [US 매수 스킵] 시그널 통과했으나 정수주 0주 — "
-                                        f"배정예산 ${target_budget:.2f} < 종가기준 1주(~${curr_p:.2f}) "
-                                        f"(총자산 ${total_us_equity:.2f}, 비중캡 후 ratio={ratio:.4f}, macro×{macro_mult:.2f}, 예수금 ${us_cash:.2f})"
+                                    if in_cooldown(state, t):
+                                        print(f"  ⏭️ {us_name}({t}): 쿨다운 중 (패스)")
+                                        continue
+                                    if t in held_us:
+                                        print(f"  ⏭️ {us_name}({t}): 이미 보유중 (패스)")
+                                        continue
+                                    sector_ok_us, sector_msg_us = allow_us_sector_entry(
+                                        t,
+                                        state.get("positions", {}),
+                                        MAX_POSITIONS_US,
+                                        normalize_ticker,
                                     )
-                                    continue
-                                if not _ai_false_breakout_buy_gate(
-                                    t,
-                                    "US",
-                                    strategy_type,
-                                    AI_FALSE_BREAKOUT_THRESHOLD,
-                                    f"{us_name}({t})",
-                                ):
-                                    continue
+                                    if not sector_ok_us:
+                                        print(f"  ⏭️ {us_name}({t}): {sector_msg_us} (패스)")
+                                        continue
 
-                                # 시장가 매수 (Phase2 TWAP: 대액 시 USD 분할, 슬라이스마다 101% 지정가)
-                                us_box = [float(us_cash)]
-                                entry_atr = float(get_safe_atr(t, ohlcv) or 0.0)
-                                ok_us_buy = _execute_us_market_buy_twap(
-                                    t,
-                                    us_name,
-                                    float(target_budget),
-                                    curr_p,
-                                    sl_p,
-                                    entry_atr,
-                                    t_name,
-                                    s_name,
-                                    state,
-                                    us_box,
-                                    strategy_type=strategy_type,
-                                    entry_fib_level=entry_fib_level,
-                                )
-                                if not ok_us_buy:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): [US 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
-                                        f"배정 ${target_budget:.2f}, 종가 ${curr_p:.2f} (TWAP·KIS·예수 확인)"
+                                    # OHLCV: 신호 계산에 필요
+                                    ohlcv = get_ohlcv_yfinance(t)
+                                    if not ohlcv:
+                                        print(f"  ⏭️ {us_name}({t}): OHLCV 데이터 부족 (패스)")
+                                        continue
+
+                                    # =================================================================
+                                    # 포지션 사이징(미장): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
+                                    #
+                                    # - base_ratio = 1 / MAX_POSITIONS_US (절대 고정)
+                                    # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
+                                    # - 최종 비중 조절은 macro_mult 에서만 담당
+                                    # =================================================================
+                                    base_ratio = 1.0 / max(1, int(MAX_POSITIONS_US))
+                                    ratio, t_name = _position_ratio_with_vol_target(
+                                        base_ratio,
+                                        ohlcv,
+                                        target_vol=_alpha_target_vol,
+                                        ticker=t,
                                     )
-                                else:
-                                    _cycle_buy_fills += 1
-                                us_cash = float(us_box[0])
-                            except Exception as e:
-                                print(f"  ❌ [US BUY 예외] {t}: {type(e).__name__}: {e}")
-                                traceback.print_exc()
-                                continue        
+
+                                    target_budget = total_us_equity * ratio * macro_mult
+                                    us_min_budget = 50.0  # 최소 주문금액
+                                
+                                    # 🧹 [수술 2] 예수금 영끌(Sweep) 및 철통 방어 로직
+                                    if target_budget < us_min_budget:
+                                        print(
+                                            f"  ⏭️ {us_name}({t}): [US 예산 부족] 배정예산 ${target_budget:.2f} < "
+                                            f"최소 ${us_min_budget:.0f} (총자산 ${total_us_equity:.2f}×비중·macro, 예수금 ${us_cash:.2f})"
+                                        )
+                                        continue
+                                    if us_cash < us_min_budget:
+                                        print(
+                                            f"  ⏭️ {us_name}({t}): [US 예수금 부족] 가용 ${us_cash:.2f} < 최소 ${us_min_budget:.0f} — 매수 불가"
+                                        )
+                                        continue
+                                    if us_cash < target_budget:
+                                        print(f"  🧹 [미장 영끌 발동] {us_name}({t}): 예산(${target_budget:.2f}) 부족. 지갑에 남은 전액(${us_cash:.2f}) 풀매수 장전!")
+                                        target_budget = us_cash
+
+                                    strategy_type = "TREND_V8"
+                                    entry_fib_level = 0.0
+                                    is_buy, sl_p, s_name = calculate_pro_signals(ohlcv, weather['US'], t, us_name, idx, total_us)
+                                    if is_buy:
+                                        print(f"  ✅ [V8-BUY] {us_name}({t}) 진입")
+                                    else:
+                                        sw_ok, sw_fib, sw_why = check_swing_entry(pd.DataFrame(ohlcv))
+                                        if sw_ok:
+                                            strategy_type = "SWING_FIB"
+                                            entry_fib_level = float(sw_fib)
+                                            sl_p = float(sw_fib)
+                                            s_name = "SWING_FIB"
+                                            print(f"  ✅ [SWING-BUY] {us_name}({t}) entry_fib={entry_fib_level:.2f}")
+                                        else:
+                                            _prog = f"[{idx}/{total_us}]" if total_us > 0 else ""
+                                            _disp = f"{us_name}({t})" if us_name and us_name != t else t
+                                            print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
+                                            continue
+                                    if not can_open_new(t, state, max_positions=MAX_POSITIONS_US):
+                                        print(f"  ⏭️ {us_name}({t}): 포지션 개수 초과 ({MAX_POSITIONS_US}개) (패스)")
+                                        continue
+
+                                    curr_p = float(ohlcv[-1]['c'])
+                                    qty = int(target_budget / curr_p) if curr_p > 0 else 0
+                                    if qty <= 0:
+                                        print(
+                                            f"  ⏭️ {us_name}({t}): [US 매수 스킵] 시그널 통과했으나 정수주 0주 — "
+                                            f"배정예산 ${target_budget:.2f} < 종가기준 1주(~${curr_p:.2f}) "
+                                            f"(총자산 ${total_us_equity:.2f}, 비중캡 후 ratio={ratio:.4f}, macro×{macro_mult:.2f}, 예수금 ${us_cash:.2f})"
+                                        )
+                                        continue
+                                    if not _ai_false_breakout_buy_gate(
+                                        t,
+                                        "US",
+                                        strategy_type,
+                                        AI_FALSE_BREAKOUT_THRESHOLD,
+                                        f"{us_name}({t})",
+                                    ):
+                                        continue
+
+                                    # 시장가 매수 (Phase2 TWAP: 대액 시 USD 분할, 슬라이스마다 101% 지정가)
+                                    us_box = [float(us_cash)]
+                                    entry_atr = float(get_safe_atr(t, ohlcv) or 0.0)
+                                    ok_us_buy = _execute_us_market_buy_twap(
+                                        t,
+                                        us_name,
+                                        float(target_budget),
+                                        curr_p,
+                                        sl_p,
+                                        entry_atr,
+                                        t_name,
+                                        s_name,
+                                        state,
+                                        us_box,
+                                        strategy_type=strategy_type,
+                                        entry_fib_level=entry_fib_level,
+                                    )
+                                    if not ok_us_buy:
+                                        print(
+                                            f"  ⏭️ {us_name}({t}): [US 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
+                                            f"배정 ${target_budget:.2f}, 종가 ${curr_p:.2f} (TWAP·KIS·예수 확인)"
+                                        )
+                                    else:
+                                        _cycle_buy_fills += 1
+                                    us_cash = float(us_box[0])
+                                except Exception as e:
+                                    print(f"  ❌ [US BUY 예외] {t}: {type(e).__name__}: {e}")
+                                    traceback.print_exc()
+                                    continue        
     else:
         _log_us_market_closed_or_suppressed()
 
@@ -4815,14 +4931,20 @@ def run_trading_bot():
 
             if not skip_buy:
                 _cycle_buy_zone_coin = True
-                # 지수 급락 체크
-                coin_index_change = get_market_index_change("COIN")
-                print(f"  📊 [BTC 지수] 변화율: {coin_index_change:+.2f}% 날씨는 {coin_weather}")
-                if coin_index_change <= INDEX_CRASH_COIN:
-                    print(f"  🚫 [COIN 매수 중단] BTC {coin_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_COIN}%)")
-                elif coin_weather == "🌧️ BEAR":
-                    print(f"  🛑 [COIN 매수 중단] 현재 코인 날씨는 {coin_weather} 입니다. (현금 관망)")   
+                if not _macro_market_buy_allowed(macro_snap, "COIN"):
+                    print(
+                        f"  -> 🚨 코인 Phase4 글로벌 방어막: 신규 매수 중단. "
+                        f"({(macro_snap.get('market_buy_block_reason') or {}).get('COIN', '')})"
+                    )
                 else:
+                    # 지수 급락 체크
+                    coin_index_change = get_market_index_change("COIN")
+                    print(f"  📊 [BTC 지수] 변화율: {coin_index_change:+.2f}% 날씨는 {coin_weather}")
+                    if coin_index_change <= INDEX_CRASH_COIN:
+                        print(f"  🚫 [COIN 매수 중단] BTC {coin_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_COIN}%)")
+                    elif coin_weather == "🌧️ BEAR":
+                        print(f"  🛑 [COIN 매수 중단] 현재 코인 날씨는 {coin_weather} 입니다. (현금 관망)")   
+                    else:
                         if coin_weather == "🌧️ BEAR":
                             print("  ⏭️ 코인 시장이 베어 상태라 신규 매수 안함 (패스)")
                         else:
@@ -4881,6 +5003,8 @@ def run_trading_bot():
                                 scan_targets = []
                                 _ohlcv_pref = {}
 
+                            scan_targets = _sort_buy_targets_by_rs(scan_targets, "COIN")
+
                             print(
                                 f"  -> 🪙 코인 실시간 수급 상위 {len(scan_targets)}개 정밀 분석 시작! "
                                 f"(매수 판단: V8→스윙, 국·미장과 동일)"
@@ -4913,8 +5037,12 @@ def run_trading_bot():
                                 # - 최종 비중 조절은 macro_mult 에서만 담당
                                 # =================================================================
                                 base_ratio = 1.0 / max(1, int(MAX_POSITIONS_COIN))
-                                ratio = float(base_ratio)
-                                t_name = "1/N 고정"
+                                ratio, t_name = _position_ratio_with_vol_target(
+                                    base_ratio,
+                                    ohlcv,
+                                    target_vol=_alpha_target_vol,
+                                    ticker=t,
+                                )
 
                                 budget = total_coin_equity * ratio * macro_mult
                                 coin_min_budget = _coin_min_order_krw()

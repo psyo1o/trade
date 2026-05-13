@@ -50,7 +50,7 @@ from utils.helpers import (
     seconds_until_next_quarter_hour,
     seconds_until_next_half_hour,
 )
-from execution.sync_positions import sync_all_positions
+from execution.sync_positions import sync_all_positions, _last_buy_price_from_trade_history
 from services.gui_table_adapter import build_rows_data
 from run_bot import (
     get_us_cash_real,
@@ -473,6 +473,8 @@ class BalanceUpdaterThread(QThread):
                 pos = {}
             if m == "COIN" and buy_p <= 0:
                 buy_p = float(_to_float(pos.get("buy_p", 0), 0.0))
+                if buy_p <= 0:
+                    buy_p = float(_last_buy_price_from_trade_history(ledger_key, "COIN") or 0.0)
             current_price = run_bot.resolve_holding_display_price(
                 m, ledger_key, buy_p, current_p_api, pos
             )
@@ -1120,9 +1122,10 @@ class BotDashboard(QMainWindow):
             sl_p = float(pos_info.get('sl_p', 0.0))
             max_p = float(pos_info.get('max_p', 0.0))
             
-            # 수익률 계산
+            # 장부 수익률: 매수가 대비 기록된 최고가(max_p). 실시간 보유 표·상단 ROI는 현재가 기준.
             if buy_p > 0:
-                profit_rate = ((max_p - buy_p) / buy_p) * 100
+                peak_p = max_p if max_p > 0 else buy_p
+                profit_rate = ((peak_p - buy_p) / buy_p) * 100
             else:
                 profit_rate = 0.0
             

@@ -16,7 +16,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from api.macro_data import fetch_crypto_fear_greed_index, fetch_vix_close
+from api.macro_data import (
+    fetch_coin_whale_short_ratio,
+    fetch_crypto_fear_greed_index,
+    fetch_us_put_call_ratio,
+    fetch_usd_krw_momentum,
+    fetch_vix_close,
+)
 
 
 def evaluate_macro_guard(
@@ -52,6 +58,56 @@ def evaluate_macro_guard(
         "budget_multiplier": 1.0,
         "reason": f"VIX {vix:.2f}, Fear&Greed {fgi} (정상 범위)",
     }
+
+
+def evaluate_market_macro_buy_permission(
+    market: str,
+    *,
+    us_put_call_ratio: float | None,
+    coin_whale_long_short_ratio: float | None,
+    usd_krw_spot: float | None,
+    usd_krw_momentum_ratio: float | None,
+    us_pcr_block: float = 1.2,
+    coin_whale_block: float = 0.8,
+    krw_fx_momentum_block: float = 1.015,
+    krw_fx_spot_block: float = 1500.0,
+) -> Dict[str, Any]:
+    """시장별 글로벌 알파 차단(US PCR·코인 고래·원화 환율). 지표 미수집 시 통과."""
+    mk = str(market or "").strip().upper()
+    pcr = float(us_put_call_ratio) if us_put_call_ratio is not None else None
+    whale = float(coin_whale_long_short_ratio) if coin_whale_long_short_ratio is not None else None
+    fx_spot = float(usd_krw_spot) if usd_krw_spot is not None else None
+    fx_mom = float(usd_krw_momentum_ratio) if usd_krw_momentum_ratio is not None else None
+
+    if mk == "US":
+        if pcr is not None and pcr >= float(us_pcr_block):
+            return {
+                "allowed": False,
+                "reason": f"SPY Put/Call {pcr:.3f} >= {us_pcr_block:g}",
+            }
+        return {"allowed": True, "reason": "US 글로벌 지표 정상"}
+
+    if mk == "COIN":
+        if whale is not None and whale <= float(coin_whale_block):
+            return {
+                "allowed": False,
+                "reason": f"BTC 고래 롱숏 {whale:.3f} <= {coin_whale_block:g}",
+            }
+        return {"allowed": True, "reason": "COIN 글로벌 지표 정상"}
+
+    if mk == "KR":
+        reasons: list[str] = []
+        if pcr is not None and pcr >= float(us_pcr_block):
+            reasons.append(f"SPY Put/Call {pcr:.3f} >= {us_pcr_block:g}")
+        if fx_mom is not None and fx_mom >= float(krw_fx_momentum_block):
+            reasons.append(f"환율 모멘텀 {fx_mom:.4f} >= {krw_fx_momentum_block:g}")
+        if fx_spot is not None and fx_spot >= float(krw_fx_spot_block):
+            reasons.append(f"환율 {fx_spot:.2f} >= {krw_fx_spot_block:g}")
+        if reasons:
+            return {"allowed": False, "reason": " | ".join(reasons)}
+        return {"allowed": True, "reason": "KR 글로벌 지표 정상"}
+
+    return {"allowed": True, "reason": "unknown market"}
 
 
 def fetch_vix_yfinance() -> float:
@@ -105,6 +161,12 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
             "fgi": None,
             "vix_source": "",
             "fgi_source": "",
+            "us_put_call_ratio": None,
+            "coin_whale_long_short_ratio": None,
+            "usd_krw_spot": None,
+            "usd_krw_momentum_ratio": None,
+            "market_buy_allowed": {"KR": True, "US": True, "COIN": True},
+            "market_buy_block_reason": {"KR": "", "US": "", "COIN": ""},
             "reason": "macro_guard_enabled=false",
         }
 
@@ -148,11 +210,49 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
         fgi_reduce=fgi_reduce,
         reduce_mult=reduce_mult,
     )
+
+    us_pcr_block = float(config.get("macro_us_put_call_block_threshold", 1.2))
+    coin_whale_block = float(config.get("macro_coin_whale_long_short_block_threshold", 0.8))
+    krw_fx_mom_block = float(config.get("macro_krw_fx_momentum_block_threshold", 1.015))
+    krw_fx_spot_block = float(config.get("macro_krw_fx_spot_block_threshold", 1500.0))
+
+    us_pcr = fetch_us_put_call_ratio(str(config.get("macro_us_put_call_symbol", "SPY")))
+    whale_ratio = fetch_coin_whale_short_ratio(
+        str(config.get("macro_coin_whale_symbol", "BTCUSDT")),
+        str(config.get("macro_coin_whale_period", "1d")),
+    )
+    fx_pack = fetch_usd_krw_momentum() or {}
+    usd_krw_spot = _coerce_float(fx_pack.get("spot"))
+    usd_krw_momentum_ratio = _coerce_float(fx_pack.get("momentum_ratio"))
+
+    market_buy_allowed: Dict[str, bool] = {}
+    market_buy_block_reason: Dict[str, str] = {}
+    for mk in ("KR", "US", "COIN"):
+        perm = evaluate_market_macro_buy_permission(
+            mk,
+            us_put_call_ratio=us_pcr,
+            coin_whale_long_short_ratio=whale_ratio,
+            usd_krw_spot=usd_krw_spot,
+            usd_krw_momentum_ratio=usd_krw_momentum_ratio,
+            us_pcr_block=us_pcr_block,
+            coin_whale_block=coin_whale_block,
+            krw_fx_momentum_block=krw_fx_mom_block,
+            krw_fx_spot_block=krw_fx_spot_block,
+        )
+        market_buy_allowed[mk] = bool(perm.get("allowed", True))
+        market_buy_block_reason[mk] = str(perm.get("reason", "") or "")
+
     return {
         "enabled": True,
         "vix": float(vix_val),
         "fgi": int(fgi_val),
         "vix_source": vix_src,
         "fgi_source": fgi_src,
+        "us_put_call_ratio": us_pcr,
+        "coin_whale_long_short_ratio": whale_ratio,
+        "usd_krw_spot": usd_krw_spot,
+        "usd_krw_momentum_ratio": usd_krw_momentum_ratio,
+        "market_buy_allowed": market_buy_allowed,
+        "market_buy_block_reason": market_buy_block_reason,
         **decision,
     }
