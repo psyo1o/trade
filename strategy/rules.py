@@ -525,10 +525,14 @@ def _calc_rsi14(close: pd.Series) -> pd.Series:
 
 def check_swing_entry(df: pd.DataFrame) -> tuple[bool, float, str]:
     """
-    스윙 매수 타점 판단.
+    스윙 매수 타점 판단 (HTS 턴어라운드 조건검색 연동).
+    
+    진입 조건:
+        1. 60일 이평선 위에 위치 (추세 확인)
+        2. 당일 양봉 (상방 흐름 확인)
 
     Returns:
-        (진입여부, 지지받은 피보나치 레벨 가격, 실패 시 사유 문자열 — 성공 시 "")
+        (진입여부, 가장 가까운 피보나치 레벨 가격, 실패 시 사유 문자열 — 성공 시 "")
     """
     if df is None or len(df) < 60:
         return False, 0.0, "봉 부족(60 미만)"
@@ -539,23 +543,16 @@ def check_swing_entry(df: pd.DataFrame) -> tuple[bool, float, str]:
         return False, 0.0, "OHLC 컬럼 부족"
 
     w["ma60"] = w["c"].rolling(60).mean()
-    bb_mid = w["c"].rolling(20).mean()
-    bb_std = w["c"].rolling(20).std()
-    w["bb_lower"] = bb_mid - (bb_std * 2.0)
-    w["rsi14"] = _calc_rsi14(w["c"])
 
     today = w.iloc[-1]
-    prev = w.iloc[-2]
     close_today = float(today["c"])
+    open_today = float(today["o"])
 
+    # 1. 60일선 위에 위치 (종가 > 60MA)
     cond1 = pd.notna(today["ma60"]) and close_today > float(today["ma60"])
-    cond2 = pd.notna(today["bb_lower"]) and close_today <= float(today["bb_lower"]) * 1.02
-    cond3 = (
-        pd.notna(prev["rsi14"])
-        and pd.notna(today["rsi14"])
-        and float(prev["rsi14"]) <= 50.0
-        and float(today["rsi14"]) > float(prev["rsi14"])
-    )
+    
+    # 2. 당일 양봉 체크 (시가보다 종가가 높아야 함)
+    cond5 = close_today > open_today
 
     recent60 = w.iloc[-60:]
     hi60 = float(recent60["h"].max())
@@ -566,26 +563,16 @@ def check_swing_entry(df: pd.DataFrame) -> tuple[bool, float, str]:
     fib_382 = hi60 - (span * 0.382)
     fib_500 = hi60 - (span * 0.5)
 
-    near_382 = abs(close_today - fib_382) / fib_382 <= 0.02 if fib_382 > 0 else False
-    near_500 = abs(close_today - fib_500) / fib_500 <= 0.02 if fib_500 > 0 else False
-    cond4 = near_382 or near_500
-
-    if cond1 and cond2 and cond3 and cond4:
-        if near_382 and near_500:
-            chosen = fib_382 if abs(close_today - fib_382) <= abs(close_today - fib_500) else fib_500
-        else:
-            chosen = fib_382 if near_382 else fib_500
+    if cond1 and cond5:
+        # 매도 하드스탑 계산을 위해 현재가와 가장 가까운 피보나치 레벨 반환
+        chosen = fib_382 if abs(close_today - fib_382) <= abs(close_today - fib_500) else fib_500
         return True, float(chosen), ""
 
     miss: list[str] = []
     if not cond1:
         miss.append("종가≤60MA")
-    if not cond2:
-        miss.append("볼밴하단×1.02 초과")
-    if not cond3:
-        miss.append("RSI14(전≤50·당>전) 미달")
-    if not cond4:
-        miss.append("피보0.382/0.5±2% 미근접")
+    if not cond5:
+        miss.append("당일 음봉")
     return False, 0.0, " · ".join(miss) if miss else "조건 미충족"
 
 

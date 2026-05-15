@@ -1,5 +1,5 @@
 ================================================================================
-  c-bot 프로젝트 구조 / 파일 설명 (2026-05-01)
+  c-bot 프로젝트 구조 / 파일 설명 (2026-05-15)
   — 처음 보는 분도 따라갈 수 있게: 무엇이 어디에 있고, 무엇을 Git에 올리지 않는지까지 정리
 ================================================================================
 
@@ -33,7 +33,7 @@
   services/      … 잔고 facade, GUI/heartbeat 공용 스냅샷, 테이블 어댑터
   utils/         … 로그, 텔레그램, 공통 헬퍼(주말 KIS 차단 판별 등)
   tests/         … test_lab.py(실험), test_kis_parsers.py 등
-  조건검색/      … HTS 조건검색식 등 참고 자료(선택)
+  조건검색/      … HTS 조건검색식 (HTS 턴어라운드 종목 발굴, 봇 매수 연동)
 
 
 --------------------------------------------------------------------------------
@@ -142,7 +142,7 @@ api/
   kis_parsers.py … output2 list/dict 혼합 파싱 공통화
 
 strategy/
-  rules.py … calculate_pro_signals(V8, Hurst<0.45 차단), check_swing_*, get_chandelier_exit 등
+  rules.py … calculate_pro_signals(V8, Hurst<0.45 차단), check_swing_entry(HTS 조건검색 연동), check_swing_exit, get_chandelier_exit 등
   alpha_sizing.py … 10일 RS 정렬, volatility_target_ratio (min(1/N, target_vol/ATR%))
   indicators.py … get_safe_atr (V8 ATR 무결성)
   sector_lock.py … Phase1 섹터 과다 방지

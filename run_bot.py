@@ -3976,40 +3976,6 @@ def run_trading_bot():
                             try:
                                 ohlcv_200 = get_ohlcv_yfinance(t)
 
-                                # =================================================================
-                                # 포지션 사이징(국장): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
-                                #
-                                # - base_ratio = 1 / MAX_POSITIONS_KR (절대 고정)
-                                # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
-                                # - 최종 비중 조절은 macro_mult 에서만 담당
-                                # =================================================================
-                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_KR))
-                                ratio, t_name = _position_ratio_with_vol_target(
-                                    base_ratio,
-                                    ohlcv_200,
-                                    target_vol=_alpha_target_vol,
-                                    ticker=t,
-                                )
-                            
-                                target_budget = total_kr_equity * ratio * macro_mult
-                                kr_min_budget = 50000.0 # 국장 최소 주문 (5만원)
-
-                                # 🧹 [수술 2] 예수금 영끌(Sweep) 및 철통 방어 로직
-                                if target_budget < kr_min_budget:
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [KR 예산 부족] 배정예산 {int(target_budget):,}원 < "
-                                        f"최소 {int(kr_min_budget):,}원 (총자산 {int(total_kr_equity):,}원×비중·macro, 예수금 {int(kr_cash):,}원)"
-                                    )
-                                    continue
-                                if kr_cash < kr_min_budget:
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [KR 예수금 부족] 가용 {int(kr_cash):,}원 < 최소 {int(kr_min_budget):,}원 — 매수 불가"
-                                    )
-                                    continue
-                                if kr_cash < target_budget:
-                                    print(f"  🧹 [예수금 영끌 발동] {kr_name}({t}): 예산({int(target_budget):,}원) 부족. 지갑에 남은 전액({int(kr_cash):,}원) 풀매수 장전!")
-                                    target_budget = kr_cash
-
                                 strategy_type = "TREND_V8"
                                 entry_fib_level = 0.0
                                 is_buy, sl_p, s_name = calculate_pro_signals(ohlcv_200, weather['KR'], t, kr_name, idx, total_kr)
@@ -4028,6 +3994,32 @@ def run_trading_bot():
                                         _disp = f"{kr_name}({t})" if kr_name and kr_name != t else t
                                         print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
                                         continue
+
+                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_KR))
+                                ratio, t_name = _position_ratio_with_vol_target(
+                                    base_ratio,
+                                    ohlcv_200,
+                                    target_vol=_alpha_target_vol,
+                                    ticker=t,
+                                )
+
+                                target_budget = total_kr_equity * ratio * macro_mult
+                                kr_min_budget = 50000.0
+
+                                if target_budget < kr_min_budget:
+                                    print(
+                                        f"  ⏭️ {kr_name}({t}): [KR 예산 부족] 배정예산 {int(target_budget):,}원 < "
+                                        f"최소 {int(kr_min_budget):,}원 (총자산 {int(total_kr_equity):,}원×비중·macro, 예수금 {int(kr_cash):,}원)"
+                                    )
+                                    continue
+                                if kr_cash < kr_min_budget:
+                                    print(
+                                        f"  ⏭️ {kr_name}({t}): [KR 예수금 부족] 가용 {int(kr_cash):,}원 < 최소 {int(kr_min_budget):,}원 — 매수 불가"
+                                    )
+                                    continue
+                                if kr_cash < target_budget:
+                                    print(f"  🧹 [예수금 영끌 발동] {kr_name}({t}): 예산({int(target_budget):,}원) 부족. 지갑에 남은 전액({int(kr_cash):,}원) 풀매수 장전!")
+                                    target_budget = kr_cash
                             
                                 if not can_open_new(t, state, max_positions=MAX_POSITIONS_KR):
                                     print(
@@ -4498,40 +4490,6 @@ def run_trading_bot():
                                         print(f"  ⏭️ {us_name}({t}): OHLCV 데이터 부족 (패스)")
                                         continue
 
-                                    # =================================================================
-                                    # 포지션 사이징(미장): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
-                                    #
-                                    # - base_ratio = 1 / MAX_POSITIONS_US (절대 고정)
-                                    # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
-                                    # - 최종 비중 조절은 macro_mult 에서만 담당
-                                    # =================================================================
-                                    base_ratio = 1.0 / max(1, int(MAX_POSITIONS_US))
-                                    ratio, t_name = _position_ratio_with_vol_target(
-                                        base_ratio,
-                                        ohlcv,
-                                        target_vol=_alpha_target_vol,
-                                        ticker=t,
-                                    )
-
-                                    target_budget = total_us_equity * ratio * macro_mult
-                                    us_min_budget = 50.0  # 최소 주문금액
-                                
-                                    # 🧹 [수술 2] 예수금 영끌(Sweep) 및 철통 방어 로직
-                                    if target_budget < us_min_budget:
-                                        print(
-                                            f"  ⏭️ {us_name}({t}): [US 예산 부족] 배정예산 ${target_budget:.2f} < "
-                                            f"최소 ${us_min_budget:.0f} (총자산 ${total_us_equity:.2f}×비중·macro, 예수금 ${us_cash:.2f})"
-                                        )
-                                        continue
-                                    if us_cash < us_min_budget:
-                                        print(
-                                            f"  ⏭️ {us_name}({t}): [US 예수금 부족] 가용 ${us_cash:.2f} < 최소 ${us_min_budget:.0f} — 매수 불가"
-                                        )
-                                        continue
-                                    if us_cash < target_budget:
-                                        print(f"  🧹 [미장 영끌 발동] {us_name}({t}): 예산(${target_budget:.2f}) 부족. 지갑에 남은 전액(${us_cash:.2f}) 풀매수 장전!")
-                                        target_budget = us_cash
-
                                     strategy_type = "TREND_V8"
                                     entry_fib_level = 0.0
                                     is_buy, sl_p, s_name = calculate_pro_signals(ohlcv, weather['US'], t, us_name, idx, total_us)
@@ -4550,6 +4508,32 @@ def run_trading_bot():
                                             _disp = f"{us_name}({t})" if us_name and us_name != t else t
                                             print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
                                             continue
+
+                                    base_ratio = 1.0 / max(1, int(MAX_POSITIONS_US))
+                                    ratio, t_name = _position_ratio_with_vol_target(
+                                        base_ratio,
+                                        ohlcv,
+                                        target_vol=_alpha_target_vol,
+                                        ticker=t,
+                                    )
+
+                                    target_budget = total_us_equity * ratio * macro_mult
+                                    us_min_budget = 50.0
+
+                                    if target_budget < us_min_budget:
+                                        print(
+                                            f"  ⏭️ {us_name}({t}): [US 예산 부족] 배정예산 ${target_budget:.2f} < "
+                                            f"최소 ${us_min_budget:.0f} (총자산 ${total_us_equity:.2f}×비중·macro, 예수금 ${us_cash:.2f})"
+                                        )
+                                        continue
+                                    if us_cash < us_min_budget:
+                                        print(
+                                            f"  ⏭️ {us_name}({t}): [US 예수금 부족] 가용 ${us_cash:.2f} < 최소 ${us_min_budget:.0f} — 매수 불가"
+                                        )
+                                        continue
+                                    if us_cash < target_budget:
+                                        print(f"  🧹 [미장 영끌 발동] {us_name}({t}): 예산(${target_budget:.2f}) 부족. 지갑에 남은 전액(${us_cash:.2f}) 풀매수 장전!")
+                                        target_budget = us_cash
                                     if not can_open_new(t, state, max_positions=MAX_POSITIONS_US):
                                         print(f"  ⏭️ {us_name}({t}): 포지션 개수 초과 ({MAX_POSITIONS_US}개) (패스)")
                                         continue
@@ -5029,40 +5013,6 @@ def run_trading_bot():
                                     print(f"  ⏭️ {t}: OHLCV 데이터 부족 (패스)")
                                     continue
                                 
-                                # =================================================================
-                                # 포지션 사이징(코인): 1/N 고정 (프랍 데스크 모델, 종목·날씨별 가중치 없음)
-                                #
-                                # - base_ratio = 1 / MAX_POSITIONS_COIN (절대 고정)
-                                # - ratio 는 base_ratio 그대로, 감산·가산 모두 없음
-                                # - 최종 비중 조절은 macro_mult 에서만 담당
-                                # =================================================================
-                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_COIN))
-                                ratio, t_name = _position_ratio_with_vol_target(
-                                    base_ratio,
-                                    ohlcv,
-                                    target_vol=_alpha_target_vol,
-                                    ticker=t,
-                                )
-
-                                budget = total_coin_equity * ratio * macro_mult
-                                coin_min_budget = _coin_min_order_krw()
-
-                                # 🧹 [수술 2] 예수금 영끌(Sweep) 및 철통 방어 로직
-                                if budget < coin_min_budget:
-                                    print(
-                                        f"  ⏭️ {t}: [COIN 예산 부족] 배정예산 {int(budget):,}원 < "
-                                        f"최소 {int(coin_min_budget):,}원 (총평가 {int(total_coin_equity):,}원×비중·macro, 주문가능 {int(krw_bal):,}원)"
-                                    )
-                                    continue
-                                if krw_bal < coin_min_budget:
-                                    print(
-                                        f"  ⏭️ {t}: [COIN 예수금 부족] 주문가능 {int(krw_bal):,}원 < 최소 {int(coin_min_budget):,}원 — 매수 불가"
-                                    )
-                                    continue
-                                if krw_bal < budget:
-                                    print(f"  🧹 [코인 영끌 발동] {t}: 예산({int(budget):,}원) 부족. 지갑에 남은 전액({int(krw_bal):,}원) 풀매수 장전!")
-                                    budget = krw_bal
-
                                 strategy_type = "TREND_V8"
                                 entry_fib_level = 0.0
                                 is_buy, sl_p, s_name = calculate_pro_signals(
@@ -5084,6 +5034,32 @@ def run_trading_bot():
                                         _disp = f"{_cn}({t})" if _cn and _cn != t else t
                                         print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
                                         continue
+
+                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_COIN))
+                                ratio, t_name = _position_ratio_with_vol_target(
+                                    base_ratio,
+                                    ohlcv,
+                                    target_vol=_alpha_target_vol,
+                                    ticker=t,
+                                )
+
+                                budget = total_coin_equity * ratio * macro_mult
+                                coin_min_budget = _coin_min_order_krw()
+
+                                if budget < coin_min_budget:
+                                    print(
+                                        f"  ⏭️ {t}: [COIN 예산 부족] 배정예산 {int(budget):,}원 < "
+                                        f"최소 {int(coin_min_budget):,}원 (총평가 {int(total_coin_equity):,}원×비중·macro, 주문가능 {int(krw_bal):,}원)"
+                                    )
+                                    continue
+                                if krw_bal < coin_min_budget:
+                                    print(
+                                        f"  ⏭️ {t}: [COIN 예수금 부족] 주문가능 {int(krw_bal):,}원 < 최소 {int(coin_min_budget):,}원 — 매수 불가"
+                                    )
+                                    continue
+                                if krw_bal < budget:
+                                    print(f"  🧹 [코인 영끌 발동] {t}: 예산({int(budget):,}원) 부족. 지갑에 남은 전액({int(krw_bal):,}원) 풀매수 장전!")
+                                    budget = krw_bal
 
                                 if not can_open_new(t, state, max_positions=MAX_POSITIONS_COIN):
                                     print(f"  ⏭️ {t}: 포지션 개수 초과 ({MAX_POSITIONS_COIN}개) (패스)")

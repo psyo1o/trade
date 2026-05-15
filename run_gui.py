@@ -1234,6 +1234,8 @@ class BotDashboard(QMainWindow):
     def _on_trade_worker_finished(self):
         self._trade_worker_busy = False
         self._flush_pending_heartbeat()
+        # 매매 종료 후 최신 장부·내역을 화면에 즉시 반영
+        QTimer.singleShot(500, lambda: self.refresh_balance(sync_first=False))
 
     def do_trade(self):
         if self._trade_worker_busy:
