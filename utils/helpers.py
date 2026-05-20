@@ -229,18 +229,32 @@ def get_us_company_name(ticker):
 
 
 def get_kr_company_name(code):
-    """🇰🇷 국내주식 종목명 조회 (잔고는 run_bot 경유 get_balance_with_retry 사용)"""
+    """🇰🇷 국내주식 종목명 — 잔고 → KIS → 네이버 (yfinance 미사용)."""
+    sym = "".join(ch for ch in str(code or "") if ch.isdigit()).zfill(6)
+    if not sym:
+        return str(code or "").strip()
+
     import importlib
+
     m64 = importlib.import_module("run_bot")
     try:
         bal = ensure_dict(m64.get_balance_with_retry())
-        kr_output1 = bal.get('output1', []) if isinstance(bal.get('output1'), list) else []
+        kr_output1 = bal.get("output1", []) if isinstance(bal.get("output1"), list) else []
         for stock in kr_output1:
-            if stock.get('pdno') == code:
-                return stock.get('prdt_name', code)
-        return code
-    except:
-        return code
+            if str(stock.get("pdno", "")).zfill(6) == sym:
+                name = str(stock.get("prdt_name") or "").strip()
+                if name and name != sym:
+                    return name
+    except Exception:
+        pass
+
+    try:
+        from api.kr_stock_meta import resolve_kr_company_name
+        from api import kis_api
+
+        return resolve_kr_company_name(sym, broker=kis_api.broker_kr)
+    except Exception:
+        return sym
 
 
 def load_kis_token():

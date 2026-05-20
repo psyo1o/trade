@@ -5,7 +5,7 @@
 ``bot_state.json`` 스키마(일부)
     * ``positions`` — 티커별 ``buy_p``, ``sl_p``, ``tier``, ``qty``(실계좌·매수 시 동기화, 주말 GUI 표시) 등.
     * ``cooldown`` — 매수 직후 짧은 재진입 방지(분 단위, ``in_cooldown``).
-    * ``ticker_cooldowns`` — **매도 후** 티커별 절대 만료 시각(ISO). 전략·시장·사유 매트릭스(h) 적용; 분할 익절 잔량 시 미부여.
+    * ``ticker_cooldowns`` — **매도 후** 티커별 절대 만료 시각(ISO). 매도 사유별(익절 1h·손절·타임스탑 24h); 분할 익절 잔량 시 미부여.
     * ``peak_equity_{KR|US|COIN}`` — 시장별 MDD 브레이크용 고점.
     * ``peak_total_equity`` / ``last_reset_week`` / ``account_circuit_peak_reset_pending`` /
       ``account_circuit_cooldown_until`` — Phase5 합산 서킷(월요일 주차 MDD).
@@ -392,8 +392,12 @@ def _normalize_market_tag(market: str | None) -> str:
     return "KR"
 
 
-def _is_stop_loss_or_timestop_bucket(reason: str, profit_rate: float | None) -> bool:
-    """익절 vs 손절·타임스탑 구분 (reason 키워드 + profit_rate)."""
+_COOLDOWN_HOURS_PROFIT = 1.0
+_COOLDOWN_HOURS_STOP_LOSS = 24.0
+_COOLDOWN_HOURS_TIME_STOP = 24.0
+
+
+def _is_time_stop_exit(reason: str) -> bool:
     r = reason or ""
     if "V8_TIME_STOP" in r or "SWING_TIME_STOP" in r:
         return True
@@ -401,17 +405,23 @@ def _is_stop_loss_or_timestop_bucket(reason: str, profit_rate: float | None) -> 
         return True
     if "타임스탑" in r or ("타임" in r and "스탑" in r):
         return True
+    rl = r.lower()
+    return "time stop" in rl or "timestop" in rl
+
+
+def _is_stop_loss_exit(reason: str, profit_rate: float | None) -> bool:
+    """하드스탑·손절·컷로스 (타임스탑 제외)."""
+    if _is_time_stop_exit(reason):
+        return False
+    r = reason or ""
     if "하드스탑" in r or "손절" in r:
         return True
     if "지하실" in r or "좀비" in r:
         return True
     rl = r.lower()
-    if "time stop" in rl or "timestop" in rl:
+    if "hard stop" in rl or "stop loss" in rl or "cut loss" in rl:
         return True
-    if "hard stop" in rl or "stop loss" in rl:
-        return True
-    # 스윙 하드스탑 이탈 등 (영문 조합)
-    if "hard" in rl and "stop" in rl and "swing" in rl:
+    if "hard" in rl and "stop" in rl:
         return True
     try:
         if profit_rate is not None and float(profit_rate) < 0:
@@ -421,24 +431,47 @@ def _is_stop_loss_or_timestop_bucket(reason: str, profit_rate: float | None) -> 
     return False
 
 
-_COOLDOWN_HOURS_MATRIX: dict[tuple[str, str, str], float] = {
-    # TREND_V8 — 정상 익절
-    ("TREND_V8", "KR", "profit"): 72.0,
-    ("TREND_V8", "US", "profit"): 72.0,
-    ("TREND_V8", "COIN", "profit"): 24.0,
-    # TREND_V8 — 손절·타임스탑 (주식 타임스탑 달력 10일과 동일 스케일)
-    ("TREND_V8", "KR", "stop"): 240.0,
-    ("TREND_V8", "US", "stop"): 240.0,
-    ("TREND_V8", "COIN", "stop"): 72.0,
-    # SWING_FIB — 정상 익절
-    ("SWING_FIB", "KR", "profit"): 480.0,
-    ("SWING_FIB", "US", "profit"): 480.0,
-    ("SWING_FIB", "COIN", "profit"): 168.0,
-    # SWING_FIB — 손절·타임스탑
-    ("SWING_FIB", "KR", "stop"): 720.0,
-    ("SWING_FIB", "US", "stop"): 720.0,
-    ("SWING_FIB", "COIN", "stop"): 240.0,
-}
+def _is_profit_exit(reason: str) -> bool:
+    """익절·트레일링·분할 익절 등 빠른 재진입 대상."""
+    r = reason or ""
+    rl = r.lower()
+    if "scale-out" in rl or "scale out" in rl or "분할 익절" in r:
+        return True
+    if "swing-sell" in rl or "[swing-sell]" in rl:
+        return True
+    if "익절" in r or "take profit" in rl:
+        return True
+    if "샹들리에" in r or "chandelier" in rl:
+        return True
+    if "트레일" in r or "trailing" in rl:
+        return True
+    if "lock" in rl or "락" in r:
+        return True
+    if "추세 종료" in r:
+        return True
+    return False
+
+
+def _classify_exit_cooldown_bucket(reason: str, profit_rate: float | None) -> str:
+    """
+    매도 사유 → 쿨다운 버킷.
+
+    * ``profit`` — 익절·트레일링·분할 익절 (1h)
+    * ``time_stop`` — 타임스탑 (24h)
+    * ``stop_loss`` — 하드스탑·손절 (24h)
+    """
+    if _is_time_stop_exit(reason):
+        return "time_stop"
+    if _is_stop_loss_exit(reason, profit_rate):
+        return "stop_loss"
+    if _is_profit_exit(reason):
+        return "profit"
+    try:
+        if profit_rate is not None and float(profit_rate) >= 0:
+            return "profit"
+    except (TypeError, ValueError):
+        pass
+    return "stop_loss"
 
 
 def compute_ticker_cooldown_hours(
@@ -453,7 +486,7 @@ def compute_ticker_cooldown_hours(
     Layer 2 ``ticker_cooldowns`` 에 적용할 시간(h).
 
     * ``remaining_qty > 0`` (분할 익절 후 잔량 보유) → ``None`` (부여 안 함).
-    * 전량 청산(잔량 0)일 때만 전략·시장·사유 매트릭스 적용.
+    * 전량 청산 시 매도 사유별: 익절 1h / 손절·타임스탑 24h.
     """
     if remaining_qty is not None:
         try:
@@ -462,13 +495,12 @@ def compute_ticker_cooldown_hours(
         except (TypeError, ValueError):
             pass
 
-    st = _normalize_strategy_type(strategy_type)
-    m = _normalize_market_tag(market)
-    bucket = "stop" if _is_stop_loss_or_timestop_bucket(reason, profit_rate) else "profit"
-    hrs = _COOLDOWN_HOURS_MATRIX.get((st, m, bucket))
-    if hrs is not None:
-        return float(hrs)
-    return float(_COOLDOWN_HOURS_MATRIX.get((st, m, "profit"), 72.0))
+    bucket = _classify_exit_cooldown_bucket(reason or "", profit_rate)
+    if bucket == "profit":
+        return _COOLDOWN_HOURS_PROFIT
+    if bucket == "time_stop":
+        return _COOLDOWN_HOURS_TIME_STOP
+    return _COOLDOWN_HOURS_STOP_LOSS
 
 
 def set_ticker_cooldown_after_sell(

@@ -77,6 +77,7 @@ from run_bot import (
 from execution.guard import load_state, save_state
 
 TRADE_HISTORY_PATH = Path(__file__).resolve().parent / "trade_history.json"
+TRADE_HISTORY_SECTOR_OVERLAY_PATH = Path(__file__).resolve().parent / "trade_history_sectors_backfill.json"
 
 # Internet watch: TCP로 외부망을 짧게 확인. 연속 실패 시에만 quit → run_bot.bat가 GUI 재실행.
 # (구버전: 12초×3회 ≈ 40초 끊김에도 종료) — 환경 변수로 조절 가능.
@@ -790,11 +791,14 @@ class BotDashboard(QMainWindow):
         history_tab = QWidget()
         history_layout = QVBoxLayout(history_tab)
         
-        self.history_table = QTableWidget(0, 8)
-        self.history_table.setHorizontalHeaderLabels(["시간", "시장", "종목", "구분", "수량", "가격", "수익률(%)", "사유"])
+        self.history_table = QTableWidget(0, 9)
+        self.history_table.setHorizontalHeaderLabels(
+            ["시간", "시장", "종목", "섹터", "구분", "수량", "가격", "수익률(%)", "사유"]
+        )
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.history_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Stretch)
         self.history_table.horizontalHeader().setMinimumSectionSize(52)
         self.history_table.verticalHeader().setDefaultSectionSize(34)
         self.history_table.horizontalHeader().setMinimumHeight(30)
@@ -1016,9 +1020,19 @@ class BotDashboard(QMainWindow):
 
     def refresh_trade_history(self):
         """trade_history.json을 읽어 매매 내역 탭을 업데이트합니다."""
+        from utils.trade_sector import sector_for_trade_record
+
         self.history_table.setRowCount(0)
         history = []
         history_changed = False
+        sector_overlay = {}
+        if TRADE_HISTORY_SECTOR_OVERLAY_PATH.exists():
+            try:
+                ov = json.loads(TRADE_HISTORY_SECTOR_OVERLAY_PATH.read_text(encoding="utf-8"))
+                if isinstance(ov, dict):
+                    sector_overlay = ov
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
         if TRADE_HISTORY_PATH.exists():
             try:
                 history = json.loads(TRADE_HISTORY_PATH.read_text(encoding="utf-8"))
@@ -1063,14 +1077,17 @@ class BotDashboard(QMainWindow):
                     item["name"] = symbol_name
                     history_changed = True
 
+            sector_txt = sector_for_trade_record(item, sector_overlay) or "-"
+
             self.history_table.setItem(row, 0, QTableWidgetItem(item.get("timestamp", "")))
             self.history_table.setItem(row, 1, QTableWidgetItem(market))
             self.history_table.setItem(row, 2, QTableWidgetItem(display_name))
-            self.history_table.setItem(row, 3, QTableWidgetItem(item.get("side", "")))
-            self.history_table.setItem(row, 4, QTableWidgetItem(str(item.get("qty", ""))))
-            self.history_table.setItem(row, 5, QTableWidgetItem(str(item.get("price", ""))))
-            self.history_table.setItem(row, 6, QTableWidgetItem(str(item.get("profit_rate", ""))))
-            self.history_table.setItem(row, 7, QTableWidgetItem(item.get("reason", "")))
+            self.history_table.setItem(row, 3, QTableWidgetItem(sector_txt))
+            self.history_table.setItem(row, 4, QTableWidgetItem(item.get("side", "")))
+            self.history_table.setItem(row, 5, QTableWidgetItem(str(item.get("qty", ""))))
+            self.history_table.setItem(row, 6, QTableWidgetItem(str(item.get("price", ""))))
+            self.history_table.setItem(row, 7, QTableWidgetItem(str(item.get("profit_rate", ""))))
+            self.history_table.setItem(row, 8, QTableWidgetItem(item.get("reason", "")))
 
         if history_changed:
             try:

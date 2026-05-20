@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Phase 3 — 뉴스 악재 센티먼트 필터.
+Phase 3 — 뉴스 악재 센티먼트 필터 (듀얼 프롬프트).
 
 LLM(Gemini/OpenAI)은 OHLCV·호가 숫자가 아니라 **최근 뉴스 헤드라인**만 보고
-단기 치명 악재 여부를 0~100 위험도로 평가한다. 뉴스 수집 실패·본문 없음 시
-LLM 호출 없이 위험도 0(통과)으로 룰베이스 매매를 방해하지 않는다.
+0~100 위험도를 평가한다. ``strategy_type`` 에 따라 프롬프트가 분기된다.
+
+* **TREND_V8** — 단기 악재·가짜 돌파에 민감 (깐깐)
+* **SWING** 계열 — Terminal Risk(상폐·부도·횡령 등)만 감시 (관대)
+
+뉴스 수집 실패·본문 없음 시 LLM 호출 없이 위험도 0(통과).
 """
 from __future__ import annotations
 
@@ -70,9 +74,20 @@ def _get_secret(key_name: str, config: dict | None = None) -> str:
     return ""
 
 
+def is_swing_strategy_type(strategy_type: str | None) -> bool:
+    """스윙 계열 전략명(SWING_FIB, SWING, …) 여부."""
+    st = str(strategy_type or "").strip().upper()
+    return st == "SWING_FIB" or st == "SWING" or "SWING" in st
+
+
 def normalize_ai_strategy_type(strategy_type: str | None) -> str:
-    s = str(strategy_type or "TREND_V8").strip().upper()
-    return "SWING_FIB" if s == "SWING_FIB" else "TREND_V8"
+    """LLM 프롬프트·로그용 정규 전략명."""
+    return "SWING_FIB" if is_swing_strategy_type(strategy_type) else "TREND_V8"
+
+
+def ai_prompt_profile(strategy_type: str | None) -> str:
+    """듀얼 프롬프트 프로필 키."""
+    return "swing_terminal_risk" if is_swing_strategy_type(strategy_type) else "v8_strict"
 
 
 def _normalize_market(market: str | None) -> str:
@@ -218,15 +233,40 @@ def collect_recent_news_text(ticker: str, market: str, max_headlines: int = 10) 
     return _fetch_yfinance_news_text(symbol, max_headlines=max_headlines).strip()
 
 
-def _build_llm_prompt_news(news_text: str) -> str:
+def _build_llm_prompt_news_v8(news_text: str) -> str:
+    """TREND_V8 — 단기 악재·가짜 돌파에 민감한 깐깐한 프롬프트."""
     return (
         "당신은 헤지펀드의 리스크 관리자입니다. 다음은 이 종목의 최근 뉴스 헤드라인입니다. "
         "이 텍스트 안에 주가에 단기적으로 치명적인 타격을 줄 수 있는 명백한 악재"
-        "(예: 횡령, 배임, 대규모 유상증자, 상장폐지 위기, CEO 구속 등)가 포함되어 있는지 분석하십시오. "
+        "(예: 횡령, 배임, 대규모 유상증자, 상장폐지 위기, CEO 구속, 가짜 돌파 직후 악재 뉴스 등)가 "
+        "포함되어 있는지 분석하십시오. "
         "악재가 확실하다면 위험도 점수를 80~100점 사이로, 단순 노이즈거나 호재/중립이라면 0~30점 사이로 반환하십시오.\n"
         '출력은 JSON만: {"false_breakout_prob": <int>, "rationale": "짧은 한국어 1~3문장"}\n'
         f"news_text={news_text}\n"
     )
+
+
+def _build_llm_prompt_news_swing(news_text: str) -> str:
+    """SWING — 턴어라운드 구간의 일반 악재는 무시, Terminal Risk만 감시."""
+    return (
+        "당신은 스윙(낙폭 과대 후 반등) 전략 전담 리스크 관리자입니다. "
+        "다음은 이 종목의 최근 뉴스 헤드라인입니다.\n"
+        "【중요】단순 실적 부진, 어닝 미스, 섹터·시장 전체 하락, 목표가 하향, 일시적 공시 지연, "
+        "경쟁 심화, 단기 수급 악화 등 **턴어라운드 매수 구간에서 흔한 일반 악재는 위험으로 보지 말고 무시**하십시오.\n"
+        "오직 **기업 존립에 치명적인 Terminal Risk**가 헤드라인에 명시된 경우에만 높은 위험도를 부여하십시오. "
+        "예: 상장폐지·상장유지 실질적 불가, 부도·워크아웃·법정관리, 경영진 횡령·배임·분식회계로 인한 "
+        "형사 기소·구속, 감사의견 거절·상폐 예고, 핵심 사업 영구 폐쇄 등.\n"
+        "Terminal Risk가 **명확**하면 위험도 80~100점, 그 외(일반 악재·노이즈·중립·호재)는 0~30점.\n"
+        '출력은 JSON만: {"false_breakout_prob": <int>, "rationale": "짧은 한국어 1~3문장"}\n'
+        f"news_text={news_text}\n"
+    )
+
+
+def _build_llm_prompt_news(news_text: str, strategy_type: str | None = None) -> str:
+    """전략명에 따라 V8(깐깐) / SWING(Terminal Risk만) 프롬프트 분기."""
+    if is_swing_strategy_type(strategy_type):
+        return _build_llm_prompt_news_swing(news_text)
+    return _build_llm_prompt_news_v8(news_text)
 
 
 def _parse_llm_json(text: str) -> Tuple[int, str] | None:
@@ -257,12 +297,14 @@ def _openai_news_prob(
     news_text: str,
     config: dict | None,
     model_name: str | None = None,
+    *,
+    strategy_type: str | None = None,
 ) -> Tuple[int, str, bool]:
     api_key = _get_secret("OPENAI_API_KEY", config)
     if not api_key:
         return 0, "skip:OPENAI_API_KEY 없음 → 위험도 0", False
 
-    prompt = _build_llm_prompt_news(news_text)
+    prompt = _build_llm_prompt_news(news_text, strategy_type=strategy_type)
     mdl = (model_name or "").strip() or _openai_model_from_config(config)
 
     try:
@@ -287,12 +329,14 @@ def _gemini_news_prob(
     news_text: str,
     config: dict | None,
     model_name: str = "gemini-2.5-flash",
+    *,
+    strategy_type: str | None = None,
 ) -> Tuple[int, str, bool]:
     api_key = _get_secret("GOOGLE_API_KEY", config)
     if not api_key:
         return 0, "skip:GOOGLE_API_KEY 없음 → 위험도 0", False
 
-    prompt = _build_llm_prompt_news(news_text)
+    prompt = _build_llm_prompt_news(news_text, strategy_type=strategy_type)
     model_candidates = [
         model_name,
         "gemini-2.5-flash",
@@ -356,21 +400,30 @@ def evaluate_false_breakout_filter(
     orderbook: Any = None,
     candles_15m_10: Any = None,
 ) -> Dict[str, Any]:
-    """뉴스 악재 위험도 ``false_breakout_prob`` (0~100) 가 ``threshold`` 이상이면 매수 차단."""
+    """뉴스 악재 위험도 ``false_breakout_prob`` (0~100) 가 ``threshold`` 이상이면 매수 차단.
+
+    ``strategy_type`` — ``TREND_V8``(깐깐) / ``SWING_FIB``·``SWING`` 등(스윙 Terminal Risk 프롬프트).
+    """
     st = normalize_ai_strategy_type(strategy_type)
+    profile = ai_prompt_profile(strategy_type)
     provider_in = str(ai_provider or "gemini").strip().lower()
     news_text = collect_recent_news_text(ticker, market)
 
+    _base = {
+        "ticker": ticker,
+        "market": _normalize_market(market),
+        "strategy_type": st,
+        "prompt_profile": profile,
+    }
+
     if not news_text.strip():
         return {
-            "ticker": ticker,
-            "market": _normalize_market(market),
+            **_base,
             "false_breakout_prob": 0,
             "threshold": int(threshold),
             "blocked": False,
             "rationale": "skip:뉴스 없음/수집 실패 → 위험도 0",
             "provider": provider_in if use_ai else "skip",
-            "strategy_type": st,
             "evaluation_engine": "skip_no_news",
             "llm_success": False,
             "openai_fallback_used": False,
@@ -378,14 +431,12 @@ def evaluate_false_breakout_filter(
 
     if not use_ai:
         return {
-            "ticker": ticker,
-            "market": _normalize_market(market),
+            **_base,
             "false_breakout_prob": 0,
             "threshold": int(threshold),
             "blocked": False,
             "rationale": "skip:use_ai=False → 위험도 0",
             "provider": "skip",
-            "strategy_type": st,
             "evaluation_engine": "skip_no_ai",
             "llm_success": False,
             "openai_fallback_used": False,
@@ -400,10 +451,14 @@ def evaluate_false_breakout_filter(
         fallback_after_gemini = bool(config.get("ai_false_breakout_openai_fallback"))
 
     if provider_in == "openai":
-        prob, rationale, llm_success = _openai_news_prob(news_text, config)
+        prob, rationale, llm_success = _openai_news_prob(
+            news_text, config, strategy_type=strategy_type
+        )
         evaluation_engine = "openai" if llm_success else "skip"
     else:
-        prob, rationale, llm_success = _gemini_news_prob(news_text, config)
+        prob, rationale, llm_success = _gemini_news_prob(
+            news_text, config, strategy_type=strategy_type
+        )
         evaluation_engine = "gemini" if llm_success else "skip"
 
         if (
@@ -411,7 +466,9 @@ def evaluate_false_breakout_filter(
             and fallback_after_gemini
             and _get_secret("OPENAI_API_KEY", config).strip()
         ):
-            prob_o, rationale_o, ok_o = _openai_news_prob(news_text, config)
+            prob_o, rationale_o, ok_o = _openai_news_prob(
+                news_text, config, strategy_type=strategy_type
+            )
             if ok_o:
                 prob, rationale = prob_o, f"[Gemini 실패→OpenAI 폴백] {rationale_o}"
                 llm_success = True
@@ -421,14 +478,12 @@ def evaluate_false_breakout_filter(
     blocked = int(prob) >= int(threshold)
 
     return {
-        "ticker": ticker,
-        "market": _normalize_market(market),
+        **_base,
         "false_breakout_prob": int(prob),
         "threshold": int(threshold),
         "blocked": blocked,
         "rationale": rationale,
         "provider": provider_in,
-        "strategy_type": st,
         "evaluation_engine": evaluation_engine,
         "llm_success": llm_success,
         "openai_fallback_used": openai_fallback_used,

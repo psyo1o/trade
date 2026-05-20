@@ -4,8 +4,12 @@ V5 전략 코어 — OHLCV 수집, 프로 시그널, 청산 가격.
 
 역할 분리
     * **데이터** — ``get_ohlcv_yfinance`` / ``get_ohlcv_kis_domestic_daily`` / ``get_ohlcv_upbit`` / ``get_ohlcv_realtime`` 등.
-    * **시그널** — ``calculate_pro_signals`` (진입 조건 요약).
-    * **청산** — ``check_pro_exit``, ``get_final_exit_price`` (손절·트레일링 등).
+    * **시그널** — ``calculate_pro_signals`` (V8 진입), ``check_swing_entry`` / ``check_swing_exit`` (SWING_FIB).
+    * **청산** — ``check_pro_exit``, ``get_final_exit_price`` (V8), ``get_swing_exit_display_price`` (SWING_FIB 매도선).
+
+스윙 요약은 README.md §8. 진입: ``check_swing_entry`` (60MA·이격30%·거래량·갭3%·양봉·윗꼬리·피보).
+상수: ``SWING_MA60_MAX_EXTENSION_PCT``, ``SWING_VOL_MIN_VS_PREV_RATIO``, ``SWING_GAP_UP_MAX_PCT`` 등.
+매도선: ``get_swing_exit_display_price`` (HALF 목표는 ``get_swing_half_target_price``).
 """
 import pandas as pd
 import numpy as np
@@ -46,15 +50,18 @@ def _resolve_display_name(ticker, name=""):
     resolved = key
     try:
         if key.isdigit():
-            info = yf.Ticker(f"{key}.KS").info
-            name_yf = info.get('longName', info.get('shortName'))
-            if _is_valid_symbol_name(name_yf, key):
-                resolved = str(name_yf)
-            else:
-                info = yf.Ticker(f"{key}.KQ").info
-                name_yf = info.get('longName', info.get('shortName'))
-                if _is_valid_symbol_name(name_yf, key):
-                    resolved = str(name_yf)
+            from api.kr_stock_meta import resolve_kr_company_name
+
+            broker = None
+            try:
+                from api import kis_api
+
+                broker = kis_api.broker_kr
+            except Exception:
+                pass
+            name_kr = resolve_kr_company_name(key, broker=broker)
+            if _is_valid_symbol_name(name_kr, key):
+                resolved = str(name_kr)
         else:
             info = yf.Ticker(key).info
             name_yf = info.get('longName', info.get('shortName'))
@@ -523,62 +530,342 @@ def _calc_rsi14(close: pd.Series) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def check_swing_entry(df: pd.DataFrame) -> tuple[bool, float, str]:
+# 스윙 진입: 당일 고가 대비 현재가 하락(%)이 이 값 이상이면 윗꼬리 설거지로 거절
+SWING_UPPER_WICK_DROP_PCT = 5.0
+# 60MA 위 추세 속 눌림목 — 판정가가 60MA 대비 이 비율(%) 초과 이격이면 고점 상투로 거절
+SWING_MA60_MAX_EXTENSION_PCT = 30.0
+# 당일 거래량 ≥ 전일 × 이 비율, 또는 ≥ 5일 평균 거래량
+SWING_VOL_MIN_VS_PREV_RATIO = 0.80
+# 전일 종가 대비 당일 시가 갭 상승(%) 상한 — 초과 시 뇌동 추격으로 거절
+SWING_GAP_UP_MAX_PCT = 3.0
+# 스윙 손절 피보: 60봉 고저 되돌림 비율 (현재가 **아래** 지지만 허용)
+_SWING_FIB_RETRACE_RATIOS = (0.382, 0.500, 0.618)
+
+
+def _swing_reference_close(reference_close: float | None, close_bar: float) -> tuple[float, bool]:
+    """(판정 종가, 실시간가 사용 여부)."""
+    try:
+        live = float(reference_close) if reference_close is not None else 0.0
+    except (TypeError, ValueError):
+        live = 0.0
+    if live > 0:
+        return live, True
+    return float(close_bar), False
+
+
+def _pick_swing_fib_support_below(price: float, hi60: float, lo60: float) -> tuple[float | None, str]:
     """
-    스윙 매수 타점 판단 (HTS 턴어라운드 조건검색 연동).
-    
+    현재가보다 낮은 피보나치 되돌림선 중 가장 가까운(가장 높은) 지지가를 선택.
+    38.2·50·61.8% 모두 현재가 이상이면 None.
+    """
+    if not np.isfinite(hi60) or not np.isfinite(lo60) or hi60 <= lo60:
+        return None, "60봉 고저 스팬 무효"
+    span = hi60 - lo60
+    if span <= 0:
+        return None, "60봉 고저 스팬 무효"
+    px = float(price)
+    below: list[tuple[float, float]] = []
+    for ratio in _SWING_FIB_RETRACE_RATIOS:
+        level = hi60 - (span * float(ratio))
+        if level < px:
+            below.append((float(ratio), float(level)))
+    if not below:
+        return None, (
+            f"피보 지지 없음(38.2·50·61.8% 모두 현재가 {px:,.0f} 이상 — 진입 포기)"
+        )
+    _ratio, chosen = max(below, key=lambda x: x[1])
+    return chosen, ""
+
+
+def _swing_volume_inflow_ok(w: pd.DataFrame, today: pd.Series) -> tuple[bool, str]:
+    """당일 거래량이 전일 80% 이상 또는 5일 평균 이상인지."""
+    if "v" not in w.columns:
+        return False, "거래량(v) 컬럼 부족"
+    try:
+        vol_today = float(today.get("v", 0) or 0)
+    except (TypeError, ValueError):
+        vol_today = 0.0
+    if vol_today <= 0:
+        return False, "당일 거래량 0"
+    vol_yest = 0.0
+    if len(w) >= 2:
+        try:
+            vol_yest = float(w.iloc[-2].get("v", 0) or 0)
+        except (TypeError, ValueError):
+            vol_yest = 0.0
+    vol_ma5 = np.nan
+    if len(w) >= 5:
+        vol_ma5 = float(w["v"].tail(5).mean())
+    if vol_yest > 0 and vol_today >= vol_yest * SWING_VOL_MIN_VS_PREV_RATIO:
+        return True, ""
+    if np.isfinite(vol_ma5) and vol_ma5 > 0 and vol_today >= vol_ma5:
+        return True, ""
+    parts = [f"당일 {vol_today:,.0f}"]
+    if vol_yest > 0:
+        need_prev = vol_yest * SWING_VOL_MIN_VS_PREV_RATIO
+        parts.append(
+            f"전일 {vol_yest:,.0f}의 {int(SWING_VOL_MIN_VS_PREV_RATIO * 100)}%({need_prev:,.0f}) 미만"
+        )
+    if np.isfinite(vol_ma5) and vol_ma5 > 0:
+        parts.append(f"5일평균 {vol_ma5:,.0f} 미만")
+    return False, "거래량 부족(가짜 반등) — " + ", ".join(parts)
+
+
+def check_swing_entry(
+    df: pd.DataFrame,
+    *,
+    reference_close: float | None = None,
+) -> tuple[bool, float, str]:
+    """
+    추세 속 눌림목(Pullback) 스윙 매수 — KR/US/COIN 공통 (HTS 없이 코드 단 검증).
+
     진입 조건:
-        1. 60일 이평선 위에 위치 (추세 확인)
-        2. 당일 양봉 (상방 흐름 확인)
+        1. 60MA 위 + 60MA 대비 이격 ≤ ``SWING_MA60_MAX_EXTENSION_PCT`` (기본 30%)
+        2. 당일 양봉 (시가 < 판정가) — ``reference_close`` 우선
+        3. 전일 종가→당일 시가 갭 < ``SWING_GAP_UP_MAX_PCT`` (기본 3%)
+        4. 거래량: 당일 ≥ 전일×``SWING_VOL_MIN_VS_PREV_RATIO`` 또는 ≥ 5일 평균
+        5. 윗꼬리 < ``SWING_UPPER_WICK_DROP_PCT``
+        6. 피보: 60봉 38.2/50/61.8% 중 현재가 **아래** 지지
+
+    ``reference_close`` — 호출 시점 실시간가(KIS·거래소). 없으면 당일 일봉 종가.
 
     Returns:
-        (진입여부, 가장 가까운 피보나치 레벨 가격, 실패 시 사유 문자열 — 성공 시 "")
+        (진입여부, entry_fib_level/sl_p, 실패 시 사유 — 성공 시 "")
     """
     if df is None or len(df) < 60:
         return False, 0.0, "봉 부족(60 미만)"
 
     w = _normalize_ohlcv_df(df)
-    need_cols = {"h", "l", "c"}
+    need_cols = {"o", "h", "l", "c", "v"}
     if not need_cols.issubset(set(w.columns)):
-        return False, 0.0, "OHLC 컬럼 부족"
+        return False, 0.0, "OHLCV 컬럼 부족"
 
     w["ma60"] = w["c"].rolling(60).mean()
 
     today = w.iloc[-1]
-    close_today = float(today["c"])
+    close_bar = float(today["c"])
     open_today = float(today["o"])
+    high_today = float(today["h"])
+    if open_today <= 0:
+        return False, 0.0, "당일 시가 무효"
 
-    # 1. 60일선 위에 위치 (종가 > 60MA)
-    cond1 = pd.notna(today["ma60"]) and close_today > float(today["ma60"])
-    
-    # 2. 당일 양봉 체크 (시가보다 종가가 높아야 함)
-    cond5 = close_today > open_today
+    close_for_candle, used_live = _swing_reference_close(reference_close, close_bar)
+    if close_for_candle <= 0:
+        return False, 0.0, "판정 종가 무효"
+
+    # 갭 상승 억제 (전일 종가 → 당일 시가)
+    if len(w) >= 2:
+        prev_close = float(w.iloc[-2]["c"])
+        if prev_close > 0:
+            gap_pct = (open_today - prev_close) / prev_close * 100.0
+            if gap_pct >= SWING_GAP_UP_MAX_PCT:
+                return (
+                    False,
+                    0.0,
+                    f"갭상승 과다(전일 종가 {prev_close:,.0f}→시가 {open_today:,.0f}, "
+                    f"+{gap_pct:.2f}%≥{SWING_GAP_UP_MAX_PCT:.1f}%)",
+                )
+
+    ma60 = float(today["ma60"]) if pd.notna(today["ma60"]) else 0.0
+    ma_cap = ma60 * (1.0 + SWING_MA60_MAX_EXTENSION_PCT / 100.0) if ma60 > 0 else 0.0
+
+    # 1. 60일선 위 + 이격 상한 (에베레스트 컷)
+    cond_ma = ma60 > 0 and close_for_candle > ma60
+    cond_ma_ext_ok = ma_cap <= 0 or close_for_candle <= ma_cap
+    # 2. 실시간 양봉 (시가 < 판정가)
+    cond_bull = close_for_candle > open_today
+    # 3. 거래량 유입
+    cond_vol, vol_why = _swing_volume_inflow_ok(w, today)
 
     recent60 = w.iloc[-60:]
     hi60 = float(recent60["h"].max())
     lo60 = float(recent60["l"].min())
-    if not np.isfinite(hi60) or not np.isfinite(lo60) or hi60 <= lo60:
-        return False, 0.0, "60봉 고저 스팬 무효"
-    span = hi60 - lo60
-    fib_382 = hi60 - (span * 0.382)
-    fib_500 = hi60 - (span * 0.5)
 
-    if cond1 and cond5:
-        # 매도 하드스탑 계산을 위해 현재가와 가장 가까운 피보나치 레벨 반환
-        chosen = fib_382 if abs(close_today - fib_382) <= abs(close_today - fib_500) else fib_500
-        return True, float(chosen), ""
+    # 3. 윗꼬리 설거지: 당일 고가 대비 현재가 5% 이상 밀림
+    high_for_wick = max(high_today, close_for_candle)
+    if high_for_wick > 0:
+        wick_drop_pct = (high_for_wick - close_for_candle) / high_for_wick * 100.0
+        if wick_drop_pct >= SWING_UPPER_WICK_DROP_PCT:
+            src = "실시간" if used_live else "일봉"
+            return (
+                False,
+                0.0,
+                f"윗꼬리 설거지({src} 고가 {high_for_wick:,.0f} 대비 -{wick_drop_pct:.2f}%≥{SWING_UPPER_WICK_DROP_PCT:.0f}%)",
+            )
 
     miss: list[str] = []
-    if not cond1:
+    if not cond_ma:
         miss.append("종가≤60MA")
-    if not cond5:
-        miss.append("당일 음봉")
-    return False, 0.0, " · ".join(miss) if miss else "조건 미충족"
+    elif not cond_ma_ext_ok:
+        ext_pct = (close_for_candle / ma60 - 1.0) * 100.0 if ma60 > 0 else 0.0
+        miss.append(
+            f"60MA 이격 과다(+{ext_pct:.1f}%>{SWING_MA60_MAX_EXTENSION_PCT:.0f}%, "
+            f"판정가 {close_for_candle:,.0f} / 60MA {ma60:,.0f})"
+        )
+    if not cond_bull:
+        pct = ((close_for_candle - open_today) / open_today) * 100.0
+        src = "실시간" if used_live else "일봉"
+        miss.append(f"당일 음봉({src} 시가 {open_today:,.0f}≥종가 {close_for_candle:,.0f}, {pct:+.2f}%)")
+    if not cond_vol:
+        miss.append(vol_why)
+    if miss:
+        return False, 0.0, " · ".join(miss)
+
+    fib_stop, fib_why = _pick_swing_fib_support_below(close_for_candle, hi60, lo60)
+    if fib_stop is None:
+        return False, 0.0, fib_why
+
+    return True, float(fib_stop), ""
 
 
-def check_swing_exit(pos_info: dict, df: pd.DataFrame) -> tuple[str, str]:
+# 볼밴 상단 1차 익절(HALF): 현재가가 상단 이상 + 평단 대비 최소 수익률(%)
+SWING_BB_HALF_MIN_PROFIT_PCT = 2.0
+# 스윙 수익 보존 락(V8 ``get_final_exit_price`` 콘크리트와 동일 티어 — 최고가 대비 %)
+_SWING_PROFIT_LOCK_TIERS = (
+    (30.0, 1.15),
+    (20.0, 1.05),
+    (10.0, 1.005),
+)
+
+
+def _append_swing_indicators(w: pd.DataFrame) -> pd.DataFrame:
+    """스윙 청산·매도선용 일봉 지표(볼밴·일목·RSI)."""
+    out = _normalize_ohlcv_df(w)
+    out["rsi14"] = _calc_rsi14(out["c"])
+    bb_mid = out["c"].rolling(20).mean()
+    bb_std = out["c"].rolling(20).std()
+    out["bb_upper"] = bb_mid + (bb_std * 2.0)
+    tenkan = (out["h"].rolling(9).max() + out["l"].rolling(9).min()) / 2.0
+    kijun = (out["h"].rolling(26).max() + out["l"].rolling(26).min()) / 2.0
+    out["senkou_a"] = ((tenkan + kijun) / 2.0).shift(26)
+    out["senkou_b"] = ((out["h"].rolling(52).max() + out["l"].rolling(52).min()) / 2.0).shift(26)
+    return out
+
+
+def _swing_cloud_floor_from_row(today: pd.Series) -> float | None:
+    if pd.notna(today.get("senkou_a")) and pd.notna(today.get("senkou_b")):
+        return float(min(float(today["senkou_a"]), float(today["senkou_b"])))
+    return None
+
+
+def get_swing_hard_stop_floor(pos_info: dict, ohlcv) -> float:
+    """
+    스윙 손절 바닥 — 피보(entry_fib)와 구름 하단 중 **더 높은** 가격(이하 이탈 시 FULL).
+    """
+    p = pos_info if isinstance(pos_info, dict) else {}
+    entry_fib = float(p.get("entry_fib_level", 0.0) or 0.0)
+    if entry_fib <= 0:
+        entry_fib = float(p.get("sl_p", 0.0) or 0.0)
+    cloud_floor = None
+    if ohlcv and len(ohlcv) >= 60:
+        try:
+            w = _append_swing_indicators(pd.DataFrame(ohlcv))
+            cloud_floor = _swing_cloud_floor_from_row(w.iloc[-1])
+        except Exception:
+            cloud_floor = None
+    floors: list[float] = []
+    if entry_fib > 0 and np.isfinite(entry_fib):
+        floors.append(float(entry_fib))
+    if cloud_floor is not None and np.isfinite(cloud_floor) and cloud_floor > 0:
+        floors.append(float(cloud_floor))
+    if floors:
+        return max(floors)
+    buy = _swing_avg_price(p)
+    sl_fb = float(p.get("sl_p", 0.0) or 0.0)
+    if sl_fb > 0:
+        return sl_fb
+    return buy * 0.9 if buy > 0 else 0.0
+
+
+def get_swing_profit_lock_floor(buy_p: float, max_p: float) -> float:
+    """최고가 기준 수익률에 따른 콘크리트 바닥(V8과 동일 티어)."""
+    bp = float(buy_p)
+    mp = float(max_p)
+    if bp <= 0 or mp <= 0:
+        return 0.0
+    max_profit_rate = (mp - bp) / bp * 100.0
+    for threshold_pct, mult in _SWING_PROFIT_LOCK_TIERS:
+        if max_profit_rate >= threshold_pct:
+            return bp * mult
+    return 0.0
+
+
+def get_swing_half_target_price(pos_info: dict, ohlcv) -> float | None:
+    """볼밴 상단 1차 익절(HALF) 목표가. scale_out_done 이면 None."""
+    if bool((pos_info or {}).get("scale_out_done", False)):
+        return None
+    if not ohlcv or len(ohlcv) < 60:
+        return None
+    try:
+        w = _append_swing_indicators(pd.DataFrame(ohlcv))
+        bb_upper = w.iloc[-1].get("bb_upper")
+        if pd.notna(bb_upper) and float(bb_upper) > 0:
+            return float(bb_upper)
+    except Exception:
+        pass
+    return None
+
+
+def get_swing_exit_display_price(curr_p, pos_info, ohlcv) -> float:
+    """
+    SWING_FIB 포지션의 **실행 매도선**(현재가가 이하로 내려오면 청산).
+
+    - 수익 구간 미달: 피보·구름 하드스탑
+    - 최고가 수익률 10/20/30% 돌파 시: V8과 같은 콘크리트 바닥으로 상향
+    """
+    p = pos_info if isinstance(pos_info, dict) else {}
+    cp = _finite_price(curr_p, 0.0)
+    buy = _swing_avg_price(p)
+    max_p = max(_finite_price(p.get("max_p", buy), buy), cp)
+    hard = get_swing_hard_stop_floor(p, ohlcv)
+    profit_floor = get_swing_profit_lock_floor(buy, max_p)
+    if profit_floor > 0:
+        return _finite_price(max(hard, profit_floor), hard)
+    return _finite_price(hard, 0.0)
+
+
+def _swing_avg_price(pos_info: dict) -> float:
+    """장부 평단. ``avg_price`` 우선, 없으면 ``buy_p``."""
+    p = pos_info if isinstance(pos_info, dict) else {}
+    for key in ("avg_price", "buy_p"):
+        try:
+            v = float(p.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            return v
+    return 0.0
+
+
+def _swing_current_price(close_today: float, reference_price: float | None) -> float:
+    """판정 현재가 — 실시간가가 있으면 우선, 없으면 당일 종가(일봉)."""
+    try:
+        ref = float(reference_price) if reference_price is not None else 0.0
+    except (TypeError, ValueError):
+        ref = 0.0
+    if ref > 0:
+        return ref
+    return float(close_today)
+
+
+def _swing_profit_rate_pct(avg_price: float, current_px: float) -> float:
+    if avg_price <= 0 or current_px <= 0:
+        return 0.0
+    return (current_px - avg_price) / avg_price * 100.0
+
+
+def check_swing_exit(
+    pos_info: dict,
+    df: pd.DataFrame,
+    *,
+    reference_price: float | None = None,
+) -> tuple[str, str]:
     """
     스윙 매도 타점 판단.
+
+    ``reference_price`` — 장중 실시간가(KIS 등). 없으면 당일 종가로 판정.
+    HALF 볼밴: 현재가≥상단(20,2σ) 및 평단(``avg_price``→``buy_p``) 대비
+    ``SWING_BB_HALF_MIN_PROFIT_PCT``(기본 2%) 이상.
 
     Returns:
         ("FULL"|"HALF"|"HOLD", 사유)
@@ -586,21 +873,10 @@ def check_swing_exit(pos_info: dict, df: pd.DataFrame) -> tuple[str, str]:
     if df is None or len(df) < 60:
         return "HOLD", ""
 
-    w = _normalize_ohlcv_df(df)
+    w = _append_swing_indicators(df)
     need_cols = {"h", "l", "c"}
     if not need_cols.issubset(set(w.columns)):
         return "HOLD", ""
-
-    w["rsi14"] = _calc_rsi14(w["c"])
-    bb_mid = w["c"].rolling(20).mean()
-    bb_std = w["c"].rolling(20).std()
-    w["bb_upper"] = bb_mid + (bb_std * 2.0)
-
-    # 일목균형표 (9, 26, 52)
-    tenkan = (w["h"].rolling(9).max() + w["l"].rolling(9).min()) / 2.0
-    kijun = (w["h"].rolling(26).max() + w["l"].rolling(26).min()) / 2.0
-    w["senkou_a"] = ((tenkan + kijun) / 2.0).shift(26)
-    w["senkou_b"] = ((w["h"].rolling(52).max() + w["l"].rolling(52).min()) / 2.0).shift(26)
 
     today = w.iloc[-1]
     prev = w.iloc[-2]
@@ -608,28 +884,46 @@ def check_swing_exit(pos_info: dict, df: pd.DataFrame) -> tuple[str, str]:
     entry_fib = float((pos_info or {}).get("entry_fib_level", 0.0) or 0.0)
     scale_out = bool((pos_info or {}).get("scale_out_done", False))
     close_today = float(today["c"])
-    high_today = float(today["h"])
+    current_px = _swing_current_price(close_today, reference_price)
+    avg_price = _swing_avg_price(pos_info)
 
-    # 1) 하드스탑
-    fib_break = entry_fib > 0 and close_today < entry_fib
-    cloud_floor = np.nan
-    if pd.notna(today["senkou_a"]) and pd.notna(today["senkou_b"]):
-        cloud_floor = min(float(today["senkou_a"]), float(today["senkou_b"]))
-    cloud_break = np.isfinite(cloud_floor) and close_today < float(cloud_floor)
+    # 1) 하드스탑 (현재가 기준)
+    fib_break = entry_fib > 0 and current_px < entry_fib
+    cloud_floor = _swing_cloud_floor_from_row(today)
+    cloud_break = cloud_floor is not None and current_px < float(cloud_floor)
     if fib_break or cloud_break:
-        return "FULL", "스윙 하드스탑 이탈"
+        parts: list[str] = []
+        if fib_break:
+            parts.append(f"피보 {entry_fib:,.0f}")
+        if cloud_break:
+            parts.append(f"구름 {float(cloud_floor):,.0f}")
+        floor_txt = " · ".join(parts)
+        return "FULL", f"스윙 하드스탑 이탈 (현재가: {current_px:,.0f} < {floor_txt})"
 
-    # 2) 볼밴 상단 1차 익절
-    if pd.notna(today["bb_upper"]) and high_today >= float(today["bb_upper"]) and not scale_out:
-        return "HALF", "볼밴 상단 1차 익절"
+    # 2) 볼밴 상단 1차 익절 — 현재가≥상단 AND 평단 대비 +2% 이상
+    if pd.notna(today["bb_upper"]) and not scale_out and avg_price > 0:
+        bb_upper = float(today["bb_upper"])
+        profit_pct = _swing_profit_rate_pct(avg_price, current_px)
+        if current_px >= bb_upper and profit_pct >= SWING_BB_HALF_MIN_PROFIT_PCT:
+            return (
+                "HALF",
+                f"볼밴 상단 1차 익절 (현재가: {current_px:,.0f} >= 볼밴: {bb_upper:,.0f}, "
+                f"평단: {avg_price:,.0f} 수익 {profit_pct:+.2f}%)",
+            )
 
-    # 3) RSI 과매수 데드크로스
+    # 3) RSI 과매수 데드크로스 — 수익 구간에서만 (휩쏘 방지)
     if (
-        pd.notna(prev["rsi14"])
+        avg_price > 0
+        and current_px > avg_price
+        and pd.notna(prev["rsi14"])
         and pd.notna(today["rsi14"])
         and float(prev["rsi14"]) > 70.0
         and float(today["rsi14"]) < 70.0
     ):
-        return "FULL", "RSI 과매수 데드크로스"
+        profit_pct = _swing_profit_rate_pct(avg_price, current_px)
+        return (
+            "FULL",
+            f"RSI 과매수 데드크로스 (현재가: {current_px:,.0f} > 평단: {avg_price:,.0f} 수익 {profit_pct:+.2f}%)",
+        )
 
     return "HOLD", ""

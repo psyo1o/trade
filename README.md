@@ -14,7 +14,7 @@ _문서 갱신: 2026-05-13 — Phase4 글로벌 `-> 🚨` 차단 로그를 국·
 5. [한 사이클 안에서 일어나는 일](#5-한-사이클-안에서-일어나는-일)
 6. [최상위 파일 설명](#6-최상위-파일-설명)
 7. [데이터 파일과 Git](#7-데이터-파일과-git)
-8. [전략: V8(추세)과 스윙](#8-전략-v8추세과-스윙)
+8. [전략: V8(추세)과 스윙](#8-전략-v8추세과-스윙) — [HTS 조건검색 26.05](#국장-hts-조건검색-v8-2605)
 9. [Phase 1~5가 의미하는 것](#9-phase-15가-의미하는-것)
 10. [관측성: 로그를 읽는 법](#10-관측성-로그를-읽는-법)
 11. [`config.json` 핵심 키](#11-configjson-핵심-키)
@@ -44,7 +44,7 @@ _문서 갱신: 2026-05-13 — Phase4 글로벌 `-> 🚨` 차단 로그를 국·
 2. **`requirements.txt`** 로 의존성 설치: `py -3.11 -m pip install -r requirements.txt`
 3. **`.gitignore`에 있는 파일**은 저장소에 없을 수 있습니다. 특히 **`config.json`** 은 직접 만들고, API 키·계좌·텔레그램 값을 넣어야 합니다.
 4. **`bot_state.json`**, **`trade_history.json`** 은 없으면 실행 중 생성되거나 비어 있는 상태에서 시작해도 됩니다.
-5. **국장 후보 종목**은 스크리너가 **`kr_targets.json`** 을 만듭니다. 이 파일은 **매 스캔마다 바뀌므로 Git에 포함하지 않습니다** (`.gitignore`). 처음에는 비어 있으면 봇이 빈 목록으로 국장 매수 루프만 스킵할 수 있으니, 운영 전에 스크리너를 한 번 돌리거나 HTS 결과를 반영하세요.
+5. **국장 후보 종목**은 스크리너가 **`kr_targets.json`** 을 만듭니다. HTS에는 **`조건검색/v8조건검색 26.05(외국인수급제외 간결화).txt`** (또는 동명 `.xml`/`.tdf`)를 등록해 두고, `screener.py` 가 API로 조회합니다. `kr_targets.json` 은 **매 스캔마다 바뀌므로 Git에 포함하지 않습니다**. 처음에는 비어 있으면 국장 매수 루프만 스킵되므로, 운영 전에 스크리너를 한 번 돌리세요.
 
 ---
 
@@ -167,7 +167,7 @@ c-bot/
 ├── services/           # 잔고 facade, 스냅샷, GUI 테이블 어댑터
 ├── utils/              # 로그, 텔레그램, math_utils(Hurst) 등
 ├── tests/              # 실험·회귀 테스트 (test_lab, test_kis_parsers, test_alt_data_research, test_news_fetch, diagnose_*)
-└── 조건검색/           # HTS 조건검색식 등(참고용 리소스)
+└── 조건검색/           # HTS 조건검색식 — 최신: v8조건검색 26.05(외국인수급제외 간결화).txt
 ```
 
 ---
@@ -179,7 +179,7 @@ c-bot/
 ```mermaid
 flowchart TD
   A[사이클 시작] --> B[실계좌와 장부 동기화 sync_all_positions]
-  B --> C[리스크: MDD / Phase5 / Phase4 VIX·FGI·글로벌 / 섹터·AI]
+  B --> C[리스크: MDD / Phase5 / Phase4 글로벌 알파 / 섹터·AI]
   C --> D[매도 루프 KR → US → COIN]
   D --> E[매수 루프 KR → US → COIN]
   E --> F{매수 존·조건 충족인데 신규 체결 0건?}
@@ -191,11 +191,11 @@ flowchart TD
 
 **동기화:** 국·미 **정규장이 아닐 때는 KIS로 보유 티커 목록을 새로 조회하지 않습니다**(`fetch_equity_held_lists_for_position_sync`). 코인 보유 조회와 장부 동기화는 매 사이클 계속합니다. 비장중에 KIS가 빈 보유를 주어도 장부 국·미 줄이 유령 삭제되지 않도록 `sync_all_positions` 에서 `held` 보강 등을 합니다.
 
-**매도 쪽 주의:** 포지션마다 `strategy_type` 이 있습니다. **`SWING_FIB`** 이면 스윙 전용 청산만 타고, 그 외는 **V8 계열**(분할 익절·타임스탑·하드스탑·샹들리에 등)을 탑니다.
+**매도 쪽 주의:** 포지션마다 `strategy_type` 이 있습니다. **`SWING_FIB`** 은 `check_swing_exit`(HALF/FULL) → (HOLD 시) 분할 익절·타임스탑·하드스탑·**스윙 매도선 이탈**(`get_swing_exit_display_price`) 순이며, **V8 샹들리에는 쓰지 않습니다.** 그 외(`TREND_V8`)는 분할 익절·타임스탑·하드스탑·샹들리에(V8)입니다.
 
 **매수 쪽:** 시장별 스캔 대상은 **10일 RS**로 정렬한 뒤(`strategy/alpha_sizing.py`), 종목마다 **먼저 V8**(`calculate_pro_signals`, Hurst **&lt; 0.45** 차단)을 보고, 실패 시 **스윙 보조**(`check_swing_entry`)를 봅니다. 통과 후 비중은 **`min(1/N, alpha_target_vol/ATR%)`** 로 잡고 `macro_mult`·예수금·최소주문을 적용합니다. **코인(업비트·바이낸스 공통)** 도 동일한 **일봉 직전 KST 창** 안에서만 매수 판단하며, 진입 순서도 국·미와 같습니다.
 
-**Phase4 거시:** `_build_market_context` → `get_macro_guard_snapshot` 이 **VIX/FGI 예산 배수**(`budget_multiplier`)와 **시장별 글로벌 차단**(`market_buy_allowed`, `market_buy_block_reason`)을 함께 돌려줍니다. `macro_mult <= 0` 이면 **전 시장** 신규 매수 중단(`-> 🚨 … Phase4 거시 방어막`, 매수 창 밖에서도 출력). **글로벌만** 걸리면 해당 시장(KR/US/COIN)만 중단하지만, `-> 🚨 … Phase4 글로벌 방어막` 은 **그 시장 매수 시간창 안**에서만 찍힙니다. 창 밖에서는 `[KR|US|COIN 매수 대기]`만 보이고 글로벌 방어막 문구는 없습니다. 사이클 시작 `🚫 [Phase4 글로벌] MK …` 요약은 매 사이클 그대로입니다.
+**Phase4 거시:** `_build_market_context` → `get_macro_guard_snapshot` 이 **시장별 글로벌 알파 차단**(`market_buy_allowed`, `market_buy_block_reason`)만 판정합니다. `budget_multiplier`(`macro_mult`)는 항상 **1.0**입니다(VIX·Fear&Greed 예산 축소/차단 제거). **해당 시장만** 차단되며, `-> 🚨 … Phase4 글로벌 방어막` 은 **그 시장 매수 시간창 안**에서만 찍힙니다. 창 밖에서는 `[KR|US|COIN 매수 대기]`만 보이고 글로벌 방어막 문구는 없습니다. 사이클 시작 `🚫 [Phase4 글로벌] MK …` 요약은 매 사이클 그대로입니다.
 
 **텔레그램(운영 알림):** **어느 한쪽이라도** “매수 시간창·게이트까지 진입”했는데 **신규 매수 TWAP 성공이 한 건도 없으면**, 사이클 종료 시 `📭 [매수 패스] …` 한 통을 보냅니다. 본문 앞부분은 **이번에 매수 존에 들어간 시장만** `KR` / `US` / `COIN` 으로 찍습니다(예: 국장만이면 `KR 매수 가능 시간·…`, 둘 이상이면 `KR·US …`). `utils/telegram.py`의 일반 텍스트 `sendMessage`. 세 시장 모두 매수창 밖이면 보내지 않습니다.
 
@@ -212,8 +212,9 @@ flowchart TD
 - KR/US 잔고 정책(GUI 스냅샷 등): **장중에만 KIS 실조회**, **장외(휴장/점검)에는 `last_kis_display_snapshot` 고정값 사용**. 코인은 기존대로 실조회합니다.  
 - **`_sync_positions_for_cycle` / `fetch_equity_held_lists_for_position_sync`:** 동기화 시 국·미가 **정규장이 아니면 KIS 보유 목록 API를 호출하지 않고** 빈 리스트로 넘깁니다. **`sync_all_positions`** 안에서 비장중·빈 보유 대비 **장부 키로 `held` 보강** 등으로 유령 일괄 삭제를 막습니다. 시장이 **False** 인 경우 **KIS 시드·평단 보정·유령 삭제·주식 자동복구** 루프는 실행하지 않습니다(코인 동기화는 계속). 주식 **자동복구**로 새 행을 넣을 때 **`buy_date`** 는 가능하면 **`trade_history.json`** 에서 해당 티커·시장의 **가장 최근 `BUY`의 `timestamp`** 를 씁니다(없을 때만 복구 시각).
 - **매수 패스 텔레그램:** 위 [한 사이클](#5-한-사이클-안에서-일어나는-일) 참고.
-- **Phase4·알파 사이징:** `_build_market_context` 가 `macro_snap`(VIX/FGI·PCR·고래·환율·`market_buy_allowed`)을 넘깁니다. `_sort_buy_targets_by_rs`, `_position_ratio_with_vol_target` 로 RS 정렬·변동성 타겟 비중을 적용합니다.
-- **매도 후 Layer2:** 전량 청산 시 `set_ticker_cooldown_after_sell`(전략·시장·사유 매트릭스). 수동 매도는 `_apply_manual_sell_state_update`·`_run_manual_sell_position_sync` 경로.
+- **Phase4·알파 사이징:** `_build_market_context` 가 `macro_snap`(PCR·고래·환율 모멘텀·`market_buy_allowed`)을 넘깁니다. `_sort_buy_targets_by_rs`, `_position_ratio_with_vol_target` 로 RS 정렬·변동성 타겟 비중을 적용합니다.
+- **매도 후 Layer2:** 전량 청산 시 `set_ticker_cooldown_after_sell`(매도 **사유별** 1h/24h). 수동 매도는 `_apply_manual_sell_state_update`·`_run_manual_sell_position_sync` 경로.
+- **보유 중복 방지:** 스캔 대상이 실계좌·장부에 **이미 보유**이면 `이미 보유중 (패스)` — 신규 매수·쿨다운과 무관하게 유지됩니다.
 - **관측성:** 예산·예수·TWAP·시장별 스킵은 `[KR …]`, `[US …]`, `[COIN …]` 등 태그 로그로 남깁니다. 모듈 상단 docstring에 grep용 태그 요약이 있습니다.
 
 ### `run_gui.py`
@@ -227,7 +228,7 @@ flowchart TD
 
 ### `screener.py` / `us_screener.py`
 
-- **국장:** HTS 조건검색 결과를 합쳐 **`kr_targets.json`** 에 기록 (로컬 전용, Git 무시).
+- **국장:** `config.json` 의 **`kis_hts_id`** 계좌에 HTS에 등록된 **조건검색식 전체** 결과를 합쳐 **`kr_targets.json`** 에 기록 (로컬 전용, Git 무시). 조건식 본문·등록 방법은 아래 **[국장 HTS 조건검색 (V8 26.05)](#국장-hts-조건검색-v8-2605)**.
 - **미장:** 감시 유니버스를 **`us_universe_cache.json`** 에 캐시 (TTL·스케줄러 연동).
 - 스케줄 등록은 `run_bot.start_scanner_scheduler` — 국장 **14:50 KST**, 미장 **15:20 US/Eastern** (매수 창 직전 갱신 목적).
 
@@ -269,7 +270,7 @@ flowchart TD
 | `trade_history.json` | 매매 로그 | **제외** |
 | `us_universe_cache.json` | 미장 유니버스 캐시 | **제외** |
 | `kr_targets.json` | 국장 스크리너 출력(자주 변함) | **제외** |
-| `조건검색/` | HTS 식 등 참고 자료 | 선택적으로 커밋 |
+| `조건검색/` | HTS 조건검색식 원본 — **최신 V8:** `v8조건검색 26.05(외국인수급제외 간결화).txt` (`.xml`/`.tdf` 동봉) | 선택적으로 커밋 |
 
 새로 클론한 저장소에는 위 제외 파일이 없을 수 있으니, **로컬에서 생성**하거나 스크리너/봇을 한 번 실행해 채우면 됩니다.
 
@@ -277,11 +278,85 @@ flowchart TD
 
 ## 8) 전략: V8(추세)과 스윙
 
+### 국장 HTS 조건검색 (V8 26.05)
+
+**최신 원본 (2026.05):** `조건검색/v8조건검색 26.05(외국인수급제외 간결화).txt` — HTS 등록용 동명 **`.xml` / `.tdf`** 와 내용을 맞춥니다. (`조건검색/README.md` 요약)
+
+**이전안과 차이:** 구 `조건검색/v8조건검색 26.05.txt` 는 시가총액·**외국인/기관 5일 순매수**·순이익 증가율 등 **3갈래 OR** 이었습니다. **간결화(26.05)** 는 외국인·기관·시총·실적 조건을 빼고, **유동성(A·B) + 두 가지 진입 경로**만 남깁니다.
+
+**조합 로직 (HTS):**
+
+```text
+A and B and ((C and D and E and F) or (G and H))
+```
+
+| 심볼 | 조건 항목 | 요약 |
+|------|-----------|------|
+| **A** | 주가범위 | 종가 3,000원 이상 |
+| **B** | 평균거래대금 | 5봉 평균 거래대금 하한(천원 단위 HTS 설정) |
+| **C** | 가격/20MA | 종가 &gt; 20일 단순이평 |
+| **D** | 20MA 추세 | 20일선 상승 추세 유지 |
+| **E** | 거래량 | 전일 동시간 대비 200%~900% |
+| **F** | MACD | MACD(12,26,9) &gt; Signal |
+| **G** | 볼린저 | 종가가 하한밴드(20,2) **상향 돌파** |
+| **H** | RSI | RSI(14,9)가 Signal **상향 돌파** |
+
+| 경로 | HTS 블록 | 봇 2차 필터 (같은 사이클) |
+|------|----------|---------------------------|
+| **추세·수급** | C ∧ D ∧ E ∧ F | **`calculate_pro_signals`** (V8) — Hurst·양봉·MACD·RSI·20MA 우상향·ATR 과열 등 |
+| **턴어라운드 / Pullback** | G ∧ H (국장 HTS) | V8 실패 시 **`check_swing_entry`** (KR·US·COIN 코드 검증) |
+
+**국장 후보 → 매수까지 흐름**
+
+1. HTS에 위 조건식 등록 → `screener.py` (`run_night_screener`, **14:50 KST** 스케줄)가 `kis_hts_id` 계정의 **등록된 모든 조건식** 종목을 합쳐 **`kr_targets.json`** 저장.
+2. `run_bot` 매수 창: `kr_targets` + 당일 **시총 상위 200** + **거래대금 상위 50** 교집합·티어 정렬(`_build_kr_targets`) → **10일 RS** 정렬 → 종목마다 **V8 → 스윙** → 예산·AI·섹터락 등.
+
+**참고:** `조건검색/스윙조건검색.txt`, `바닥탈출턴어라운드.txt` 등은 **별도 HTS 식**(레거시·참고). `screener`는 계정에 등록된 식을 **이름 구분 없이 전부** 합치므로, V8만 쓰려면 HTS에 **간결화 식만** 두거나 다른 식을 비활성화하세요.
+
 ### 진입 (매수)
 
-1. **`calculate_pro_signals`** (V8 계열 추세·수급 스나이퍼)를 **먼저** 평가합니다. 스캔 로그에는 **`[V8]`** 접두사가 붙습니다.
-2. V8이 실패하면 **`check_swing_entry`** (60일선 위 & 당일 양봉)를 **추가로** 평가합니다. (HTS 조건검색의 턴어라운드 종목을 대상으로 60일선 추세와 당일 상방 흐름 확인) 실패 시 **`[스윙]`** 한 줄로 **왜 안 샀는지** 사유가 나옵니다.
+1. **`calculate_pro_signals`** (V8 계열 추세·수급 스나이퍼)를 **먼저** 평가합니다. 스캔 로그에는 **`[V8]`** 접두사가 붙습니다. (HTS **C~F** 경로와 대응)
+2. V8이 실패하면 **`check_swing_entry`**(추세 속 눌림목)를 **추가로** 평가합니다. 미장·코인은 HTS 없이 이 코드 필터만 사용합니다. 실패 시 **`[스윙]`** 한 줄로 사유가 나옵니다.
 3. V8으로 통과하면 **`[V8-BUY]`**, 스윙으로만 통과하면 **`[SWING-BUY]`** 와 `entry_fib_level` 이 로그에 찍힙니다.
+
+**시장 날씨 `🌧️ BEAR`:** 지수 급락·MDD·Phase4 등과 별도로, 날씨가 BEAR여도 **스캔 루프는 계속** 돌고 V8 신호만 차단합니다(`_v8_trend_buy_allowed_in_weather`). V8 통과 종목은 `⏭️ BEAR — V8 차단` 로그 후 스윙 분기로 넘어가며, **`check_swing_entry` 통과 시 `SWING_FIB` 매수는 허용**됩니다. BULL/SIDEWAYS에서는 기존과 동일하게 V8·스윙 모두 가능합니다.
+
+#### 스윙 매수 (`check_swing_entry`) — V8 실패 시 2차 폴백 (Pullback, KR·US·COIN)
+
+| 항목 | 내용 |
+|------|------|
+| **추세** | 판정가 **&gt; 60MA** 이고 **≤ 60MA×1.30** (+30% 이격 상한, 에베레스트 컷) |
+| **양봉** | 시가 &lt; 판정가 (`reference_close` 실시간 우선) |
+| **갭** | 전일 종가→당일 시가 **+3% 미만** (`SWING_GAP_UP_MAX_PCT`) — 뇌동 추격 컷 |
+| **거래량** | 당일 ≥ 전일 **80%** 또는 ≥ **5일 평균** (`SWING_VOL_MIN_VS_PREV_RATIO`) |
+| **윗꼬리** | 당일 고가 대비 판정가 하락 **&lt; 5%** |
+| **손절 피보** | 60봉 38.2/50/61.8% 중 **현재가 아래** 가장 가까운 지지 → `entry_fib_level` |
+| **판정가** | KR/US/COIN: **`reference_close`**(KIS·거래소) 우선, 없으면 일봉 종가 |
+| **V8 대비** | Hurst·MACD·RSI·20MA 우상향·3ATR 과열 **없음** |
+| **국장 V8·공통** | `run_bot` 국장 루프: 갭 **+5%** (`calculate_pro_signals` 전) — 스윙 **+3%** 와 별도 |
+| **바깥 게이트** | MDD·Phase4·BEAR(V8만)·섹터락·AI(`swing_terminal_risk`) 등 |
+
+**논리 요약:** HTS 후보(국장)든 RS 유니버스(미·코)든, 코드에서 **추세(60MA) 안의 눌림 반등**만 허용합니다. 과열 이격·무량 양봉·갭 추격은 차단하고, **피보는 현재가 아래**만 인정합니다.
+
+**스윙 상수 (`strategy/rules.py`)**
+
+| 상수 | 기본값 | 용도 |
+|------|--------|------|
+| `SWING_UPPER_WICK_DROP_PCT` | 5.0 | 당일 고가 대비 판정가 하락 ≥ 이 값(%)이면 매수 거절 |
+| `SWING_MA60_MAX_EXTENSION_PCT` | 30.0 | 60MA 대비 판정가 이격 상한(%) |
+| `SWING_VOL_MIN_VS_PREV_RATIO` | 0.80 | 당일 거래량 ≥ 전일×이 값, 또는 5일 평균 이상 |
+| `SWING_GAP_UP_MAX_PCT` | 3.0 | 전일 종가→당일 시가 갭 상한(%) |
+| `SWING_BB_HALF_MIN_PROFIT_PCT` | 2.0 | 볼밴 HALF: 평단 대비 최소 수익률(%) |
+| `_SWING_FIB_RETRACE_RATIOS` | 0.382, 0.5, 0.618 | 손절 피보 후보(현재가 **아래**만) |
+| `_SWING_PROFIT_LOCK_TIERS` | 10%→+0.5%, 20%→+5%, 30%→+15% | 최고가 수익률 기준 콘크리트 바닥(V8 `get_final_exit_price` 와 동일 티어) |
+
+**실시간가 주입 (`run_bot.py`)**
+
+| 시장 | `reference_close` / `reference_price` |
+|------|-------------------------------------|
+| KR | `kis_api.broker_kr.fetch_price` → `stck_prpr` |
+| US | `kis_api.broker_us.fetch_price` → `last` |
+| COIN | `coin_broker.get_current_price` |
 
 #### V8 방어: Hurst Exponent (횡보·역추세 차단)
 
@@ -321,7 +396,7 @@ flowchart TD
 target_budget = total_equity * ratio * macro_mult
 ```
 
-- 거시 방어막(`macro_mult`)이 0.0/0.5/1.0 등으로 변하면 **시장 전체 비중만** 줄거나 유지됩니다.
+- `macro_mult`는 Phase4에서 **항상 1.0**입니다(예산 축소 없음). 시장별 매수 차단은 `market_buy_allowed` 로만 적용됩니다.
 - 예수금이 부족하면 기존처럼 **“영끌”** 로 조정합니다.
 
 ```python
@@ -333,8 +408,55 @@ if cash < target_budget:
 
 ### 청산 (매도)
 
-- 장부 **`strategy_type`** 이 **`SWING_FIB`** 이면 먼저 **`check_swing_exit`** (`FULL` / `HALF` / `HOLD`)를 봅니다. **`HALF`·`FULL`** 이 나오면 스윙 규칙으로 부분·전량 매도 후 해당 사이클은 종료하고, **`HOLD`** 이면 그 아래 **분할 익절 → 타임스탑·하드스탑·샹들리에** 를 **같이** 탑니다 (스윙만 있다가 타임스탑에 걸리지 않도록 한 동작).
+- 장부 **`strategy_type`** 이 **`SWING_FIB`** 이면 먼저 **`check_swing_exit`** (`FULL` / `HALF` / `HOLD`)를 봅니다. **`HALF`·`FULL`** 이 나오면 스윙 규칙으로 부분·전량 매도 후 해당 사이클은 종료하고, **`HOLD`** 이면 그 아래 **분할 익절(Scale-Out) → 타임스탑 → 하드스탑 → 스윙 매도선 이탈** 을 탑니다. 수익 구간 트레일링에는 **V8 샹들리에를 쓰지 않습니다.**
 - 그 외(`TREND_V8` 또는 예전 장부)는 **V8 매도 루프**(분할 익절 → 타임스탑 → 하드스탑 → 샹들리에 순)를 탑니다.
+
+#### 스윙 매도선 vs 1차 익절 (개념)
+
+| 구분 | 방향 | 동작 | 장부·화면 |
+|------|------|------|-----------|
+| **매도선(스윙)** | 가격이 **아래로** 이 선 이하 | 하드스탑·수익 보존 락 → **잔량 전량** 매도 | `sl_p`, GUI 손절가 열, 생존신고 `매도선` |
+| **1차 익절(볼밴)** | 가격이 **위로** 볼밴 상단 터치 | `HALF` → **약 50%만** 익절, 잔량 유지 | 로그 `1차익절(볼밴): …` **참고용** (매도선 아님) |
+
+**기존 보유 종목:** 매수 시점과 무관하게 **매도 루프마다** `get_swing_exit_display_price` 로 재계산하고 `sl_p`·`max_p` 를 갱신합니다. 봇이 한 사이클만 돌아도 장부·GUI·텔레그램 매도선이 새 규칙으로 맞춰집니다. (`strategy_type` 이 `SWING_FIB` 이고 `entry_fib_level` 이 있어야 피보·구름이 정확합니다.)
+
+#### 스윙 매도선 표시·실행 (`get_swing_exit_display_price`)
+
+| 구간 | 매도선(현재가 **이하** 이탈 시 청산) | GUI·텔레그램 `sl_p` |
+|------|--------------------------------------|---------------------|
+| 손실·저수익 | `max(진입 피보, 구름 하단)` 하드스탑 | 매 사이클 장부 갱신 |
+| 최고가 +10% / +20% / +30% | 콘크리트 바닥(평단 +0.5% / +5% / +15%) | V8 샹들리에 **대신** 스윙 전용 |
+| 수익 +2% 이상·HALF 전 | 로그 `1차익절(볼밴): …` 보조 표시 | 볼밴 상단은 **매도선이 아님** (HALF 트리거) |
+
+보유 로그 예: `매도선(스윙): 25,200원` · V8 보유는 `매도선(V8): …`  
+`SWING_FIB` 포지션은 V8 `get_final_exit_price`(샹들리에)를 **표시·수익 트레일링·`check_pro_exit`에 쓰지 않습니다.**
+
+#### 스윙 매도 (`check_swing_exit`) — `strategy/rules.py`
+
+판정 **현재가** = 매도 루프의 KIS/거래소 실시간가(`reference_price`), 없으면 당일 일봉 종가.  
+평단 = 장부 `avg_price` → 없으면 **`buy_p`** (실계좌 평단 보정값).
+
+| 우선순위 | 신호 | 조건 | 비고 |
+|----------|------|------|------|
+| 1 | **FULL** 하드스탑 | 현재가 < `entry_fib_level`(피보) **또는** 현재가 < 일목 구름 하단 | 사유에 현재가·기준가(피보/구름) 포함 |
+| 2 | **HALF** 볼밴 1차 익절 | **현재가 ≥ 볼밴 상단(20,2σ)** **그리고** 평단 대비 **≥ +2.0%** (`SWING_BB_HALF_MIN_PROFIT_PCT`) | 당일 **고가만** 터치·손실 구간에서는 **매도 안 함** (과거 버그 수정) |
+| 3 | **FULL** RSI | 전일 RSI>70 & 당일 RSI<70 & **현재가 > 평단** | 손실 구간 휩쏘 방지 |
+| — | **HOLD** | 위 미해당 | 아래 V8 경로 계속 |
+
+- HALF 시 로그·`trade_history` 예: `볼밴 상단 1차 익절 (현재가: 26,100 >= 볼밴: 25,920, 평단: 25,800 수익 +1.16%)` — **50% 분할 매도**이므로 매도선과 별개입니다.
+- FULL(피보·구름·RSI)과 HALF·RSI는 **매 사이클 OHLCV·실시간가로 재판정**합니다.
+- `HOLD` 이후 수익 구간 방어는 **`get_swing_exit_display_price`** 매도선 이탈(`run_bot._check_swing_trailing_exit`)로 처리합니다.
+
+#### 스윙 전략 — 설계 정합성·알려진 주의점
+
+| 구분 | 평가 |
+|------|------|
+| **매수 ↔ 볼밴 HALF +2%** | 타임스탑 유예(+2%)와 맞춤. HALF는 **현재가 ≥ 볼밴 상단** 이고 **평단 +2%↑** 일 때만 (고가만 터치·손실 구간 매도 방지). |
+| **매수 ↔ 피보 손절** | 60봉 38.2/50/61.8% 중 **현재가 아래** 가장 가까운 지지 → `entry_fib_level`. 표시·장부 `sl_p` 는 매 사이클 `get_swing_exit_display_price` 로 갱신. FULL은 **현재가 < 피보/구름**. |
+| **매도선 vs 1차 익절** | 매도선 = 아래 방향 전량 방어선. 1차 익절 = 위 방향 볼밴 HALF(절반만). |
+| **매수 ↔ RSI FULL** | RSI 데드크로스 전량 청산도 **현재가 > 평단** 일 때만 (손실 구간 휩쏘 방지). |
+| **V8 vs 스윙** | V8 탈락 후 스윙 2차 진입. 스윙 전용 **윗꼬리 5%**·**피보 아래 지지**로 V8식 상투·즉시 손절 일부 완화. Hurst·3ATR 과열은 여전히 V8만. |
+| **일봉 고가 한계** | 윗꼬리 판정의 “고가”는 일봉 `h`(실시간 고가 미반영 시 둔할 수 있음). 판정가는 실시간 우선. |
 
 #### 타임스탑 (보유 시간 `buy_date` 우선, 없으면 `buy_time`)
 
@@ -351,16 +473,15 @@ if cash < target_budget:
 
 #### Layer 2: `ticker_cooldowns` (매도 후 재매수 금지, 시간 단위)
 
-전량 청산 시에만 장부 **`strategy_type`** (`TREND_V8` / `SWING_FIB`), 시장 (**KR** / **US** / **COIN**), 매도 **`reason`**·**`profit_rate`** 로 **손절·타임스탑 vs 정상 익절** 을 나눠 시간을 적용합니다. **분할 익절 후 잔여 수량이 있으면** (`remaining_qty > 0`) 쿨다운을 **부여하지 않습니다**.
+전량 청산 시에만 매도 **`reason`**·**`profit_rate`** 로 **사유별** 쿨다운을 부여합니다(전략·시장과 무관, KR/US/COIN 동일). **분할 익절 후 잔여 수량이 있으면** (`remaining_qty > 0`) 쿨다운을 **부여하지 않습니다**.
 
-| 전략 | 구분 | KR·US | COIN |
-|------|------|-------|------|
-| **TREND_V8** | 정상 익절 등 | 72h (3일) | 24h (1일) |
-| **TREND_V8** | 손절·타임스탑 | **240h (10일)** — 주식 타임스탑과 동일 스케일 | 72h (3일) |
-| **SWING_FIB** | 정상 익절 등 | 480h (20일) | 168h (7일) |
-| **SWING_FIB** | 손절·타임스탑·지하실/좀비화 등 | 720h (30일) | 240h (10일) |
+| 매도 사유 (요약) | `reason` 키워드 예 | 쿨다운 |
+|------------------|---------------------|--------|
+| **익절·트레일링·분할 익절** | 샹들리에, Scale-Out, `[SWING-SELL]`, 익절·Lock 등 | **1시간** |
+| **손절** | 하드스탑, 손절, Hard Stop, Cut Loss, `profit_rate < 0` (타임스탑 제외) | **24시간** |
+| **타임스탑** | `[V8_TIME_STOP_*]`, `[SWING_TIME_STOP_*]`, 타임스탑 | **24시간** |
 
-구현·로그: `execution/guard.py` 의 `compute_ticker_cooldown_hours` / `set_ticker_cooldown_after_sell`, 매도 루프는 `run_bot.py` (전량 청산 직전 `strategy_type`·시장·`profit_rate` 전달). 발동 시 `[쿨다운 적용] …`, 분할 익절 잔량 시 `[쿨다운 패스] …`.
+구현·로그: `execution/guard.py` 의 `_classify_exit_cooldown_bucket` / `compute_ticker_cooldown_hours` / `set_ticker_cooldown_after_sell`, 매도 루프는 `run_bot.py` (전량 청산 직전 `reason`·`profit_rate`·`remaining_qty` 전달). 발동 시 `[쿨다운 적용] …`, 분할 익절 잔량 시 `[쿨다운 패스] …`.
 
 **건드리지 않는 레이어:** 같은 파일의 Layer1 공용 매수 후 `cooldown`(분 단위), Phase5 계좌 서킷, 신규 매수 후 **15분** 매도 보호 등은 기존대로 유지합니다.
 
@@ -389,8 +510,8 @@ if cash < target_budget:
 |-------|------|-----------|
 | **1** | 같은 GICS **섹터** 과다 보유 방지 | `strategy/sector_lock.py` |
 | **2** | **TWAP** 분할 매수·**분할 익절 매도**(전량 청산 타임스탑/하드스탑 경로는 단일 주문) | `execution/order_twap.py`, `execution/scale_out.py`, `run_bot.py` |
-| **3** | **AI 휩쏘** 필터 | `strategy/ai_filter.py`, `config.json` 의 `ai_false_breakout_*` |
-| **4** | **거시 방어막** (VIX·Fear&Greed + 글로벌 알파) | `strategy/macro_guard.py`, `api/macro_data.py` |
+| **3** | **AI 휩쏘** 필터 (전략별 **듀얼 프롬프트**) | `strategy/ai_filter.py`, `run_bot._ai_false_breakout_buy_gate`, `config.json` 의 `ai_false_breakout_*` |
+| **4** | **거시 방어막** (시장별 글로벌 알파) | `strategy/macro_guard.py`, `api/macro_data.py` |
 | **5** | **합산 계좌 서킷** — 월요일(서울) **주차별 고점** 리셋 후 트레일링 MDD, 쿨다운 후 고점 1회 리셋 | `execution/circuit_break.py`, `execution/guard.py`, `run_bot`, `adjust_capital.py` |
 
 **Phase 3 — 뉴스 악재 LLM 필터 (`strategy/ai_filter.py`):** 매수 직전 **최근 뉴스 헤드라인**만 LLM(Gemini → OpenAI 폴백)에 넘겨 **0~100 위험도**를 받습니다. OHLCV·호가 숫자는 **프롬프트에 넣지 않습니다**.
@@ -412,35 +533,36 @@ if cash < target_budget:
 - 수집 실패·본문 없음 → **LLM 미호출**, `false_breakout_prob=0`, **매수 차단 없음** (`evaluation_engine=skip_no_news`).
 - 스모크: `tests/test_news_fetch.py`.
 
-**매수 게이트:** `false_breakout_prob >= ai_false_breakout_threshold`(국장·미장 기본 70) 또는 `>= ai_false_breakout_threshold_coin`(코인 기본 80) 이면 차단.
+**듀얼 프롬프트:** `run_bot` → `evaluate_false_breakout_filter(..., strategy_type=…)` 로 전략명을 넘기면 LLM 시스템 프롬프트가 분기됩니다.
+
+| 전략 | `prompt_profile` | 프롬프트 성격 |
+|------|------------------|---------------|
+| **TREND_V8** | `v8_strict` | 단기 악재·가짜 돌파에 민감 (기존과 동일) |
+| **SWING** / **SWING_FIB** 등 | `swing_terminal_risk` | 실적 부진·섹터 하락 등 일반 악재 무시, **상폐·부도·횡령/배임** 등 Terminal Risk만 80~100 |
+
+**매수 게이트:** `false_breakout_prob >= ai_false_breakout_threshold`(국장·미장 기본 70) 또는 `>= ai_false_breakout_threshold_coin`(코인 기본 80) 이면 차단(전략 공통 임계).
 
 **Gemini → OpenAI 폴백:** `ai_false_breakout_provider` 가 `gemini`(기본)일 때, Gemini가 키 없음·API 오류·JSON 실패 등으로 **LLM 점수를 내지 못하면**, `OPENAI_API_KEY`가 있고 `ai_false_breakout_openai_fallback` 이 `false`가 아니면(기본: 폴백 **켜짐**) **한 번** OpenAI를 호출한다. OpenAI 모델명은 `ai_false_breakout_openai_model`(기본 `gpt-4o-mini`).
 
-**Phase 4 — 거시 방어막 (2층)**
+**Phase 4 — 거시 방어막 (시장별 글로벌 알파)**
 
-**A. 예산 배수 (기존 VIX·FGI)** — `evaluate_macro_guard` / `get_macro_guard_snapshot` 의 `budget_multiplier`
+VIX·Crypto Fear&Greed **예산 배수**(`block`/`reduce`)와 원/달러 **절대값**(예: 1500원) 차단은 **제거**되었습니다. `get_macro_guard_snapshot` 의 `budget_multiplier`(`macro_mult`)는 **항상 1.0**이며, 신규 매수는 아래 **시장별 1지표**만으로 막습니다.
 
-| 조건 | `mode` | 예산 배수 |
-|------|--------|-----------|
-| VIX ≥ `macro_vix_block_threshold` (기본 25) | `block` | **0** (전 시장 신규 매수 중단) |
-| Fear&Greed ≥ `macro_fgi_reduce_threshold` (기본 80) | `reduce` | **`macro_fgi_budget_multiplier`** (기본 0.5) |
-| 그 외 | `normal` | **1.0** |
+`api/macro_data.py` 수집 + `evaluate_market_macro_buy_permission` (지표 **미수집 시 해당 조건은 통과**, fail-open)
 
-조회 실패 시 `macro_vix_fallback` / `macro_fgi_fallback` 으로 대체. `macro_vix_override` / `macro_fgi_override` 로 라이브 조회 생략 가능.
+| 시장 | 지표 | 수집 | 차단 조건 (기본) |
+|------|------|------|------------------|
+| **US** | SPY Put/Call OI 비율 | `fetch_us_put_call_ratio()` | PCR **≥ 1.2** |
+| **COIN** | BTCUSDT 고래 롱/숏 (1d) | `fetch_coin_whale_short_ratio()` | 롱숏 **≤ 0.8** |
+| **KR** | 원/달러 모멘텀 | `fetch_usd_krw_momentum()` (현재가÷5일 이평) | 모멘텀 **≥ 1.015** (5일 이평 대비 **1.5% 급등**) |
 
-**B. 시장별 글로벌 알파 차단** — `api/macro_data.py` 수집 + `evaluate_market_macro_buy_permission` (지표 **미수집 시 해당 조건은 통과**, fail-open)
-
-| 지표 | 수집 (`macro_data`) | 차단 시장·조건 (기본 임계) |
-|------|---------------------|---------------------------|
-| SPY Put/Call OI 비율 | `fetch_us_put_call_ratio()` (yfinance 옵션 체인) | **US** ≥ 1.2 · **KR** 동일 PCR로도 차단 |
-| BTCUSDT 고래 롱/숏 (1d) | `fetch_coin_whale_short_ratio()` (바이낸스 선물 공개 API) | **COIN** 롱숏 ≤ 0.8 |
-| 원/달러 절대·모멘텀 | `fetch_usd_krw_momentum()` (`KRW=X` / `USDKRW=X`, 현재가÷5일 이평) | **KR** 모멘텀 ≥ 1.015 **또는** 환율 ≥ 1500 |
-
-- 사이클 시작(매 사이클): `🛡️ [Phase4 거시]` (VIX·FGI·배수) + `🛡️ [Phase4 글로벌]` (PCR·고래·환율) + 차단 시 `🚫 [Phase4 글로벌] KR|US|COIN 신규 매수 차단 — …` 요약.
+- 사이클 시작(매 사이클): `🛡️ [Phase4 거시]` (요약 문구) + `🛡️ [Phase4 글로벌]` (PCR·고래·환율 모멘텀) + 차단 시 `🚫 [Phase4 글로벌] KR|US|COIN 신규 매수 차단 — …` 요약.
 - **실제 글로벌 매수 차단 적용:** `market_buy_allowed[KR|US|COIN] == false` 이면 **해당 시장 매수 시간창**에 들어온 뒤 스캔·주문 직전에 `-> 🚨 국장|미장|코인 Phase4 글로벌 방어막: 신규 매수 중단` (창 밖에서는 `[KR|US|COIN 매수 대기]`만). 창 안에서 막히면 그 사이클은 신규 매수 없이 끝나며, 매수 존 진입·체결 0건이면 [매수 패스 텔레그램](#5-한-사이클-안에서-일어나는-일)과 같습니다.
-- **VIX/FGI 전 시장 차단:** `macro_mult <= 0` 이면 매수 창 여부와 무관하게 해당 시장 엔진에서 `-> 🚨 … Phase4 거시 방어막` 으로 신규 매수를 막습니다.
+- 코드에 `macro_mult <= 0` 분기가 남아 있으나, Phase4 활성 시 **발동하지 않습니다**(항상 1.0).
 
-**선택 `config.json` 키 (Phase 4 글로벌):** `macro_us_put_call_block_threshold`, `macro_us_put_call_symbol`, `macro_coin_whale_long_short_block_threshold`, `macro_coin_whale_symbol`, `macro_coin_whale_period`, `macro_krw_fx_momentum_block_threshold`, `macro_krw_fx_spot_block_threshold`.
+**선택 `config.json` 키 (Phase 4):** `macro_guard_enabled`, `macro_us_put_call_block_threshold`, `macro_us_put_call_symbol`, `macro_coin_whale_long_short_block_threshold`, `macro_coin_whale_symbol`, `macro_coin_whale_period`, `macro_krw_fx_momentum_block_threshold`.
+
+**레거시(무시):** `macro_vix_*`, `macro_fgi_*`, `macro_krw_fx_spot_block_threshold` — 설정에 남아 있어도 조회·차단에 사용하지 않습니다.
 
 **레거시 — KR/US 호가 TR 수정 (LLM 입력과 별개):** 과거 KIS `inquire-price` 만으로는 호가가 (0,0)이 되어 **별도 LLM 루브릭**에서 오판이 났던 이슈가 있어, **KR** 은 `api/kis_api.fetch_kr_orderbook` (`FHKST01010200`) 로 잔량을 채우는 경로가 남아 있습니다. **현재 Phase 3 LLM 게이트는 뉴스 헤드라인만** 사용합니다.
 
@@ -453,9 +575,12 @@ if cash < target_budget:
 - **파일 로그:** `utils/logger.py` 의 일별 롤오버로 **`logs/bot.log`** 가 쌓이고, 자정 넘기면 이전 날짜 파일이 **`logs/bot.YYYY-MM-DD.log`** 형식으로 보관됩니다.
 - **시장별:** `[KR …]`, `[US …]`, `[COIN …]` — 예산·예수·정수주 0·TWAP 미체결·BEAR+ADX 스킵 등.
 - **V8 스캔:** `🔍 [V8] [n/N] 종목 … ❌ 패스:` 또는 통과 시 `🔥 [V8] …`. Hurst 차단 시 `Hurst 차단 — 강한 횡보/역추세 (H=...<0.45)`.
-- **스윙 보조:** V8 실패 뒤 `🔍 [스윙] … ❌ 패스: 사유` 또는 `✅ [SWING-BUY] …`.
+- **스윙 보조:** V8 실패 뒤 `🔍 [스윙] … ❌ 패스: 사유` 또는 `✅ [SWING-BUY] …` (BEAR 시 `| BEAR 시장 스윙 예외` 가능).
+- **스윙 보유:** `📊 [KR|US|COIN 보유] … 매도선(스윙): …` · `| 1차익절(볼밴): …`(HALF 목표, 매도선 아님) · `[SWING-SELL]` HALF/FULL.
+- **BEAR 매수:** `📌 [KR|US|COIN] BEAR 날씨 — V8 추세 매수만 중단, SWING_FIB 스윙 후보는 계속 분석` · V8 통과 시 `⏭️ … BEAR … 추세 매수 차단`.
 - **RS·비중:** `-> [RS] … 10일 상대강도 순 정렬`, 매수 단계 `vol-target(ATR%, cap 1/N=…)` 또는 `1/N 고정`.
-- **Phase4 글로벌:** 사이클 시작 `🛡️ [Phase4 글로벌] PCR=… 고래롱숏=… 환율=…`, 차단 요약 `🚫 [Phase4 글로벌] KR|US|COIN 신규 매수 차단`. **매수 창 안**에서만 `-> 🚨 국장|미장|코인 Phase4 글로벌 방어막: 신규 매수 중단` (창 밖은 `[KR|US|COIN 매수 대기]`만).
+- **Phase3 AI:** `[AI FILTER]` / `[AI PASS]` — 로그에 `프롬프트: v8_strict` 또는 `swing_terminal_risk` 표기.
+- **Phase4 글로벌:** 사이클 시작 `🛡️ [Phase4 글로벌] PCR=… 고래롱숏=… 환율모멘텀=…`, 차단 요약 `🚫 [Phase4 글로벌] KR|US|COIN 신규 매수 차단`. **매수 창 안**에서만 `-> 🚨 국장|미장|코인 Phase4 글로벌 방어막: 신규 매수 중단` (창 밖은 `[KR|US|COIN 매수 대기]`만).
 - **매수 패스(텔레그램):** 매수 가능 구간이었는데 이번 사이클에 신규 매수 체결이 없으면 `📭 [매수 패스] …` — **해당 사이클에 존에 들어간 시장만** `KR` / `US` / `COIN` 으로 표기(본문은 `run_bot.py` 와 동일). `telegram_token` / `telegram_chat_id` 필수.
 - **스냅샷/GUI:** `[snapshot …]`, 조회 폴백은 `📌` / `⚠️` 한 줄.
 - **Phase5:** `[Phase5 서킷]` 등 (구체 문자열은 런타임 로그 참고).
@@ -613,17 +738,11 @@ if cash < target_budget:
   "ai_false_breakout_provider": "gemini",
 
   "macro_guard_enabled": true,
-  "macro_vix_block_threshold": 25.0,
-  "macro_fgi_reduce_threshold": 80,
-  "macro_fgi_budget_multiplier": 0.5,
-  "macro_vix_fallback": 22.0,
-  "macro_fgi_fallback": 60,
 
   "alpha_target_vol": 0.02,
   "macro_us_put_call_block_threshold": 1.2,
   "macro_coin_whale_long_short_block_threshold": 0.8,
   "macro_krw_fx_momentum_block_threshold": 1.015,
-  "macro_krw_fx_spot_block_threshold": 1500,
   "macro_us_put_call_symbol": "SPY",
   "macro_coin_whale_symbol": "BTCUSDT",
   "macro_coin_whale_period": "1d"
@@ -638,8 +757,8 @@ if cash < target_budget:
 - **`twap_*`:** 주문 금액이 임계를 넘으면 분할, 슬라이스 간 `twap_slice_delay_sec` 초 대기.
 - **`buy_window_minutes_before_close`:** 장 마감 N분 전만 신규 매수 허용.
 - **`account_circuit_*`:** 합산 계좌 서킷 on/off, MDD 임계(%), 쿨다운 시간(시간).
-- **`ai_false_breakout_*`:** 매수 직전 **뉴스 헤드라인** LLM 게이트(`strategy/ai_filter.py`). 점수가 임계 이상이면 차단(Phase 3 절). API 키는 환경 변수 `GOOGLE_API_KEY` / `OPENAI_API_KEY`, `config.json`, 루트 `ai_keys.txt` 순. `ai_false_breakout_openai_fallback`, `ai_false_breakout_openai_model` 선택.
-- **`macro_*`:** VIX/FGI **예산 배수** + 글로벌 알파 **시장별 신규 매수 차단**(Phase 4 절). 글로벌 `-> 🚨` 는 **매수 창 안**에서만(국·미·코인 동일). `macro_guard_enabled=false` 시 전부 비활성. 스냅샷 필드: `market_buy_allowed`, `market_buy_block_reason`, `us_put_call_ratio`, `coin_whale_long_short_ratio`, `usd_krw_spot`, `usd_krw_momentum_ratio`.
+- **`ai_false_breakout_*`:** 매수 직전 **뉴스 헤드라인** LLM 게이트. `strategy_type` 별 듀얼 프롬프트(`ai_filter.py`). API 키는 환경 변수 `GOOGLE_API_KEY` / `OPENAI_API_KEY`, `config.json`, 루트 `ai_keys.txt` 순. `ai_false_breakout_openai_fallback`, `ai_false_breakout_openai_model` 선택.
+- **`macro_*`:** Phase 4 **시장별 글로벌 알파 신규 매수 차단**(Phase 4 절). `budget_multiplier`는 항상 1.0. 글로벌 `-> 🚨` 는 **매수 창 안**에서만(국·미·코인 동일). `macro_guard_enabled=false` 시 비활성. 스냅샷 필드: `market_buy_allowed`, `market_buy_block_reason`, `us_put_call_ratio`, `coin_whale_long_short_ratio`, `usd_krw_momentum_ratio`.
 - **`alpha_target_vol`:** 변동성 타겟 비중의 목표 일일 변동성(소수, 기본 0.02). `ratio = min(1/N, alpha_target_vol / ATR%)`.
 
 ---

@@ -8,6 +8,11 @@
 
 토큰
     * ``kis_token.json`` — ``run_bot`` 과 호환되는 ``access_token`` + ``timestamp`` 형식을 사용한다.
+
+HTS 조건식 (최신)
+    * 등록 원본: ``조건검색/v8조건검색 26.05(외국인수급제외 간결화).txt`` (동명 .xml/.tdf)
+    * 로직: ``A and B and ((C and D and E and F) or (G and H))`` — README.md §8 「국장 HTS 조건검색」
+    * 이 스크립트는 계정에 등록된 **모든** 조건식 결과를 합칩니다. V8만 쓰려면 HTS에 간결화 식만 두세요.
 """
 import json, requests, time
 from pathlib import Path

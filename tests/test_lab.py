@@ -34,8 +34,7 @@ Phase 1 샌드박스 — 동적 섹터 쏠림 방지 (MDD 1차 방어)
   OPENAI_API_KEY / GOOGLE_API_KEY : 선택한 AI 제공자 키.
   tests/ai_keys.txt               : 이 샌드박스 전용(환경변수 없을 때). 운영 run_bot 은
                                     config.json 동일 키 또는 루트 ``ai_keys.txt`` (``strategy/ai_filter._get_secret``).
-  LAB_VIX=27.5          : Phase 4 테스트용 VIX 값(미지정 시 실조회 시도).
-  LAB_FGI=82            : Phase 4 테스트용 Fear&Greed 값(0~100).
+  Phase 4 샌드박스: 실조회(PCR·고래·환율 모멘텀) + Mock 시나리오(US/COIN/KR 차단 조건).
 """
 from __future__ import annotations
 
@@ -54,7 +53,7 @@ if str(_BOT_ROOT) not in sys.path:
 
 import yfinance as yf
 
-from strategy.macro_guard import evaluate_macro_guard, get_macro_guard_snapshot
+from strategy.macro_guard import evaluate_market_macro_buy_permission, get_macro_guard_snapshot
 
 from execution.circuit_break import evaluate_total_account_circuit, estimate_usdkrw
 from execution.guard import (
@@ -881,44 +880,38 @@ def run_phase3_ai_filter_lab() -> None:
 
 
 def run_phase4_macro_guard_lab() -> None:
-    """Phase 4 샌드박스: 거시 데이터로 예산 차단/축소 판단 (운영과 동일 `get_macro_guard_snapshot`)."""
+    """Phase 4 샌드박스: 글로벌 알파 시장별 매수 차단 (운영과 동일 `get_macro_guard_snapshot`)."""
     print("\n" + "=" * 72)
-    print("[Phase4 샌드박스] Macro 대체데이터 방어막 (VIX/Fear&Greed)")
+    print("[Phase4 샌드박스] Macro 글로벌 알파 방어막 (PCR·고래·환율 모멘텀)")
     print("=" * 72)
 
     lab_cfg: Dict[str, Any] = {"macro_guard_enabled": True}
-    vix_env = os.environ.get("LAB_VIX", "").strip()
-    fgi_env = os.environ.get("LAB_FGI", "").strip()
-    if vix_env:
-        lab_cfg["macro_vix_override"] = vix_env
-    if fgi_env:
-        lab_cfg["macro_fgi_override"] = fgi_env
-
     snap = get_macro_guard_snapshot(lab_cfg)
-    vix_val = float(snap.get("vix") or 0.0)
-    fgi_val = int(snap.get("fgi") or 0)
-    vix_src = str(snap.get("vix_source") or "?")
-    fgi_src = str(snap.get("fgi_source") or "?")
 
-    base_budget = 1_000_000.0
-    mult = float(snap.get("budget_multiplier", 1.0))
-    adjusted_budget = base_budget * mult
-
-    print(f"  VIX = {vix_val:.2f} ({vix_src})")
-    print(f"  Fear&Greed = {fgi_val} ({fgi_src})")
+    print(f"  PCR = {snap.get('us_put_call_ratio')}")
+    print(f"  고래 롱숏 = {snap.get('coin_whale_long_short_ratio')}")
+    print(f"  환율 모멘텀 = {snap.get('usd_krw_momentum_ratio')}")
     print(f"  decision = {snap.get('mode')} | reason = {snap.get('reason')}")
-    print(f"  budget: {int(base_budget):,} -> {int(adjusted_budget):,} (x{mult})")
+    print(f"  market_buy_allowed = {snap.get('market_buy_allowed')}")
 
     print("\n  --- 시나리오 검증 (Mock) ---")
-    for name, vix, fgi in [
-        ("NORMAL", 18.0, 55),
-        ("EXTREME_GREED", 19.5, 84),
-        ("HIGH_VIX", 29.0, 62),
-    ]:
-        d = evaluate_macro_guard(vix, fgi)
+    scenarios = [
+        ("US_PCR_BLOCK", "US", 1.25, 1.0, 1.01, False),
+        ("COIN_WHALE_BLOCK", "COIN", 1.0, 0.75, 1.01, False),
+        ("KR_FX_MOM_BLOCK", "KR", 1.0, 1.0, 1.02, False),
+        ("ALL_CLEAR", "KR", 1.0, 1.0, 1.005, True),
+    ]
+    for name, mk, pcr, whale, fx_mom, expect_allowed in scenarios:
+        d = evaluate_market_macro_buy_permission(
+            mk,
+            us_put_call_ratio=pcr,
+            coin_whale_long_short_ratio=whale,
+            usd_krw_momentum_ratio=fx_mom,
+        )
+        ok = bool(d.get("allowed")) == expect_allowed
         print(
-            f"    {name:14s} | VIX={vix:>5.1f}, FGI={fgi:>3d} -> "
-            f"{d['mode']:>6s}, budget x{d['budget_multiplier']}, {d['reason']}"
+            f"    {name:18s} | {mk} allowed={d.get('allowed')} "
+            f"({'OK' if ok else 'FAIL'}) | {d.get('reason')}"
         )
 
 
