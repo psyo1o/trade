@@ -1,5 +1,5 @@
 ================================================================================
-  c-bot 프로젝트 구조 / 파일 설명 (2026-05-15)
+  c-bot 프로젝트 구조 / 파일 설명 (2026-05-19)
   — 처음 보는 분도 따라갈 수 있게: 무엇이 어디에 있고, 무엇을 Git에 올리지 않는지까지 정리
 ================================================================================
 
@@ -63,10 +63,14 @@ run_bot.py
     ``-> 🚨 국장|미장|코인 Phase4 글로벌 방어막`` 은 **해당 시장 매수 창 안**에서만(창 밖은 ``[KR|US|COIN 매수 대기]``만).
     Phase4 예산 축소(VIX/FGI) 제거 — ``macro_mult`` 항상 1.0. 시장별 글로벌만 ``-> 🚨 … 글로벌 방어막`` (매수 창 안).
   - 동기화: ``fetch_equity_held_lists_for_position_sync`` — 국·미 비정규장이면 KIS 보유 목록 조회 생략. ``sync_all_positions`` 에서 비장중 held 보강 등.
+  - 텔레 heartbeat: ``heartbeat_report`` → ``get_*_holdings_with_roi`` → ``_format_holding_line``
+    (``전략:V8|스윙 | 매수가 | 현재가 | 최고가 | 매도선 | 보유기간``).
+    ``_heartbeat_strategy_label`` — 장부 strategy_type·tier; 없으면 ``_strategy_from_trade_history_buy``(trade_history 최근 BUY reason).
+    스윙 매도선은 ``_heartbeat_resolve_sl_p`` + ``get_swing_exit_display_price``.
   - 사이클 말: 매수 존에 들었으나 신규 체결 0건이면 텔레그램 ``[매수 패스]`` — 본문에 이번 존 시장만 ``KR`` / ``US`` / ``COIN`` 표기(복수 시 ``KR·US`` 등).
 
 run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI 사용 안내」)
-  - PyQt5. import run_bot 순간 config 로드 → config 수정 후에는 GUI 재시작.
+  - PyQt5. 다크 QSS 대시보드. 기본 창 1480×900, 최소 1280×760. import run_bot 순간 config 로드 → config 수정 후에는 GUI 재시작.
   - 상단: stats 라벨(약 3초 주기), 국/미/코인 예수·총평·보유수익률.
     코인 상단 ROI: _calc_coin_holdings_metrics — 바이낸스는 장부 buy_p·trade_history BUY 폴백.
     바이낸스일 때 코인 칸·보유표·장부 탭 코인 가격은 USDT로 표시(스냅샷·서킷·Phase5는 내부 KRW 환산 유지).
@@ -74,16 +78,19 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
     잔고 API 실패 시 코인 상단 라벨은 bot_state last_coin_display_snapshot 폴백(성공 시 저장).
   - "예수금 새로고침" = 일반 정책 조회 / "KIS 강제 새로고침" = KIS 1회 강제(자동 조회 최소 간격 약 25초).
   - 스핀: 국·미·코인 max_positions + "설정 실시간 적용" → run_bot.MAX_* 즉시 + bot_state settings 저장.
-  - 실시간 현황 보유표 마지막 열: 수량 QLineEdit(기본=행 보유 전량, 비우면 전량) + 매도 버튼 → _on_manual_sell_click
+  - 실시간 현황 보유표: **전략** 열(V8/스윙) 다음 **수동매도** 열 — 수량 QLineEdit(기본=행 보유 전량, 비우면 전량) + 매도 버튼 → _on_manual_sell_click
     (보유 초과·정수 주/코인 소수 검증) → run_bot.manual_sell.
   - 탭: 실시간 현황(보유표·수동매도), 매매 내역(trade_history), 장부(positions, 수익률=max_p 기준, 마지막 열=전략명=tier),
     고점 보정(입출금, adjust_capital 동일·CapitalAdjustThread).
+    실시간 현황 보유표: 시장·종목명·수량·매수단가·현재가·수익률·전략(V8/스윙, _dashboard_strategy_short)·수동매도.
+    종목명 열 Interactive(약 절반 cap), 수량·가격·전략·매도 열 Stretch(_configure_holding_table).
     실시간·장부 수량: _build_live_qty_lookup 실계좌 우선. 코인 BUY qty는 체결 base 수량.
     봇 브리핑 로그는 탭 아래 공통 영역(QSplitter, run_gui.py setSizes).
   - 매매: 기동 직후 즉시 1회 없음 → KST :00/:15/:30/:45 정렬 타이머만 (중복 실행 가드).
   - 기동 직후 약 150ms에 refresh_balance(sync_first=False) 1회로 화면만 선채움.
   - 매매 직전 refresh_balance로 max_p 맞춤 후 WorkerThread에서 엔진.
-  - 텔레 heartbeat: 기동 직후 전송 없음 → KST :00/:30 슬롯 예약 후 해당 15분 매매 사이클 종료 뒤 전송 (백그라운드).
+  - 텔레 heartbeat: 기동 직후 전송 없음 → KST :00/:30 슬롯 예약 후 해당 15분 매매 사이클 종료 뒤 heartbeat_report (백그라운드).
+    보유 한 줄 전략 표기는 run_bot._format_holding_line 과 동일(전략:V8|스윙).
   - 스캐너: GUI 기동 시 start_scanner_scheduler 연동.
   - 네트워크 연속 실패 시 종료(BOT_DISABLE_NET_WATCH 로 감시 끔 가능).
   - 잔고 스레드: BalanceUpdaterThread + gui_table_adapter.build_rows_data.
@@ -114,7 +121,7 @@ bot_state.json
   - positions 키는 종목 식별 문자열(티커 형태). 업비트면 KRW-BTC 등 **KRW- 접두**,
     바이낸스 현물이면 USDT-BTC 등 **USDT- 접두** — “장부에 원화만 따로 있다”는 뜻이 아님(README 동명 절 참고).
   - 각 포지션 필드: buy_p, sl_p, qty, scale_out_done, entry_atr, current_atr,
-    strategy_type(TREND_V8 | SWING_FIB), entry_fib_level(스윙 피보 손절·sl_p),
+    strategy_type(TREND_V8 | SWING_FIB), entry_fib_level(스윙 진입 피보; sl_p는 통합 매도선 표시),
     buy_p/avg_price(평단·스윙 익절·RSI 판정) …
   - cooldown, ticker_cooldowns, stats (wins/losses/total_profit=전량 청산 누적,
     manual_partial_total_profit_pct=수동 부분 매도 가중 누적)
@@ -124,7 +131,8 @@ bot_state.json
   - last_kis_display_snapshot, capital_adjustments(선택)
 
 trade_history.json
-  - 매매 이벤트 append.
+  - 매매 이벤트 append. BUY ``reason``(예 SWING_FIB, V6 스나이퍼…)은 장부 strategy_type·tier 가 없을 때
+    텔레 heartbeat 전략 표시(_strategy_from_trade_history_buy) 폴백에 사용.
 
 us_universe_cache.json
   - S&P 시총 상위 100 + Ndx 비중복 50(최대 150), GICS, TTL.
@@ -150,16 +158,21 @@ strategy/
     check_swing_entry(Pullback KR/US/COIN: 60MA~+30%·거래량·갭3%·양봉·윗꼬리5%·피보),
       SWING_MA60_MAX_EXTENSION_PCT, SWING_VOL_MIN_VS_PREV_RATIO, SWING_GAP_UP_MAX_PCT,
       _pick_swing_fib_support_below: 38.2/50/61.8% 중 현재가 아래 지지),
-    check_swing_exit(reference_price=현재가; 피보/구름 FULL·볼밴 HALF +2%·RSI FULL 평단↑),
-    get_swing_exit_display_price(스윙 매도선·sl_p 갱신), get_swing_hard_stop_floor,
-    get_swing_half_target_price(1차익절 볼밴·로그용), _SWING_PROFIT_LOCK_TIERS,
-    SWING_BB_HALF_MIN_PROFIT_PCT=2.0, SWING_UPPER_WICK_DROP_PCT=5.0,
-    get_final_exit_price/get_chandelier_exit(V8 전용) 등
+    check_swing_exit(피보/구름 FULL·HALF 볼밴OR+5%·RSI FULL +1~10%),
+    check_swing_profit_lock_trailing_exit(수익 락 이탈만), reconcile_swing_position,
+    get_swing_exit_display_price(표시·sl_p), get_swing_hard_stop_floor, infer_swing_entry_fib_from_ohlcv,
+    get_swing_half_target_price(1차익절 볼밴·로그용), _SWING_PROFIT_LOCK_TIERS(4/8/15/25%),
+    SWING_BB_HALF_MIN_PROFIT_PCT=2.0, SWING_HALF_FIXED_TARGET_PCT=5.0, SWING_UPPER_WICK_DROP_PCT=5.0,
+    get_final_exit_price/get_chandelier_exit(V8: 샹들리에+이익락+절대cap -8%/-12%),
+    V8_MAX_STOP_CAP_MULT_EQUITY=0.92, V8_MAX_STOP_CAP_MULT_COIN=0.88,
+    _v8_max_stop_cap_floor; SWING_MAX_STOP_CAP_* (-5%/-7%) 등
   alpha_sizing.py … 10일 RS 정렬, volatility_target_ratio (min(1/N, target_vol/ATR%))
   indicators.py … get_safe_atr (V8 ATR 무결성)
   sector_lock.py … Phase1 섹터 과다 방지
   ai_filter.py … Phase3 뉴스 LLM 0~100, 듀얼 프롬프트(v8_strict / swing_terminal_risk), Gemini→OpenAI 폴백
-  macro_guard.py … Phase4 시장별 글로벌 매수 차단(US PCR / COIN 고래 / KR 환율 모멘텀)
+  macro_guard.py … Phase4 시장별 글로벌 매수 차단(US PCR / COIN 고래 / KR 환율 모멘텀).
+    US PCR 차단 시 SWING_FIB만 macro_buy_allowed_for_strategy 예외(V8 TREND_V8 차단 유지).
+    is_us_put_call_macro_block, macro_buy_allowed_for_strategy — run_bot US 매수 루프 연동
 
 execution/
   guard.py … load/save_state, cooldown, MDD, Phase5, can_open_new,
@@ -175,8 +188,8 @@ execution/
 
 services/
   account_read_facade.py … KR/US 보유 조회 통합, 폴백 시 한 줄 로그
-  account_snapshot.py … GUI/heartbeat 공용 스냅샷·현재가
-  gui_table_adapter.py … 실시간 테이블 행 조립
+  account_snapshot.py … GUI/heartbeat 공용 스냅샷·현재가·보유 한 줄(get_*_holdings_with_roi)
+  gui_table_adapter.py … 실시간 테이블 행 조립(전략 열 포함)
 
 utils/
   math_utils.py … calculate_hurst_exponent (R/S)
@@ -200,8 +213,14 @@ tests/
        - strategy_type==SWING_FIB → check_swing_exit(reference_price=현재가)
          HALF=50% 익절(볼밴 상단·평단+2%↑) / FULL=피보·구름·RSI(평단↑) — 1차익절은 매도선 아님
          HALF·FULL이면 continue, HOLD면 아래로
-       - 분할익절(Scale-Out) → 타임스탑·하드스탑 → SWING은 스윙 매도선 이탈(_check_swing_trailing_exit),
-         TREND_V8만 샹들리에(check_pro_exit)
+       - 분할익절(Scale-Out) → 타임스탑 → SWING: 수익 락만(_check_swing_trailing_exit→profit_lock;
+         피보/구름 FULL은 check_swing_exit, 손실구간 V8 hard_stop 스킵), TREND_V8: hard_stop·샹들리에
+       - 타임스탑: V8 주식 240h/+4%, V8 코인 72h/+4%, SWING 주식 120h/+2%, SWING 코인 48h/+2%
+         (run_bot V8_TIME_STOP_* / SWING_TIME_STOP_*, 주말 포함 연속시간)
+       - 하드·매도선: V8 get_final_exit_price(샹들리에×2.5ATR+이익락+max(기술선,평단×0.92/0.88));
+         기술이 -15%여도 국장 V8은 -8% cap(예). SWING get_swing_hard_stop_floor(max 피보·구름·cap -5%/-7%))
+       - V8 매수 초기 sl_p: calculate_pro_signals 듀얼 ATR 후 동일 cap 적용
+         표시 get_swing_exit_display_price(max 하드+수익락 4/8/15/25%)
        - 타임스탑 reason 태그: [V8_TIME_STOP_*], [SWING_TIME_STOP_*] — ticker_cooldowns는 guard.py
        - 타임스탑/하드스탑/샹들리에 전량 청산: 단일 시장가 주문(재시도). TWAP는 매수·분할익절 전용(의도 설계)
   5) 매수 … KR → US → COIN (시간창·필터 통과 시)

@@ -32,9 +32,9 @@ import threading
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QTextEdit, QTableWidget, QTableWidgetItem,
-                             QHeaderView, QTabWidget, QMessageBox, QSpinBox, QLineEdit, QRadioButton,
-                             QButtonGroup, QSizePolicy, QSplitter)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread
+                             QHeaderView, QTabWidget, QTabBar, QMessageBox, QSpinBox, QLineEdit,
+                             QRadioButton, QButtonGroup, QSizePolicy, QSplitter, QAbstractItemView)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QSize
 from PyQt5.QtGui import QFont
 from pathlib import Path
 import traceback
@@ -75,6 +75,10 @@ from run_bot import (
     _to_float,
 )
 from execution.guard import load_state, save_state
+from strategy.rules import (
+    get_swing_exit_display_price,
+    reconcile_swing_position,
+)
 
 TRADE_HISTORY_PATH = Path(__file__).resolve().parent / "trade_history.json"
 TRADE_HISTORY_SECTOR_OVERLAY_PATH = Path(__file__).resolve().parent / "trade_history_sectors_backfill.json"
@@ -158,6 +162,277 @@ def _position_strategy_label(pos_info: dict) -> str:
     if st == "SWING_FIB":
         return "SWING_FIB"
     return "V6 스나이퍼(수급+MACD+RSI+상투방지)"
+
+
+def _dashboard_strategy_short(pos_info: dict) -> str:
+    """실시간 보유 표 — V8 / 스윙."""
+    tier = str((pos_info or {}).get("tier") or "").strip().upper()
+    st = str((pos_info or {}).get("strategy_type") or "TREND_V8").strip().upper()
+    if st == "SWING_FIB" or tier in ("SWING_FIB", "SWING") or "SWING" in tier:
+        return "스윙"
+    return "V8"
+
+
+def _table_cell(text) -> QTableWidgetItem:
+    """표 셀 — 잘림 시 툴팁으로 전체 문자열 표시."""
+    s = str(text)
+    item = QTableWidgetItem(s)
+    item.setToolTip(s)
+    return item
+
+
+class _DashboardTabBar(QTabBar):
+    """한글 탭 제목이 말줄임·세로 클립 없이 보이도록 너비·높이 힌트."""
+
+    _TAB_WIDTH_PAD = 96
+    _TAB_MIN_WIDTH = 178
+
+    def tabSizeHint(self, index: int) -> QSize:
+        base = super().tabSizeHint(index)
+        text = self.tabText(index) or ""
+        fm = self.fontMetrics()
+        rect = fm.boundingRect(0, 0, 0, 0, Qt.TextSingleLine, text)
+        text_w = max(int(rect.width()), int(fm.horizontalAdvance(text)))
+        w = max(self._TAB_MIN_WIDTH, text_w + self._TAB_WIDTH_PAD)
+        h = max(int(base.height()), int(rect.height()) + 22)
+        return QSize(w, h)
+
+
+def _configure_main_tab_widget(tabs: QTabWidget) -> None:
+    bar = tabs.tabBar()
+    bar.setExpanding(False)
+    bar.setElideMode(Qt.ElideNone)
+    bar.setUsesScrollButtons(True)
+    bar.setMinimumHeight(40)
+    bar.setStyleSheet("QTabBar::tab { font-size: 11px; }")
+
+
+def _dashboard_stylesheet() -> str:
+    """대시보드 전역 QSS — 동작 변경 없이 색·간격·타이포만 적용."""
+    return """
+    QMainWindow, QWidget {
+        background-color: #0f1218;
+        color: #e2e8f0;
+    }
+    QLabel {
+        color: #cbd5e1;
+    }
+    QLabel#StatsBanner {
+        font-size: 15px;
+        font-weight: 600;
+        color: #e0f2fe;
+        background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 #1a2332, stop:1 #152238);
+        padding: 10px 14px;
+        border-radius: 10px;
+        border: 1px solid #334155;
+    }
+    QLabel#SectionTitle {
+        font-size: 13px;
+        font-weight: 600;
+        color: #94a3b8;
+        padding: 2px 0 4px 0;
+    }
+    QWidget#MarketKr, QWidget#MarketUs, QWidget#MarketCoin {
+        background-color: #161b26;
+        border: 1px solid #2d3748;
+        border-radius: 10px;
+    }
+    QWidget#MarketKr { border-top: 3px solid #38bdf8; }
+    QWidget#MarketUs { border-top: 3px solid #818cf8; }
+    QWidget#MarketCoin { border-top: 3px solid #fbbf24; }
+    QWidget#MarketKr QLabel, QWidget#MarketUs QLabel, QWidget#MarketCoin QLabel {
+        color: #f1f5f9;
+        font-size: 12px;
+        font-weight: 600;
+        padding: 3px 8px;
+    }
+    QTabWidget::pane {
+        border: 1px solid #2d3748;
+        border-radius: 8px;
+        background: #141820;
+        top: -1px;
+    }
+    QTabBar {
+        qproperty-drawBase: 0;
+    }
+    QTabBar::tab {
+        background: #1a2030;
+        color: #94a3b8;
+        padding: 12px 32px;
+        margin-right: 6px;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        font-weight: 600;
+        min-height: 30px;
+        min-width: 178px;
+    }
+    QTabBar::tab:selected {
+        background: #243044;
+        color: #38bdf8;
+        border-bottom: 2px solid #38bdf8;
+    }
+    QTabBar::tab:hover:!selected {
+        background: #1f2838;
+        color: #cbd5e1;
+    }
+    QTableWidget {
+        background-color: #141820;
+        alternate-background-color: #181e2a;
+        gridline-color: #2a3348;
+        color: #e2e8f0;
+        border: 1px solid #2d3748;
+        border-radius: 8px;
+        selection-background-color: #2563eb;
+        selection-color: #f8fafc;
+    }
+    QHeaderView::section {
+        background-color: #1e293b;
+        color: #94a3b8;
+        padding: 6px 8px;
+        border: none;
+        border-bottom: 2px solid #334155;
+        font-weight: 600;
+        font-size: 11px;
+    }
+    QTableWidget::item {
+        padding: 4px 6px;
+    }
+    QPushButton {
+        background-color: #243044;
+        color: #e2e8f0;
+        border: 1px solid #3d4f66;
+        border-radius: 8px;
+        padding: 8px 14px;
+        font-weight: 600;
+    }
+    QPushButton:hover {
+        background-color: #2d3d52;
+        border-color: #4b6280;
+    }
+    QPushButton:pressed {
+        background-color: #1a2433;
+    }
+    QPushButton#BtnRefresh {
+        background-color: #1d4ed8;
+        border-color: #2563eb;
+        color: #f8fafc;
+    }
+    QPushButton#BtnRefresh:hover { background-color: #2563eb; }
+    QPushButton#BtnForceKis {
+        background-color: #334155;
+        border-color: #475569;
+        color: #f1f5f9;
+    }
+    QPushButton#BtnApplyMax {
+        background-color: #0f766e;
+        border-color: #14b8a6;
+        color: #f0fdfa;
+    }
+    QPushButton#BtnApplyMax:hover { background-color: #0d9488; }
+    QPushButton#BtnCapitalApply {
+        background-color: #166534;
+        border-color: #22c55e;
+        color: #ecfdf5;
+    }
+    QPushButton#BtnCapitalApply:hover { background-color: #15803d; }
+    QPushButton#BtnManualSell {
+        background-color: #7f1d1d;
+        border-color: #b91c1c;
+        color: #fef2f2;
+        padding: 4px 10px;
+        min-width: 52px;
+    }
+    QPushButton#BtnManualSell:hover { background-color: #991b1b; }
+    QSpinBox, QLineEdit {
+        background-color: #1a2030;
+        color: #e2e8f0;
+        border: 1px solid #3d4f66;
+        border-radius: 6px;
+        padding: 5px 8px;
+        selection-background-color: #2563eb;
+    }
+    QSpinBox:focus, QLineEdit:focus {
+        border-color: #38bdf8;
+    }
+    QRadioButton {
+        color: #cbd5e1;
+        spacing: 6px;
+    }
+    QRadioButton::indicator {
+        width: 14px;
+        height: 14px;
+    }
+    QTextEdit#LogConsole {
+        background-color: #0c0f14;
+        color: #86efac;
+        font-family: Consolas, 'Cascadia Mono', 'Malgun Gothic', monospace;
+        font-size: 12px;
+        border: 1px solid #2d3748;
+        border-radius: 8px;
+        padding: 6px;
+    }
+    QSplitter::handle {
+        background: #2d3748;
+        height: 4px;
+        margin: 2px 0;
+    }
+    QScrollBar:vertical {
+        background: #141820;
+        width: 10px;
+        border-radius: 5px;
+    }
+    QScrollBar::handle:vertical {
+        background: #3d4f66;
+        border-radius: 5px;
+        min-height: 24px;
+    }
+    QScrollBar::handle:vertical:hover { background: #4b6280; }
+    """
+
+
+def _configure_holding_table(table: QTableWidget) -> None:
+    """실시간 현황 — 종목명은 좁게, 오른쪽(수량·가격·전략·매도)은 남는 폭을 나눠 가짐."""
+    _configure_data_table(table, stretch_cols=())
+    hdr = table.horizontalHeader()
+    hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+    hdr.setSectionResizeMode(1, QHeaderView.Interactive)
+    for col in (2, 3, 4, 5, 6):
+        hdr.setSectionResizeMode(col, QHeaderView.Stretch)
+    hdr.setSectionResizeMode(7, QHeaderView.Interactive)
+    table.setColumnWidth(1, 200)
+    table.setColumnWidth(7, 300)
+
+
+def _balance_holding_table_columns(table: QTableWidget) -> None:
+    """데이터 반영 후 종목명 열을 내용 기준 약 절반으로 캡."""
+    if table.rowCount() <= 0:
+        table.setColumnWidth(1, 200)
+        return
+    table.resizeColumnToContents(1)
+    natural = int(table.columnWidth(1))
+    capped = max(140, min(240, int(natural * 0.52)))
+    table.setColumnWidth(1, capped)
+
+
+def _configure_data_table(table: QTableWidget, *, stretch_cols: tuple[int, ...] = ()) -> None:
+    """테이블 공통 — 글자 잘림 방지(말줄임 끔·최소 열너비·가로 스크롤)."""
+    table.setTextElideMode(Qt.ElideNone)
+    table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+    table.setWordWrap(False)
+    table.verticalHeader().setDefaultSectionSize(34)
+    hdr = table.horizontalHeader()
+    hdr.setMinimumHeight(30)
+    hdr.setMinimumSectionSize(76)
+    hdr.setDefaultSectionSize(100)
+    hdr.setStretchLastSection(False)
+    n = table.columnCount()
+    stretch_set = set(stretch_cols)
+    for col in range(n):
+        if col in stretch_set:
+            hdr.setSectionResizeMode(col, QHeaderView.Stretch)
+        else:
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
 
 
 def _ledger_row_key(ticker: str) -> str:
@@ -460,6 +735,7 @@ class BalanceUpdaterThread(QThread):
         current_price, roi = buy_p, 0.0
 
         ledger_key = ""
+        pos: dict = {}
         try:
             m = "KR" if market_code == "KR" else ("US" if market_code == "US" else "COIN")
             # 국·미는 장부 키가 normalize_ticker(6자리·대문자) 기준 — pdno가 int/앞자리0 누락이면 조회 실패해 curr_p가 비었다고 나옴
@@ -501,6 +777,7 @@ class BalanceUpdaterThread(QThread):
             "buy_p_float": buy_p,
             "current_price": current_price,
             "roi": roi,
+            "strategy": _dashboard_strategy_short(pos),
             "m_code": market_code,
             "t_code": ledger_key or str(ticker_code).strip().upper(),
         }
@@ -668,35 +945,37 @@ class BotDashboard(QMainWindow):
         print(f"⚠️ 텔레그램 보고서 생성 또는 발송에 실패했습니다: {msg}")
 
     def initUI(self):
-        self.setWindowTitle('🚀 64비트 3콤보 트레이딩 대시보드 (완전체)')
-        self.resize(1180, 940)
-        self.setMinimumSize(1020, 760)
+        self.setWindowTitle('3콤보 트레이딩 대시보드')
+        self.resize(1480, 900)
+        self.setMinimumSize(1280, 760)
+        self.setStyleSheet(_dashboard_stylesheet())
 
-        base_ui_font = QFont("Malgun Gothic", 11)
+        base_ui_font = QFont("Malgun Gothic", 10)
         self.setFont(base_ui_font)
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
         
         self.stats_label = QLabel(get_current_stats(STATE_PATH), self)
-        self.stats_label.setMinimumHeight(72)
+        self.stats_label.setObjectName("StatsBanner")
+        self.stats_label.setMinimumHeight(68)
         self.stats_label.setWordWrap(True)
-        self.stats_label.setStyleSheet("""
-            font-size: 18px; font-weight: bold; color: #1A5276; 
-            background-color: #EBF5FB; padding: 14px; 
-            border-radius: 8px; border: 2px solid #3498DB;
-        """)
         layout.addWidget(self.stats_label)
         
         top_layout = QHBoxLayout()
+        top_layout.setSpacing(10)
 
-        font_value = QFont("Malgun Gothic", 12, QFont.Bold)
+        font_value = QFont("Malgun Gothic", 11, QFont.Bold)
 
-        def make_market_box():
+        def make_market_box(object_name: str):
             box = QWidget()
+            box.setObjectName(object_name)
             v = QVBoxLayout(box)
-            v.setContentsMargins(0, 0, 0, 0)
+            v.setContentsMargins(10, 8, 10, 8)
+            v.setSpacing(4)
             cash = QLabel("예수금: 조회중...")
             total = QLabel("총평가: 조회중...")
             roi = QLabel("보유수익률: 조회중...")
@@ -706,9 +985,9 @@ class BotDashboard(QMainWindow):
                 v.addWidget(lbl)
             return box, cash, total, roi
 
-        kr_box, self.lbl_kr_cash, self.lbl_kr_total, self.lbl_kr_roi = make_market_box()
-        us_box, self.lbl_us_cash, self.lbl_us_total, self.lbl_us_roi = make_market_box()
-        coin_box, self.lbl_coin_cash, self.lbl_coin_total, self.lbl_coin_roi = make_market_box()
+        kr_box, self.lbl_kr_cash, self.lbl_kr_total, self.lbl_kr_roi = make_market_box("MarketKr")
+        us_box, self.lbl_us_cash, self.lbl_us_total, self.lbl_us_roi = make_market_box("MarketUs")
+        coin_box, self.lbl_coin_cash, self.lbl_coin_total, self.lbl_coin_roi = make_market_box("MarketCoin")
 
         self.lbl_kr_cash.setText("🇰🇷 예수금: 조회중...")
         self.lbl_kr_total.setText("🇰🇷 총평가: 조회중...")
@@ -727,18 +1006,19 @@ class BotDashboard(QMainWindow):
         top_layout.addWidget(coin_box)
             
         btn_refresh = QPushButton("🔄 예수금 새로고침")
-        btn_refresh.setMinimumHeight(44)
+        btn_refresh.setObjectName("BtnRefresh")
+        btn_refresh.setMinimumHeight(38)
         btn_refresh.clicked.connect(self.refresh_balance)
         top_layout.addWidget(btn_refresh)
         btn_force_refresh = QPushButton("🏦 KIS 강제 새로고침")
-        btn_force_refresh.setMinimumHeight(44)
-        btn_force_refresh.setStyleSheet("background-color: #34495e; color: white; font-weight: bold;")
+        btn_force_refresh.setObjectName("BtnForceKis")
+        btn_force_refresh.setMinimumHeight(38)
         btn_force_refresh.clicked.connect(self.force_refresh_kis)
         top_layout.addWidget(btn_force_refresh)
         layout.addLayout(top_layout)
         
-        # 👇👇👇 [여기 빈 공간에 복붙해라] 👇👇👇
         settings_layout = QHBoxLayout()
+        settings_layout.setSpacing(8)
         current_state = load_state(STATE_PATH)
         saved_settings = current_state.get("settings", {})
         
@@ -758,7 +1038,8 @@ class BotDashboard(QMainWindow):
         settings_layout.addWidget(self.spin_max_coin)
         
         btn_apply_max = QPushButton("💾 설정 실시간 적용")
-        btn_apply_max.setStyleSheet("background-color: #2c3e50; color: white; font-weight: bold;")
+        btn_apply_max.setObjectName("BtnApplyMax")
+        btn_apply_max.setMinimumHeight(34)
         btn_apply_max.clicked.connect(self._apply_max_position)
         settings_layout.addWidget(btn_apply_max)
         settings_layout.addStretch()
@@ -767,22 +1048,32 @@ class BotDashboard(QMainWindow):
 
         # 탭 위젯 생성 (봇 브리핑 로그는 탭 밖 하단에 고정)
         tabs = QTabWidget()
+        tabs.setTabBar(_DashboardTabBar())
+        _configure_main_tab_widget(tabs)
 
         # 1. 실시간 현황 탭
         dashboard_tab = QWidget()
         dashboard_layout = QVBoxLayout(dashboard_tab)
         
-        self.table = QTableWidget(0, 7) # 현재가, 수익률 컬럼 추가
+        self.table = QTableWidget(0, 8)
+        self.table.setAlternatingRowColors(True)
         self.table.setHorizontalHeaderLabels(
-            ["시장", "종목명(코드)", "보유수량", "매수단가", "현재가", "수익률", "수량·수동매도"]
+            [
+                "시장",
+                "종목명(코드)",
+                "보유수량",
+                "매수단가",
+                "현재가",
+                "수익률",
+                "전략",
+                "수량·수동매도",
+            ]
         )
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setColumnWidth(4, 80)
-        self.table.setColumnWidth(6, 220)
-        self.table.verticalHeader().setDefaultSectionSize(34)
-        self.table.horizontalHeader().setMinimumHeight(30)
+        _configure_holding_table(self.table)
 
-        dashboard_layout.addWidget(QLabel("<b>📊 현재 보유 종목 (국장/미장/코인)</b>"))
+        hold_title = QLabel("📊 현재 보유 종목 (국장 / 미장 / 코인)")
+        hold_title.setObjectName("SectionTitle")
+        dashboard_layout.addWidget(hold_title)
         dashboard_layout.addWidget(self.table)
 
         tabs.addTab(dashboard_tab, "실시간 현황")
@@ -792,16 +1083,12 @@ class BotDashboard(QMainWindow):
         history_layout = QVBoxLayout(history_tab)
         
         self.history_table = QTableWidget(0, 9)
+        self.history_table.setAlternatingRowColors(True)
         self.history_table.setHorizontalHeaderLabels(
             ["시간", "시장", "종목", "섹터", "구분", "수량", "가격", "수익률(%)", "사유"]
         )
-        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        _configure_data_table(self.history_table, stretch_cols=(2, 8))
         self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.history_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Stretch)
-        self.history_table.horizontalHeader().setMinimumSectionSize(52)
-        self.history_table.verticalHeader().setDefaultSectionSize(34)
-        self.history_table.horizontalHeader().setMinimumHeight(30)
         history_layout.addWidget(self.history_table)
         
         tabs.addTab(history_tab, "매매 내역")
@@ -811,13 +1098,9 @@ class BotDashboard(QMainWindow):
         ledger_layout = QVBoxLayout(ledger_tab)
         
         self.ledger_table = QTableWidget(0, 9)
+        self.ledger_table.setAlternatingRowColors(True)
         self.ledger_table.setHorizontalHeaderLabels(["시장", "종목명(코드)", "매수가", "손절가", "수익률", "최고가", "수량", "매수시간", "전략"])
-        self.ledger_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.ledger_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.ledger_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Stretch)
-        self.ledger_table.horizontalHeader().setMinimumSectionSize(52)
-        self.ledger_table.verticalHeader().setDefaultSectionSize(34)
-        self.ledger_table.horizontalHeader().setMinimumHeight(30)
+        _configure_data_table(self.ledger_table, stretch_cols=(1, 8))
         ledger_layout.addWidget(self.ledger_table)
         
         tabs.addTab(ledger_tab, "장부 (현재 포지션)")
@@ -826,10 +1109,10 @@ class BotDashboard(QMainWindow):
         capital_tab = QWidget()
         capital_layout = QVBoxLayout(capital_tab)
         capital_help = QLabel(
-            "<b>고점 보정 (수동 입·출금)</b><br>"
-            "예수금만 입금/출금하면 Phase5 주차 고점(<code>peak_total_equity</code>)과 실총액이 어긋날 수 있습니다.<br>"
-            "실행 시 CLI와 같이 <b>실계좌 스냅샷 갱신</b> 후 고점을 가산/감산하고 <code>capital_adjustments</code>에 기록합니다.<br>"
-            "<span style='color:#c0392b'>주말 KIS 점검 구간에는 국·미 스냅샷이 제한될 수 있습니다.</span>"
+            "<b style='color:#e2e8f0'>고점 보정 (수동 입·출금)</b><br>"
+            "<span style='color:#94a3b8'>예수금만 입·출금하면 Phase5 주차 고점과 실총액이 어긋날 수 있습니다. "
+            "실행 시 실계좌 스냅샷 갱신 후 고점을 반영합니다.</span><br>"
+            "<span style='color:#f87171'>주말 KIS 점검 구간에는 국·미 스냅샷이 제한될 수 있습니다.</span>"
         )
         capital_help.setWordWrap(True)
         capital_layout.addWidget(capital_help)
@@ -854,23 +1137,22 @@ class BotDashboard(QMainWindow):
         capital_layout.addLayout(amt_row)
 
         self.capital_apply_btn = QPushButton("실행 (스냅샷 갱신 → 고점 반영)")
-        self.capital_apply_btn.setMinimumHeight(40)
-        self.capital_apply_btn.setStyleSheet("background-color: #1e8449; color: white; font-weight: bold;")
+        self.capital_apply_btn.setObjectName("BtnCapitalApply")
+        self.capital_apply_btn.setMinimumHeight(36)
         self.capital_apply_btn.clicked.connect(self._on_capital_adjust_clicked)
         capital_layout.addWidget(self.capital_apply_btn)
         capital_layout.addStretch()
 
         tabs.addTab(capital_tab, "고점 보정 (입출금)")
 
-        log_header = QLabel("<b>📝 실시간 작동 로그 (봇 브리핑)</b>")
+        log_header = QLabel("📝 실시간 작동 로그 (봇 브리핑)")
+        log_header.setObjectName("SectionTitle")
         self.log_console = QTextEdit()
+        self.log_console.setObjectName("LogConsole")
         self.log_console.setReadOnly(True)
         # 재연결·에러 폭주 시 메모리·페인트 폭주 완화 (구형 단말·공유기 재부팅 구간)
         self.log_console.document().setMaximumBlockCount(5000)
-        self.log_console.setStyleSheet(
-            "background-color: #1e1e1e; color: #00ff00; font-family: Consolas, 'Malgun Gothic', monospace; font-size: 12px;"
-        )
-        self.log_console.setMinimumHeight(200)
+        self.log_console.setMinimumHeight(160)
 
         log_panel = QWidget()
         log_layout = QVBoxLayout(log_panel)
@@ -883,7 +1165,7 @@ class BotDashboard(QMainWindow):
         main_split.addWidget(log_panel)
         main_split.setStretchFactor(0, 1)
         main_split.setStretchFactor(1, 0)
-        main_split.setSizes([520, 350])
+        main_split.setSizes([580, 240])
         layout.addWidget(main_split, 1)
 
     def _on_capital_adjust_clicked(self):
@@ -1079,15 +1361,15 @@ class BotDashboard(QMainWindow):
 
             sector_txt = sector_for_trade_record(item, sector_overlay) or "-"
 
-            self.history_table.setItem(row, 0, QTableWidgetItem(item.get("timestamp", "")))
-            self.history_table.setItem(row, 1, QTableWidgetItem(market))
-            self.history_table.setItem(row, 2, QTableWidgetItem(display_name))
-            self.history_table.setItem(row, 3, QTableWidgetItem(sector_txt))
-            self.history_table.setItem(row, 4, QTableWidgetItem(item.get("side", "")))
-            self.history_table.setItem(row, 5, QTableWidgetItem(str(item.get("qty", ""))))
-            self.history_table.setItem(row, 6, QTableWidgetItem(str(item.get("price", ""))))
-            self.history_table.setItem(row, 7, QTableWidgetItem(str(item.get("profit_rate", ""))))
-            self.history_table.setItem(row, 8, QTableWidgetItem(item.get("reason", "")))
+            self.history_table.setItem(row, 0, _table_cell(item.get("timestamp", "")))
+            self.history_table.setItem(row, 1, _table_cell(market))
+            self.history_table.setItem(row, 2, _table_cell(display_name))
+            self.history_table.setItem(row, 3, _table_cell(sector_txt))
+            self.history_table.setItem(row, 4, _table_cell(item.get("side", "")))
+            self.history_table.setItem(row, 5, _table_cell(str(item.get("qty", ""))))
+            self.history_table.setItem(row, 6, _table_cell(str(item.get("price", ""))))
+            self.history_table.setItem(row, 7, _table_cell(str(item.get("profit_rate", ""))))
+            self.history_table.setItem(row, 8, _table_cell(item.get("reason", "")))
 
         if history_changed:
             try:
@@ -1138,6 +1420,52 @@ class BotDashboard(QMainWindow):
             buy_p = float(pos_info.get('buy_p', 0.0))
             sl_p = float(pos_info.get('sl_p', 0.0))
             max_p = float(pos_info.get('max_p', 0.0))
+
+            # 스윙: 장부 sl_p 대신 피보·구름·수익락 통합 매도선을 실시간 재계산(GUI 표시)
+            st_led = str(pos_info.get("strategy_type") or "").strip().upper()
+            tier_led = str(pos_info.get("tier") or "").strip().upper()
+            if st_led == "SWING_FIB" or tier_led in ("SWING_FIB", "SWING"):
+                try:
+                    curr_led = 0.0
+                    ohlcv_led = None
+                    if market == "🪙 코인":
+                        from api import coin_broker
+
+                        curr_led = float(coin_broker.get_current_price(ticker) or 0.0)
+                        ohlcv_led = coin_broker.fetch_ohlcv(ticker, "day", 250)
+                    elif market == "🇰🇷 국장":
+                        from strategy.rules import get_ohlcv_yfinance
+
+                        ohlcv_led = get_ohlcv_yfinance(ticker)
+                        if ohlcv_led and len(ohlcv_led) >= 2:
+                            curr_led = float(ohlcv_led[-1].get("c", 0) or 0)
+                    else:
+                        from strategy.rules import get_ohlcv_yfinance
+
+                        ohlcv_led = get_ohlcv_yfinance(ticker)
+                        if ohlcv_led and len(ohlcv_led) >= 2:
+                            curr_led = float(ohlcv_led[-1].get("c", 0) or 0)
+                    if ohlcv_led and len(ohlcv_led) >= 60 and curr_led > 0:
+                        mp_led = max(max_p if max_p > 0 else buy_p, curr_led)
+                        pos_info = dict(pos_info)
+                        pos_info["max_p"] = mp_led
+                        reconcile_swing_position(
+                            pos_info, ohlcv_led, reference_price=curr_led
+                        )
+                        m_led = (
+                            "KR"
+                            if market == "🇰🇷 국장"
+                            else ("US" if market == "🇺🇸 미장" else "COIN")
+                        )
+                        sl_live = float(
+                            get_swing_exit_display_price(
+                                curr_led, pos_info, ohlcv_led, market=m_led, ticker=ticker
+                            )
+                        )
+                        if sl_live > 0:
+                            sl_p = sl_live
+                except Exception:
+                    pass
             
             # 장부 수익률: 매수가 대비 기록된 최고가(max_p). 실시간 보유 표·상단 ROI는 현재가 기준.
             if buy_p > 0:
@@ -1153,8 +1481,8 @@ class BotDashboard(QMainWindow):
             qty_text = _format_position_qty_for_table(market, qty_val)
             
             # 테이블에 행 추가
-            self.ledger_table.setItem(row, 0, QTableWidgetItem(market))
-            self.ledger_table.setItem(row, 1, QTableWidgetItem(f"{name} ({ticker})"))
+            self.ledger_table.setItem(row, 0, _table_cell(market))
+            self.ledger_table.setItem(row, 1, _table_cell(f"{name} ({ticker})"))
             
             # 가격 표시 (시장별 포맷)
             if market == "🇺🇸 미장":
@@ -1181,11 +1509,11 @@ class BotDashboard(QMainWindow):
                 sl_p_str = f"{int(sl_p):,}원"
                 max_p_str = f"{int(max_p):,}원"
             
-            self.ledger_table.setItem(row, 2, QTableWidgetItem(buy_p_str))
-            self.ledger_table.setItem(row, 3, QTableWidgetItem(sl_p_str))
-            self.ledger_table.setItem(row, 4, QTableWidgetItem(f"{profit_rate:+.2f}%"))
-            self.ledger_table.setItem(row, 5, QTableWidgetItem(max_p_str))
-            self.ledger_table.setItem(row, 6, QTableWidgetItem(qty_text))
+            self.ledger_table.setItem(row, 2, _table_cell(buy_p_str))
+            self.ledger_table.setItem(row, 3, _table_cell(sl_p_str))
+            self.ledger_table.setItem(row, 4, _table_cell(f"{profit_rate:+.2f}%"))
+            self.ledger_table.setItem(row, 5, _table_cell(max_p_str))
+            self.ledger_table.setItem(row, 6, _table_cell(qty_text))
             
             # 매수시간 포맷 (buy_date 우선 사용)
             buy_date_str = pos_info.get('buy_date', '')
@@ -1206,8 +1534,8 @@ class BotDashboard(QMainWindow):
                         buy_time_display_str = str(buy_time)[:16]
                 except:
                     buy_time_display_str = ""
-            self.ledger_table.setItem(row, 7, QTableWidgetItem(buy_time_display_str))
-            self.ledger_table.setItem(row, 8, QTableWidgetItem(strategy_label))
+            self.ledger_table.setItem(row, 7, _table_cell(buy_time_display_str))
+            self.ledger_table.setItem(row, 8, _table_cell(strategy_label))
 
     def append_log(self, text):
         blob = (text or "").replace("\r", "").rstrip()
@@ -1388,16 +1716,17 @@ class BotDashboard(QMainWindow):
                     else f"{int(d['current_price']):,}원"
                 )
 
-            self.table.setItem(row, 0, QTableWidgetItem(d['market']))
-            self.table.setItem(row, 1, QTableWidgetItem(display_name))
+            self.table.setItem(row, 0, _table_cell(d['market']))
+            self.table.setItem(row, 1, _table_cell(display_name))
             self.table.setItem(
                 row,
                 2,
-                QTableWidgetItem(_format_position_qty_for_table(d["market"], float(_to_float(d["qty"], 0.0)))),
+                _table_cell(_format_position_qty_for_table(d["market"], float(_to_float(d["qty"], 0.0)))),
             )
-            self.table.setItem(row, 3, QTableWidgetItem(price_str))
-            self.table.setItem(row, 4, QTableWidgetItem(curr_str))
-            self.table.setItem(row, 5, QTableWidgetItem(f"{d['roi']:+.2f}%"))
+            self.table.setItem(row, 3, _table_cell(price_str))
+            self.table.setItem(row, 4, _table_cell(curr_str))
+            self.table.setItem(row, 5, _table_cell(f"{d['roi']:+.2f}%"))
+            self.table.setItem(row, 6, _table_cell(str(d.get("strategy", "V8"))))
 
             cell = QWidget()
             row_lay = QHBoxLayout(cell)
@@ -1410,6 +1739,7 @@ class BotDashboard(QMainWindow):
             qty_edit.setMaximumWidth(160)
             qty_edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             sell_btn = QPushButton("매도")
+            sell_btn.setObjectName("BtnManualSell")
             sell_btn.setMinimumWidth(56)
             row_lay.addWidget(qty_edit)
             row_lay.addWidget(sell_btn)
@@ -1417,7 +1747,9 @@ class BotDashboard(QMainWindow):
             sell_btn.clicked.connect(
                 lambda _checked=False, rp=row_copy, ed=qty_edit: self._on_manual_sell_click(rp, ed)
             )
-            self.table.setCellWidget(row, 6, cell)
+            self.table.setCellWidget(row, 7, cell)
+
+        _balance_holding_table_columns(self.table)
 
     def _on_refresh_finished(self):
         self._refresh_inflight = False

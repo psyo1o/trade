@@ -5,7 +5,7 @@ V5 전략 코어 — OHLCV 수집, 프로 시그널, 청산 가격.
 역할 분리
     * **데이터** — ``get_ohlcv_yfinance`` / ``get_ohlcv_kis_domestic_daily`` / ``get_ohlcv_upbit`` / ``get_ohlcv_realtime`` 등.
     * **시그널** — ``calculate_pro_signals`` (V8 진입), ``check_swing_entry`` / ``check_swing_exit`` (SWING_FIB).
-    * **청산** — ``check_pro_exit``, ``get_final_exit_price`` (V8), ``get_swing_exit_display_price`` (SWING_FIB 매도선).
+    * **청산** — ``check_pro_exit``, ``get_final_exit_price`` (V8, -8%/-12% cap), ``get_swing_exit_display_price`` (SWING_FIB 매도선).
 
 스윙 요약은 README.md §8. 진입: ``check_swing_entry`` (60MA·이격30%·거래량·갭3%·양봉·윗꼬리·피보).
 상수: ``SWING_MA60_MAX_EXTENSION_PCT``, ``SWING_VOL_MIN_VS_PREV_RATIO``, ``SWING_GAP_UP_MAX_PCT`` 등.
@@ -376,7 +376,10 @@ def calculate_pro_signals(ohlcv, market_weather, ticker="", name="", idx=0, tota
         
         # 둘 중 '더 높은 가격(손실이 적은 가격)'을 최종 손절선으로 채택!
         stop_loss_price = max(calculated_sl, absolute_sl)
-        
+        cap_floor = _v8_max_stop_cap_floor(float(curr_p), ticker=ticker)
+        if cap_floor > 0:
+            stop_loss_price = max(float(stop_loss_price), cap_floor)
+
         print(f"   🔥 {_v8}{progress} {display_name} 🎯 3중 교차검증+상투방지 완료! [{strategy_name}]")
         print(f"      └ {_v8}세부지표: RSI({today['rsi']:.1f}), 윗꼬리({upper_tail_ratio*100:.1f}%), 이격도 적합")
         return True, stop_loss_price, strategy_name
@@ -478,6 +481,9 @@ def get_final_exit_price(ticker, curr_p, pos_info, ohlcv):
         profit_floor = 0
 
     final_exit_line = max(locked_chandelier, profit_floor)
+    cap_floor = _v8_max_stop_cap_floor(buy_price, ticker=ticker)
+    if cap_floor > 0:
+        final_exit_line = max(_finite_price(final_exit_line, sl_fb), cap_floor)
 
     return _finite_price(final_exit_line, sl_fb)
 
@@ -540,6 +546,12 @@ SWING_VOL_MIN_VS_PREV_RATIO = 0.80
 SWING_GAP_UP_MAX_PCT = 3.0
 # 스윙 손절 피보: 60봉 고저 되돌림 비율 (현재가 **아래** 지지만 허용)
 _SWING_FIB_RETRACE_RATIOS = (0.382, 0.500, 0.618)
+# 절대 손절 한도(평단 대비): KR/US -5%, COIN -7% (피보·구름이 더 높으면 그대로)
+SWING_MAX_STOP_CAP_MULT_EQUITY = 0.95
+SWING_MAX_STOP_CAP_MULT_COIN = 0.93
+# V8 절대 손절 한도(평단 대비): KR/US -8%, COIN -12% (ATR·샹들리에가 더 깊으면 상향)
+V8_MAX_STOP_CAP_MULT_EQUITY = 0.92
+V8_MAX_STOP_CAP_MULT_COIN = 0.88
 
 
 def _swing_reference_close(reference_close: float | None, close_bar: float) -> tuple[float, bool]:
@@ -718,13 +730,19 @@ def check_swing_entry(
     return True, float(fib_stop), ""
 
 
-# 볼밴 상단 1차 익절(HALF): 현재가가 상단 이상 + 평단 대비 최소 수익률(%)
+# 볼밴 상단 1차 익절(HALF): 평단 대비 최소 수익률(%) — 볼밴 터치·고정 목표 공통
 SWING_BB_HALF_MIN_PROFIT_PCT = 2.0
-# 스윙 수익 보존 락(V8 ``get_final_exit_price`` 콘크리트와 동일 티어 — 최고가 대비 %)
+# HALF: 볼밴과 무관하게 현재 수익률이 이 값 이상이면 1차 익절 후보 (OR 조건)
+SWING_HALF_FIXED_TARGET_PCT = 5.0
+# RSI FULL: 이 수익 구간에서만 전량 청산 (+10%↑ 는 수익 락 트레일링에만 맡김)
+SWING_RSI_FULL_MIN_PROFIT_PCT = 1.0
+SWING_RSI_FULL_MAX_PROFIT_PCT = 10.0
+# 스윙 전용 수익 보존 락 (max_p 기준 최대 수익률 → 평단 대비 보존 배수). V8(10/20/30%)과 분리.
 _SWING_PROFIT_LOCK_TIERS = (
-    (30.0, 1.15),
-    (20.0, 1.05),
-    (10.0, 1.005),
+    (25.0, 1.12),
+    (15.0, 1.07),
+    (8.0, 1.03),
+    (4.0, 1.005),
 )
 
 
@@ -748,18 +766,148 @@ def _swing_cloud_floor_from_row(today: pd.Series) -> float | None:
     return None
 
 
-def get_swing_hard_stop_floor(pos_info: dict, ohlcv) -> float:
+def infer_swing_entry_fib_from_ohlcv(ohlcv, reference_price: float) -> float:
+    """매수 시점 평단·현재가 기준 60봉 피보 지지(진입 로직과 동일). ``entry_fib_level`` 백필용."""
+    try:
+        px = float(reference_price)
+    except (TypeError, ValueError):
+        return 0.0
+    if px <= 0 or not ohlcv or len(ohlcv) < 60:
+        return 0.0
+    w = _normalize_ohlcv_df(pd.DataFrame(ohlcv))
+    if not {"h", "l"}.issubset(set(w.columns)):
+        return 0.0
+    recent60 = w.iloc[-60:]
+    hi60 = float(recent60["h"].max())
+    lo60 = float(recent60["l"].min())
+    fib, _ = _pick_swing_fib_support_below(px, hi60, lo60)
+    return float(fib) if fib is not None and fib > 0 else 0.0
+
+
+def reconcile_swing_position(
+    pos_info: dict,
+    ohlcv,
+    *,
+    reference_price: float | None = None,
+) -> bool:
     """
-    스윙 손절 바닥 — 피보(entry_fib)와 구름 하단 중 **더 높은** 가격(이하 이탈 시 FULL).
+    SWING_FIB 장부 보정 — ``strategy_type``·``entry_fib_level`` 누락 시 복구.
+
+    ``sl_p``(통합 매도선)를 피보 대용으로 쓰지 않음(순환·왜곡 방지).
+    """
+    if not isinstance(pos_info, dict):
+        return False
+    changed = False
+    st = str(pos_info.get("strategy_type") or "").strip().upper()
+    tier = str(pos_info.get("tier") or "").strip().upper()
+    if st != "SWING_FIB" and tier in ("SWING_FIB", "SWING"):
+        pos_info["strategy_type"] = "SWING_FIB"
+        changed = True
+    if str(pos_info.get("strategy_type") or "").upper() != "SWING_FIB":
+        return changed
+    fib = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
+    if fib <= 0 and ohlcv and len(ohlcv) >= 60:
+        anchor = _finite_price(reference_price, 0.0)
+        if anchor <= 0:
+            anchor = _swing_avg_price(pos_info)
+        if anchor <= 0:
+            try:
+                last = ohlcv[-1]
+                anchor = float(last.get("c", 0) if isinstance(last, dict) else last["c"])
+            except (TypeError, ValueError, KeyError, IndexError):
+                anchor = 0.0
+        inferred = infer_swing_entry_fib_from_ohlcv(ohlcv, anchor)
+        if inferred > 0:
+            pos_info["entry_fib_level"] = float(inferred)
+            changed = True
+    return changed
+
+
+def _resolve_swing_cap_market(market: str | None, ticker: str | None) -> str:
+    """절대 손절 한도용 시장 — KR / US / COIN."""
+    m = str(market or "").strip().upper()
+    if m in ("KR", "US", "COIN"):
+        return m
+    t = str(ticker or "").strip().upper()
+    if t.startswith(("KRW-", "USDT-", "BTC-", "ETH-")):
+        return "COIN"
+    if t.isdigit():
+        return "KR"
+    if t:
+        return "US"
+    return "KR"
+
+
+def _swing_max_stop_cap_floor(
+    buy_p: float, market: str | None = None, ticker: str | None = None
+) -> float:
+    """평단 대비 절대 손절 하한 — KR/US 95%, COIN 93%."""
+    bp = float(buy_p)
+    if bp <= 0:
+        return 0.0
+    m = _resolve_swing_cap_market(market, ticker)
+    mult = (
+        SWING_MAX_STOP_CAP_MULT_COIN
+        if m == "COIN"
+        else SWING_MAX_STOP_CAP_MULT_EQUITY
+    )
+    return bp * mult
+
+
+def _v8_max_stop_cap_floor(
+    buy_p: float, market: str | None = None, ticker: str | None = None
+) -> float:
+    """V8 평단 대비 절대 손절 하한 — KR/US 92%(-8%), COIN 88%(-12%)."""
+    bp = float(buy_p)
+    if bp <= 0:
+        return 0.0
+    m = _resolve_swing_cap_market(market, ticker)
+    mult = (
+        V8_MAX_STOP_CAP_MULT_COIN
+        if m == "COIN"
+        else V8_MAX_STOP_CAP_MULT_EQUITY
+    )
+    return bp * mult
+
+
+def _swing_ohlcv_working_df(ohlcv) -> pd.DataFrame | None:
+    if ohlcv is None:
+        return None
+    try:
+        if isinstance(ohlcv, pd.DataFrame):
+            w = ohlcv if len(ohlcv) >= 60 else None
+        else:
+            w = pd.DataFrame(ohlcv) if ohlcv and len(ohlcv) >= 60 else None
+        if w is not None and len(w) >= 60:
+            return _append_swing_indicators(w)
+    except Exception:
+        return None
+    return None
+
+
+def get_swing_hard_stop_floor(
+    pos_info: dict,
+    ohlcv,
+    *,
+    market: str | None = None,
+    ticker: str | None = None,
+) -> float:
+    """
+    스윙 손절 바닥 — ``max(피보, 구름)`` 에 **절대 손절 한도**를 적용.
+
+    KR/US: 평단의 **95%**(-5%) 미만으로 내려가지 않음. COIN: **93%**(-7%).
+    피보·구름이 한도보다 높으면 더 높은 값을 사용.
     """
     p = pos_info if isinstance(pos_info, dict) else {}
+    buy = _swing_avg_price(p)
+    cap_floor = _swing_max_stop_cap_floor(buy, market, ticker)
     entry_fib = float(p.get("entry_fib_level", 0.0) or 0.0)
-    if entry_fib <= 0:
-        entry_fib = float(p.get("sl_p", 0.0) or 0.0)
+    if entry_fib <= 0 and buy > 0:
+        entry_fib = infer_swing_entry_fib_from_ohlcv(ohlcv, buy)
     cloud_floor = None
-    if ohlcv and len(ohlcv) >= 60:
+    w = _swing_ohlcv_working_df(ohlcv)
+    if w is not None:
         try:
-            w = _append_swing_indicators(pd.DataFrame(ohlcv))
             cloud_floor = _swing_cloud_floor_from_row(w.iloc[-1])
         except Exception:
             cloud_floor = None
@@ -768,17 +916,18 @@ def get_swing_hard_stop_floor(pos_info: dict, ohlcv) -> float:
         floors.append(float(entry_fib))
     if cloud_floor is not None and np.isfinite(cloud_floor) and cloud_floor > 0:
         floors.append(float(cloud_floor))
-    if floors:
-        return max(floors)
-    buy = _swing_avg_price(p)
-    sl_fb = float(p.get("sl_p", 0.0) or 0.0)
-    if sl_fb > 0:
-        return sl_fb
-    return buy * 0.9 if buy > 0 else 0.0
+    technical = max(floors) if floors else 0.0
+    if technical <= 0 and buy > 0:
+        technical = buy * 0.9
+    if technical <= 0 and cap_floor <= 0:
+        return 0.0
+    if cap_floor <= 0:
+        return float(technical)
+    return float(max(technical, cap_floor))
 
 
 def get_swing_profit_lock_floor(buy_p: float, max_p: float) -> float:
-    """최고가 기준 수익률에 따른 콘크리트 바닥(V8과 동일 티어)."""
+    """최고가(max_p) 기준 최대 수익률에 따른 스윙 전용 타이트 콘크리트 바닥."""
     bp = float(buy_p)
     mp = float(max_p)
     if bp <= 0 or mp <= 0:
@@ -806,18 +955,26 @@ def get_swing_half_target_price(pos_info: dict, ohlcv) -> float | None:
     return None
 
 
-def get_swing_exit_display_price(curr_p, pos_info, ohlcv) -> float:
+def get_swing_exit_display_price(
+    curr_p,
+    pos_info,
+    ohlcv,
+    *,
+    market: str | None = None,
+    ticker: str | None = None,
+) -> float:
     """
-    SWING_FIB 포지션의 **실행 매도선**(현재가가 이하로 내려오면 청산).
+    SWING_FIB **표시용 통합 매도선** (GUI·``sl_p``·로그).
 
-    - 수익 구간 미달: 피보·구름 하드스탑
-    - 최고가 수익률 10/20/30% 돌파 시: V8과 같은 콘크리트 바닥으로 상향
+    - 하드스탑(피보·구름) + 수익 락 바닥 중 높은 값
+    - **실행:** 하드스탑 FULL은 ``check_swing_exit`` 만, 수익 락 이탈은
+      ``check_swing_profit_lock_trailing_exit`` 만 담당 (중복 방지).
     """
     p = pos_info if isinstance(pos_info, dict) else {}
     cp = _finite_price(curr_p, 0.0)
     buy = _swing_avg_price(p)
     max_p = max(_finite_price(p.get("max_p", buy), buy), cp)
-    hard = get_swing_hard_stop_floor(p, ohlcv)
+    hard = get_swing_hard_stop_floor(p, ohlcv, market=market, ticker=ticker)
     profit_floor = get_swing_profit_lock_floor(buy, max_p)
     if profit_floor > 0:
         return _finite_price(max(hard, profit_floor), hard)
@@ -859,13 +1016,17 @@ def check_swing_exit(
     df: pd.DataFrame,
     *,
     reference_price: float | None = None,
+    market: str | None = None,
+    ticker: str | None = None,
 ) -> tuple[str, str]:
     """
     스윙 매도 타점 판단.
 
     ``reference_price`` — 장중 실시간가(KIS 등). 없으면 당일 종가로 판정.
-    HALF 볼밴: 현재가≥상단(20,2σ) 및 평단(``avg_price``→``buy_p``) 대비
-    ``SWING_BB_HALF_MIN_PROFIT_PCT``(기본 2%) 이상.
+    HALF: ``(현재가≥볼밴 상단 OR 수익≥SWING_HALF_FIXED_TARGET_PCT)`` AND
+    수익≥``SWING_BB_HALF_MIN_PROFIT_PCT``.
+    FULL 하드스탑: 피보·구름 — 이 경로만.
+    RSI FULL: 수익 +1%~+10% 구간에서만.
 
     Returns:
         ("FULL"|"HALF"|"HOLD", 사유)
@@ -881,49 +1042,110 @@ def check_swing_exit(
     today = w.iloc[-1]
     prev = w.iloc[-2]
 
-    entry_fib = float((pos_info or {}).get("entry_fib_level", 0.0) or 0.0)
     scale_out = bool((pos_info or {}).get("scale_out_done", False))
     close_today = float(today["c"])
     current_px = _swing_current_price(close_today, reference_price)
     avg_price = _swing_avg_price(pos_info)
 
-    # 1) 하드스탑 (현재가 기준)
-    fib_break = entry_fib > 0 and current_px < entry_fib
-    cloud_floor = _swing_cloud_floor_from_row(today)
-    cloud_break = cloud_floor is not None and current_px < float(cloud_floor)
-    if fib_break or cloud_break:
-        parts: list[str] = []
-        if fib_break:
-            parts.append(f"피보 {entry_fib:,.0f}")
-        if cloud_break:
-            parts.append(f"구름 {float(cloud_floor):,.0f}")
-        floor_txt = " · ".join(parts)
-        return "FULL", f"스윙 하드스탑 이탈 (현재가: {current_px:,.0f} < {floor_txt})"
+    # 1) 하드스탑 — 피보·구름 + 절대 손절 한도(KR/US -5%, COIN -7%)
+    hard_floor = get_swing_hard_stop_floor(
+        pos_info, w, market=market, ticker=ticker
+    )
+    if hard_floor > 0 and current_px < float(hard_floor):
+        cap_floor = _swing_max_stop_cap_floor(avg_price, market, ticker)
+        extra = ""
+        if cap_floor > 0 and float(hard_floor) <= float(cap_floor) + 1e-9:
+            pct = (
+                (SWING_MAX_STOP_CAP_MULT_COIN if _resolve_swing_cap_market(market, ticker) == "COIN" else SWING_MAX_STOP_CAP_MULT_EQUITY)
+                - 1.0
+            ) * 100.0
+            extra = f", 절대한도 {pct:+.1f}%"
+        return (
+            "FULL",
+            f"스윙 하드스탑 이탈 (현재가: {current_px:,.0f} < 기준 {hard_floor:,.0f}{extra})",
+        )
 
-    # 2) 볼밴 상단 1차 익절 — 현재가≥상단 AND 평단 대비 +2% 이상
-    if pd.notna(today["bb_upper"]) and not scale_out and avg_price > 0:
-        bb_upper = float(today["bb_upper"])
+    # 2) HALF — (볼밴 상단 OR 고정 +5%) AND 최소 +2%
+    if not scale_out and avg_price > 0:
         profit_pct = _swing_profit_rate_pct(avg_price, current_px)
-        if current_px >= bb_upper and profit_pct >= SWING_BB_HALF_MIN_PROFIT_PCT:
-            return (
-                "HALF",
-                f"볼밴 상단 1차 익절 (현재가: {current_px:,.0f} >= 볼밴: {bb_upper:,.0f}, "
-                f"평단: {avg_price:,.0f} 수익 {profit_pct:+.2f}%)",
-            )
+        if profit_pct >= SWING_BB_HALF_MIN_PROFIT_PCT:
+            bb_upper = float(today["bb_upper"]) if pd.notna(today["bb_upper"]) else 0.0
+            hit_bb = bb_upper > 0 and current_px >= bb_upper
+            hit_fixed = profit_pct >= SWING_HALF_FIXED_TARGET_PCT
+            if hit_bb or hit_fixed:
+                if hit_bb and hit_fixed:
+                    tag = (
+                        f"볼밴 {bb_upper:,.0f}·고정+{SWING_HALF_FIXED_TARGET_PCT:.0f}% 1차 익절"
+                    )
+                elif hit_fixed:
+                    tag = f"고정 +{SWING_HALF_FIXED_TARGET_PCT:.0f}% 1차 익절"
+                else:
+                    tag = f"볼밴 상단 1차 익절 (볼밴: {bb_upper:,.0f})"
+                return (
+                    "HALF",
+                    f"{tag} (현재가: {current_px:,.0f}, 평단: {avg_price:,.0f} 수익 {profit_pct:+.2f}%)",
+                )
 
-    # 3) RSI 과매수 데드크로스 — 수익 구간에서만 (휩쏘 방지)
+    # 3) RSI 데드크로스 FULL — +1% 이상 ~ +10% 미만만 (고수익은 수익 락 트레일링)
+    profit_pct = _swing_profit_rate_pct(avg_price, current_px) if avg_price > 0 else 0.0
     if (
         avg_price > 0
-        and current_px > avg_price
+        and SWING_RSI_FULL_MIN_PROFIT_PCT <= profit_pct < SWING_RSI_FULL_MAX_PROFIT_PCT
         and pd.notna(prev["rsi14"])
         and pd.notna(today["rsi14"])
         and float(prev["rsi14"]) > 70.0
         and float(today["rsi14"]) < 70.0
     ):
-        profit_pct = _swing_profit_rate_pct(avg_price, current_px)
         return (
             "FULL",
-            f"RSI 과매수 데드크로스 (현재가: {current_px:,.0f} > 평단: {avg_price:,.0f} 수익 {profit_pct:+.2f}%)",
+            f"RSI 과매수 데드크로스 (현재가: {current_px:,.0f}, 평단: {avg_price:,.0f} "
+            f"수익 {profit_pct:+.2f}%, 구간 {SWING_RSI_FULL_MIN_PROFIT_PCT:.0f}~"
+            f"{SWING_RSI_FULL_MAX_PROFIT_PCT:.0f}%)",
         )
 
     return "HOLD", ""
+
+
+def check_swing_profit_lock_trailing_exit(
+    curr_p: float,
+    pos_info: dict,
+    *,
+    ohlcv=None,
+) -> tuple[bool, str]:
+    """
+    스윙 **수익 보존 락** 이탈만 검사 (하드스탑은 ``check_swing_exit`` 전담).
+
+    ``profit_floor = get_swing_profit_lock_floor(buy, max_p)`` 가 0보다 크고
+    현재가가 그 이하이면 전량 청산.
+    """
+    p = pos_info if isinstance(pos_info, dict) else {}
+    cp = float(curr_p)
+    buy = _swing_avg_price(p)
+    if buy <= 0 or cp <= 0:
+        return False, ""
+    max_p = max(_finite_price(p.get("max_p", buy), buy), cp)
+    profit_floor = get_swing_profit_lock_floor(buy, max_p)
+    if profit_floor <= 0:
+        return False, ""
+    if cp <= float(profit_floor):
+        profit_pct = _swing_profit_rate_pct(buy, cp)
+        return (
+            True,
+            f"스윙 수익 보존 락 이탈 (락선 {profit_floor:,.0f}, 수익 {profit_pct:+.2f}%, "
+            f"max_p 기준 락 {_swing_profit_lock_tier_label(buy, max_p)})",
+        )
+    return False, ""
+
+
+def _swing_profit_lock_tier_label(buy_p: float, max_p: float) -> str:
+    """로그용 — 적용된 락 티어 요약."""
+    bp = float(buy_p)
+    if bp <= 0:
+        return "-"
+    mp = float(max_p)
+    max_profit_rate = (mp - bp) / bp * 100.0 if mp > 0 else 0.0
+    for threshold_pct, mult in _SWING_PROFIT_LOCK_TIERS:
+        if max_profit_rate >= threshold_pct:
+            preserve_pct = (mult - 1.0) * 100.0
+            return f"최고+{max_profit_rate:.1f}%→보존+{preserve_pct:.1f}%"
+    return "미달"

@@ -95,10 +95,14 @@ from strategy.rules import (
     calculate_pro_signals,
     check_swing_entry,
     check_swing_exit,
+    check_swing_profit_lock_trailing_exit,
     check_pro_exit,
     get_final_exit_price,
     get_swing_exit_display_price,
     get_swing_half_target_price,
+    get_swing_hard_stop_floor,
+    _v8_max_stop_cap_floor,
+    reconcile_swing_position,
     SWING_BB_HALF_MIN_PROFIT_PCT,
     get_ohlcv_yfinance,
     get_ohlcv_realtime,
@@ -111,7 +115,11 @@ from services.account_snapshot import (
 )
 from services import account_read_facade
 from strategy.sector_lock import allow_kr_sector_entry, allow_us_sector_entry, seed_us_sector_cache
-from strategy.macro_guard import get_macro_guard_snapshot
+from strategy.macro_guard import (
+    get_macro_guard_snapshot,
+    is_us_put_call_macro_block,
+    macro_buy_allowed_for_strategy,
+)
 from strategy.alpha_sizing import sort_targets_by_relative_strength, volatility_target_ratio
 from execution.order_twap import plan_krw_slices, plan_usd_slices
 import screener
@@ -839,6 +847,40 @@ def _record_trade_event(market, ticker, side, qty, price=None, profit_rate=None,
         "profit_rate": profit_rate,
         "reason": reason,
     })
+
+
+def _coin_sell_order_ok(resp) -> bool:
+    """코인 시장가 매도 응답 — 빈 dict 등 falsy 오판 방지."""
+    if resp is None or resp is False:
+        return False
+    return True
+
+
+def _telegram_swing_sell(
+    market: str,
+    ticker: str,
+    *,
+    name: str = "",
+    half: bool,
+    qty_label: str,
+    profit_rate: float,
+    reason: str,
+) -> None:
+    """스윙 HALF/FULL 체결 텔레그램 (KR/US/COIN 공통)."""
+    mk = str(market or "").strip().upper()
+    label = str(name or "").strip() or str(ticker)
+    title = "스윙 50% 익절" if half else "스윙 전량 청산"
+    emoji = "💰" if half else "🚨"
+    reason_short = str(reason or "").strip()
+    if len(reason_short) > 280:
+        reason_short = reason_short[:277] + "..."
+    send_telegram(
+        f"{emoji} [{mk} {title}] {ticker}({label})\n"
+        f"수량: {qty_label}\n"
+        f"수익률: {float(profit_rate):+.2f}%\n"
+        f"사유: {reason_short}"
+    )
+
 
 # =====================================================================
 # 3b. KIS 잔고 표시 스냅샷 — 주말 점검 시 GUI·텔레에 직전 성공 값 표시
@@ -2394,6 +2436,115 @@ def _fmt_telegram_coin_unit_usdt(p: float) -> str:
     return f"{s} USDT" if s else "0 USDT"
 
 
+def _strategy_from_trade_history_buy(ticker: str, market: str) -> str | None:
+    """``trade_history.json`` 최근 BUY ``reason`` 으로 V8/스윙 추론."""
+    t_key = str(ticker or "").strip()
+    if not t_key:
+        return None
+    m = str(market or "").strip().upper()
+    try:
+        if not TRADE_HISTORY_PATH.exists():
+            return None
+        import json
+
+        with open(TRADE_HISTORY_PATH, encoding="utf-8") as f:
+            rows = json.load(f)
+        if not isinstance(rows, list):
+            return None
+        t_norm = normalize_ticker(t_key) if not is_coin_ticker(t_key) else t_key.upper()
+        for row in reversed(rows):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("side", "")).upper() != "BUY":
+                continue
+            rt = str(row.get("ticker", "")).strip()
+            rt_cmp = rt.upper() if is_coin_ticker(rt) else normalize_ticker(rt)
+            if rt_cmp != t_norm and rt.upper() != t_key.upper():
+                continue
+            rm = str(row.get("market", "")).strip().upper()
+            if m and rm and rm != m:
+                continue
+            reason = str(row.get("reason", "") or "")
+            ru = reason.upper()
+            if "SWING" in ru or reason.strip() == "SWING_FIB":
+                return "스윙"
+            if reason.strip():
+                return "V8"
+        return None
+    except Exception:
+        return None
+
+
+def _heartbeat_strategy_label(
+    pos: dict, *, ticker: str = "", market: str = ""
+) -> str:
+    """생존신고 보유 한 줄 — 매수 전략 표시."""
+    p = pos if isinstance(pos, dict) else {}
+    st = str(p.get("strategy_type") or "").strip().upper()
+    tier = str(p.get("tier") or "").strip().upper()
+    if st == "SWING_FIB" or tier in ("SWING_FIB", "SWING") or "SWING" in tier:
+        return "스윙"
+    if st == "TREND_V8":
+        return "V8"
+    th = _strategy_from_trade_history_buy(ticker, market)
+    if th:
+        return th
+    return "V8"
+
+
+def _heartbeat_fetch_ohlcv_for_holding(market: str, ticker: str) -> list:
+    """생존신고용 일봉(매도선 재계산)."""
+    m = str(market or "").strip().upper()
+    t = str(ticker or "").strip()
+    if not t:
+        return []
+    try:
+        if m == "COIN":
+            return coin_broker.fetch_ohlcv(t, "day", 250) or []
+        if m == "KR":
+            return get_ohlcv_yfinance(t) or []
+        if m == "US":
+            return get_ohlcv_yfinance(t) or []
+    except Exception:
+        return []
+    return []
+
+
+def _heartbeat_resolve_sl_p(
+    market: str, ticker: str, pos: dict, buy_p: float, curr_p: float
+) -> float:
+    """표시용 매도선 — 스윙/V8 각각 ``get_swing_exit_display_price`` / ``get_final_exit_price``."""
+    p = pos if isinstance(pos, dict) else {}
+    st = str(p.get("strategy_type") or "").strip().upper()
+    tier = str(p.get("tier") or "").strip().upper()
+    is_swing = st == "SWING_FIB" or tier in ("SWING_FIB", "SWING")
+    cp = float(_to_float(curr_p, 0.0))
+    bp = float(_to_float(buy_p, 0.0))
+    ohlcv = _heartbeat_fetch_ohlcv_for_holding(market, ticker)
+    if is_swing and ohlcv and len(ohlcv) >= 60 and cp > 0:
+        pos2 = dict(p)
+        pos2["max_p"] = max(float(_to_float(pos2.get("max_p", bp), bp)), cp)
+        reconcile_swing_position(pos2, ohlcv, reference_price=cp)
+        sl = float(
+            get_swing_exit_display_price(
+                cp, pos2, ohlcv, market=market, ticker=ticker
+            )
+        )
+        if sl > 0:
+            return sl
+    if (not is_swing) and ohlcv and len(ohlcv) >= 20 and cp > 0:
+        try:
+            sl = float(get_final_exit_price(ticker, cp, p, ohlcv))
+            if sl > 0:
+                return sl
+        except Exception:
+            pass
+    sl_fb = float(_to_float(p.get("sl_p", 0), 0.0))
+    if sl_fb > 0:
+        return sl_fb
+    return bp * 0.9 if bp > 0 else 0.0
+
+
 def _fmt_price_for_heartbeat(market: str, price: float) -> str:
     p = float(_to_float(price, 0.0))
     if market == "US":
@@ -2422,12 +2573,16 @@ def _format_holding_line(
     source_tag: str = "",
 ) -> str:
     p = pos if isinstance(pos, dict) else {}
+    strat = _heartbeat_strategy_label(p, ticker=ticker, market=market)
+    buy_ref = float(_to_float(buy_p, 0.0))
+    curr_ref = float(_to_float(curr_p, 0.0))
     max_p = float(_to_float(p.get("max_p", 0), 0.0))
     if max_p <= 0:
-        max_p = float(curr_p if float(curr_p) > 0 else buy_p)
-    sl_p = float(_to_float(p.get("sl_p", 0), 0.0))
+        max_p = curr_ref if curr_ref > 0 else buy_ref
+    if curr_ref > 0:
+        max_p = max(max_p, curr_ref)
+    sl_p = _heartbeat_resolve_sl_p(market, ticker, p, buy_ref, curr_ref)
     sl_txt = _fmt_price_for_heartbeat(market, sl_p) if sl_p > 0 else "-"
-    buy_ref = float(_to_float(buy_p, 0.0))
     if buy_ref > 0:
         max_pct = (float(max_p) / buy_ref - 1.0) * 100.0
         max_txt = f"{_fmt_price_for_heartbeat(market, max_p)}({max_pct:+.2f}%)"
@@ -2439,11 +2594,11 @@ def _format_holding_line(
     dur_txt = _holding_duration_clause(p)
     tag_txt = f" {source_tag}" if source_tag else ""
     return (
-        f"  {ticker}({name}): "
-        f"매수가:{_fmt_price_for_heartbeat(market, buy_p)} "
-        f"현재가:{_fmt_price_for_heartbeat(market, curr_p)}({roi:+.2f}%) "
-        f"최고가:{max_txt} "
-        f"매도선:{sl_txt}{dur_txt}{tag_txt}"
+        f"  {ticker}({name}) | 전략:{strat} | "
+        f"매수가 {_fmt_price_for_heartbeat(market, buy_p)} | "
+        f"현재가 {_fmt_price_for_heartbeat(market, curr_p)}({roi:+.2f}%) | "
+        f"최고가 {max_txt} | "
+        f"매도선 {sl_txt}{dur_txt}{tag_txt}"
     )
 
 
@@ -3086,9 +3241,12 @@ def _build_market_context(state: dict) -> tuple[dict, float, str, dict]:
             )
         for mk in ("KR", "US", "COIN"):
             if not _macro_market_buy_allowed(_macro_snap, mk):
+                extra = ""
+                if mk == "US" and is_us_put_call_macro_block(_macro_snap):
+                    extra = " — SWING_FIB는 매수 창에서만 예외 검증"
                 print(
                     f"  🚫 [Phase4 글로벌] {mk} 신규 매수 차단 — "
-                    f"{(_macro_snap.get('market_buy_block_reason') or {}).get(mk, '')}"
+                    f"{(_macro_snap.get('market_buy_block_reason') or {}).get(mk, '')}{extra}"
                 )
     else:
         print(f"  🛡️ [Phase4 거시] 비활성 | {macro_reason}")
@@ -3209,8 +3367,14 @@ def _prefetch_us_sell_ohlcv_if_needed(sell_candidates: list[str]) -> None:
 def _log_us_holdings_debug(held_us: list[str], us_bal: dict) -> None:
     """US 보유 인식 결과 디버그 로그(기존 출력 유지)."""
     print(f"  🔍 [US 잔고 데이터] 인식된 종목 수: {len(held_us)}개 / 리스트: {held_us}")
-    if not held_us and "msg1" in us_bal:
-        print(f"  ⚠️ [US API 메시지] {us_bal.get('msg1')}")
+    if held_us:
+        return
+    bal = us_bal if isinstance(us_bal, dict) else {}
+    rt = str(bal.get("rt_cd", "")).strip()
+    if rt and rt != "0":
+        print(f"  ⚠️ [US API 메시지] {bal.get('msg_cd', '')}: {bal.get('msg1', '')}")
+        return
+    # rt_cd=0 이고 보유 0건 — KIS 정상 응답(예: msg1「조회되었습니다」)은 경고 아님
 
 
 def _get_us_output1(us_bal: dict) -> list[dict]:
@@ -3488,9 +3652,39 @@ def _update_position_current_atr_if_changed(state: dict, ticker: str, pos_info: 
         save_state(STATE_PATH, state)
 
 
-def _calc_hard_stop(pos_info: dict, buy_p: float) -> float:
-    """포지션 하드스탑 계산(기본: 매수가의 90%)."""
-    return float(pos_info.get("sl_p", buy_p * 0.9))
+def _market_from_ticker(ticker: str) -> str:
+    """티커로 KR / US / COIN 구분."""
+    t = str(ticker or "").strip()
+    if is_coin_ticker(t):
+        return "COIN"
+    if t.isdigit():
+        return "KR"
+    return "US"
+
+
+def _calc_hard_stop(
+    pos_info: dict,
+    buy_p: float,
+    *,
+    ohlcv=None,
+    strategy_type: str = "",
+    ticker: str = "",
+) -> float:
+    """포지션 하드스탑 — 스윙: 피보·구름+cap / V8: sl_p·90% 폴백 + -8%·-12% cap."""
+    st = str(strategy_type or pos_info.get("strategy_type") or "TREND_V8").upper()
+    if st == "SWING_FIB":
+        m = _market_from_ticker(ticker)
+        hard = float(
+            get_swing_hard_stop_floor(pos_info, ohlcv, market=m, ticker=ticker)
+        )
+        if hard > 0:
+            return hard
+        return 0.0
+    sl = float(pos_info.get("sl_p", buy_p * 0.9))
+    cap = float(_v8_max_stop_cap_floor(buy_p, ticker=ticker))
+    if cap > 0:
+        sl = max(sl, cap)
+    return sl
 
 
 def _update_position_max_p(state: dict, ticker: str, pos_info: dict, curr_p: float) -> float:
@@ -3505,12 +3699,27 @@ def _update_position_max_p(state: dict, ticker: str, pos_info: dict, curr_p: flo
 
 
 def _resolve_exit_display_price(
-    ticker: str, curr_p: float, pos_info: dict, ohlcv, strategy_type: str
+    ticker: str,
+    curr_p: float,
+    pos_info: dict,
+    ohlcv,
+    strategy_type: str,
+    *,
+    state: dict | None = None,
 ) -> float:
     """V8 샹들리에+콘크리트 또는 SWING_FIB 전용 매도선."""
     st = str(strategy_type or "TREND_V8").upper()
     if st == "SWING_FIB":
-        return float(get_swing_exit_display_price(curr_p, pos_info, ohlcv))
+        if reconcile_swing_position(pos_info, ohlcv, reference_price=float(curr_p)):
+            if state is not None and ticker:
+                state.setdefault("positions", {})[ticker] = pos_info
+                save_state(STATE_PATH, state)
+        m = _market_from_ticker(ticker)
+        return float(
+            get_swing_exit_display_price(
+                curr_p, pos_info, ohlcv, market=m, ticker=ticker
+            )
+        )
     return float(get_final_exit_price(ticker, curr_p, pos_info, ohlcv))
 
 
@@ -3547,33 +3756,26 @@ def _format_swing_exit_log_suffix(
 def _check_swing_trailing_exit(
     curr_p: float, pos_info: dict, ohlcv, state: dict, ticker: str
 ) -> tuple[bool, str]:
-    """스윙 매도선(하드스탑+수익락) 이탈 시 청산."""
-    exit_line = get_swing_exit_display_price(curr_p, pos_info, ohlcv)
+    """스윙 수익 보존 락만 검사. 하드스탑(피보·구름)은 ``check_swing_exit`` FULL 전담."""
+    m = _market_from_ticker(ticker)
+    exit_line = get_swing_exit_display_price(
+        curr_p, pos_info, ohlcv, market=m, ticker=ticker
+    )
     _persist_exit_line_sl_p(state, ticker, pos_info, exit_line)
-    if exit_line > 0 and float(curr_p) <= float(exit_line):
-        buy_p = float(_to_float(pos_info.get("buy_p", curr_p), curr_p))
-        profit = _calc_profit_rate_pct(float(curr_p), buy_p)
-        if profit >= 10.0:
-            reason = f"스윙 수익 보존 락 이탈 (매도선 {exit_line:,.0f})"
-        elif profit >= 0:
-            reason = f"스윙 매도선 이탈 (기준 {exit_line:,.0f})"
-        else:
-            reason = f"스윙 하드스탑 이탈 (매도선 {exit_line:,.0f})"
-        return True, reason
-    return False, ""
+    return check_swing_profit_lock_trailing_exit(curr_p, pos_info, ohlcv=ohlcv)
 
 
-# 타임스탑 (보유 = 달력·연속시간; 주식은 주말 포함 ≈ 영업일 환산 안내용)
-#   V8 주식(KR/US): 10일(240h) + 수익 < +4% 전량 / ≥4% 유예  (≈ 7영업일 + 주말 1~2회)
-#   V8 코인: 3일(72h) + 수익 < +4% 전량 / ≥4% 유예  (휴장 없음)
-#   SWING 주식(KR/US): 14일(336h) + 수익 < +2% 전량 / ≥2% 유예  (≈ 10영업일 + 주말 2회)
-#   SWING 코인: 5일(120h) + 수익 < +2% 전량 / ≥2% 유예  (휴장 없음)
-# (보유시간은 buy_date 우선, 없으면 buy_time — 캘린더 경과시간)
+# 타임스탑 (보유 = 달력·연속시간, 주말·휴장 포함 — 영업일 환산 아님)
+#   V8 주식(KR/US): 240h(10일) + 수익 < +4% 전량 / ≥4% 유예 — 돌파 후 10일 내 미달 시 가짜 돌파 정리
+#   V8 코인: 72h(3일) + 수익 < +4% 전량 / ≥4% 유예 — 코인 3일 횡보 ≈ 주식 장기 횡보
+#   SWING 주식(KR/US): 120h(5일) + 수익 < +2% 전량 / ≥2% 유예 — 5일 내 V반등 없으면 모멘텀 소멸
+#   SWING 코인: 48h(2일) + 수익 < +2% 전량 / ≥2% 유예
+# (보유시간: buy_date 우선, 없으면 buy_time)
 V8_TIME_STOP_HOURS_EQUITY = 10.0 * 24.0
 V8_TIME_STOP_HOURS_COIN = 3.0 * 24.0
 V8_TIME_STOP_EXEMPT_PROFIT_PCT = 4.0
-SWING_TIME_STOP_HOURS_EQUITY = 14.0 * 24.0
-SWING_TIME_STOP_HOURS_COIN = 5.0 * 24.0
+SWING_TIME_STOP_HOURS_EQUITY = 5.0 * 24.0
+SWING_TIME_STOP_HOURS_COIN = 2.0 * 24.0
 SWING_TIME_STOP_EXEMPT_PROFIT_PCT = 2.0
 
 
@@ -3788,9 +3990,17 @@ def run_trading_bot():
                 pos_info = state.get("positions", {}).get(t, pos_info)
                 buy_p = pos_info.get('buy_p', curr_p)
                 max_p = pos_info.get('max_p', curr_p)
-                exit_line = _resolve_exit_display_price(t, curr_p, pos_info, ohlcv, strategy_type)
+                exit_line = _resolve_exit_display_price(
+                    t, curr_p, pos_info, ohlcv, strategy_type, state=state
+                )
                 _persist_exit_line_sl_p(state, t, pos_info, exit_line)
-                hard_stop = _calc_hard_stop(pos_info, float(buy_p))
+                hard_stop = _calc_hard_stop(
+                    pos_info,
+                    float(buy_p),
+                    ohlcv=ohlcv,
+                    strategy_type=strategy_type,
+                    ticker=t,
+                )
                 profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
 
                 # 📊 [상태 로그] 한눈에 보기
@@ -3820,7 +4030,11 @@ def run_trading_bot():
 
                 if strategy_type == "SWING_FIB":
                     sw_action, sw_reason = check_swing_exit(
-                        pos_info, pd.DataFrame(ohlcv), reference_price=float(curr_p)
+                        pos_info,
+                        pd.DataFrame(ohlcv),
+                        reference_price=float(curr_p),
+                        market="KR",
+                        ticker=t,
                     )
                     if sw_action == "HALF":
                         sq = compute_stock_scale_out_qty(int(qty))
@@ -3845,6 +4059,15 @@ def run_trading_bot():
                                 reason=f"[SWING-SELL] {sw_reason}",
                             )
                             print(f"  ✅ [SWING-SELL] {kr_name}({t}) HALF | {sw_reason}")
+                            _telegram_swing_sell(
+                                "KR",
+                                t,
+                                name=kr_name,
+                                half=True,
+                                qty_label=f"{int(sq)}주",
+                                profit_rate=float(profit_rate_now),
+                                reason=sw_reason,
+                            )
                         else:
                             print(f"  ❌ [SWING-SELL] {kr_name}({t}) HALF 실패: {(r_half or {}).get('msg1', '응답 없음')}")
                         continue
@@ -3858,6 +4081,15 @@ def run_trading_bot():
                             p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
                             _record_trade_event("KR", t, "SELL", qty_full, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
                             print(f"  ✅ [SWING-SELL] {kr_name}({t}) FULL | {sw_reason}")
+                            _telegram_swing_sell(
+                                "KR",
+                                t,
+                                name=kr_name,
+                                half=False,
+                                qty_label=f"{qty_full}주",
+                                profit_rate=float(p_full),
+                                reason=sw_reason,
+                            )
                             del state["positions"][t]
                             set_cooldown(state, t)
                             set_ticker_cooldown_after_sell(
@@ -3955,14 +4187,14 @@ def run_trading_bot():
                         f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
                     )
 
-                # 2. 하드스탑 체크 (타임스탑이 발동되지 않았을 때만)
-                if not is_exit and profit_rate_now < 0:
+                # 2. 하드스탑 (SWING_FIB는 check_swing_exit 피보·구름 FULL이 전담)
+                if not is_exit and profit_rate_now < 0 and strategy_type != "SWING_FIB":
                     if curr_p <= hard_stop:
                         is_exit = True
                         reason = "하드스탑 이탈 (손실구간 방어)"
                         print(f"🔴 [하드스탑 발동] {t} - 현재가: {curr_p:,.0f}원 <= 손절가: {hard_stop:,.0f}원. 강제 청산! (is_exit={is_exit})")
 
-                # 3. 수익 구간 트레일링 (스윙: 매도선 이탈 / V8: 샹들리에)
+                # 3. 수익 구간 트레일링 (스윙: 수익 락만 / V8: 샹들리에)
                 if not is_exit and profit_rate_now >= 0:
                     if strategy_type == "SWING_FIB":
                         is_exit, reason = _check_swing_trailing_exit(
@@ -4003,7 +4235,16 @@ def run_trading_bot():
                         stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
                         _record_trade_event("KR", t, "SELL", qty, price=curr_p, profit_rate=profit_rate, reason=reason)
                         print(f"  ✅ [국장 매도 체결] {kr_name}({t}) | 수익률: {profit_rate:+.2f}% | 사유: {reason}")
-                        send_telegram(f"🚨 [국장 추세종료 매도] {t}({kr_name})\n사유: {reason}\n최종 수익률: {profit_rate:.2f}%")
+                        if strategy_type == "SWING_FIB":
+                            send_telegram(
+                                f"🚨 [국장 스윙 청산] {t}({kr_name})\n"
+                                f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
+                            )
+                        else:
+                            send_telegram(
+                                f"🚨 [국장 추세종료 매도] {t}({kr_name})\n"
+                                f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
+                            )
                         del state["positions"][t]
                         set_cooldown(state, t)
                         set_ticker_cooldown_after_sell(
@@ -4354,9 +4595,17 @@ def run_trading_bot():
                 pos_info = state.get("positions", {}).get(t, pos_info)
                 buy_p = pos_info.get('buy_p', curr_p)
                 max_p = pos_info.get('max_p', curr_p)
-                exit_line = _resolve_exit_display_price(t, curr_p, pos_info, ohlcv, strategy_type)
+                exit_line = _resolve_exit_display_price(
+                    t, curr_p, pos_info, ohlcv, strategy_type, state=state
+                )
                 _persist_exit_line_sl_p(state, t, pos_info, exit_line)
-                hard_stop = _calc_hard_stop(pos_info, float(buy_p))
+                hard_stop = _calc_hard_stop(
+                    pos_info,
+                    float(buy_p),
+                    ohlcv=ohlcv,
+                    strategy_type=strategy_type,
+                    ticker=t,
+                )
                 profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
 
                 # 📊 [상태 로그] 한눈에 보기
@@ -4382,7 +4631,11 @@ def run_trading_bot():
 
                 if strategy_type == "SWING_FIB":
                     sw_action, sw_reason = check_swing_exit(
-                        pos_info, pd.DataFrame(ohlcv), reference_price=float(curr_p)
+                        pos_info,
+                        pd.DataFrame(ohlcv),
+                        reference_price=float(curr_p),
+                        market="US",
+                        ticker=t,
                     )
                     if sw_action == "HALF":
                         sq = compute_stock_scale_out_qty(int(float(qty_holding)))
@@ -4408,6 +4661,15 @@ def run_trading_bot():
                                 reason=f"[SWING-SELL] {sw_reason}",
                             )
                             print(f"  ✅ [SWING-SELL] {us_name}({t}) HALF | {sw_reason}")
+                            _telegram_swing_sell(
+                                "US",
+                                t,
+                                name=us_name,
+                                half=True,
+                                qty_label=f"{int(sq)}주",
+                                profit_rate=float(profit_rate_now),
+                                reason=sw_reason,
+                            )
                         else:
                             print(f"  ❌ [SWING-SELL] {us_name}({t}) HALF 실패: {(r_half or {}).get('msg1', '응답 없음')}")
                         continue
@@ -4421,6 +4683,15 @@ def run_trading_bot():
                             p_full = ((float(sp_full) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
                             _record_trade_event("US", t, "SELL", qty_full, price=float(sp_full), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
                             print(f"  ✅ [SWING-SELL] {us_name}({t}) FULL | {sw_reason}")
+                            _telegram_swing_sell(
+                                "US",
+                                t,
+                                name=us_name,
+                                half=False,
+                                qty_label=f"{qty_full}주",
+                                profit_rate=float(p_full),
+                                reason=sw_reason,
+                            )
                             del state["positions"][t]
                             set_cooldown(state, t)
                             set_ticker_cooldown_after_sell(
@@ -4518,15 +4789,15 @@ def run_trading_bot():
                         f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
                     )
 
-                # 🛑 [매도 로직 2] 하드스탑 (손실 구간 방어)
-                if not is_exit and profit_rate_now < 0:
+                # 🛑 [매도 로직 2] 하드스탑 (SWING_FIB는 check_swing_exit 피보·구름 FULL 전담)
+                if not is_exit and profit_rate_now < 0 and strategy_type != "SWING_FIB":
                     print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: ${curr_p:.2f} / 손절가: ${hard_stop:.2f})")
                     if curr_p <= hard_stop:
                         is_exit = True
                         reason = "하드스탑 이탈 (손실구간 방어)"
                         print(f"  🔴 [하드스탑 발동] {t} - 현재가: ${curr_p:.2f} <= 손절가: ${hard_stop:.2f}. 강제 청산!")
 
-                # 🛑 [매도 로직 3] 수익 구간 트레일링 (스윙 매도선 / V8 샹들리에)
+                # 🛑 [매도 로직 3] 수익 구간 트레일링 (스윙: 수익 락만 / V8: 샹들리에)
                 if not is_exit and profit_rate_now >= 0:
                     if strategy_type == "SWING_FIB":
                         is_exit, reason = _check_swing_trailing_exit(
@@ -4572,7 +4843,16 @@ def run_trading_bot():
                         stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
                         _record_trade_event("US", t, "SELL", qty, price=sell_price, profit_rate=profit_rate, reason=reason)
                         print(f"  ✅ [미장 매도 체결] {us_name}({t}) | 수익률: {profit_rate:+.2f}% | 사유: {reason}")
-                        send_telegram(f"🚨 [미장 추세종료 매도] {t}({us_name})\n사유: {reason}\n최종 수익률: {profit_rate:.2f}%")
+                        if strategy_type == "SWING_FIB":
+                            send_telegram(
+                                f"🚨 [미장 스윙 청산] {t}({us_name})\n"
+                                f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
+                            )
+                        else:
+                            send_telegram(
+                                f"🚨 [미장 추세종료 매도] {t}({us_name})\n"
+                                f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
+                            )
                         del state["positions"][t]
                         set_cooldown(state, t)
                         set_ticker_cooldown_after_sell(
@@ -4624,12 +4904,24 @@ def run_trading_bot():
                 )
             else:
                 _cycle_buy_zone_us = True
-                if not _macro_market_buy_allowed(macro_snap, "US"):
+                us_macro_allowed = _macro_market_buy_allowed(macro_snap, "US")
+                us_pcr_swing_bypass = is_us_put_call_macro_block(macro_snap)
+                us_block_reason = str(
+                    (macro_snap.get("market_buy_block_reason") or {}).get("US", "") or ""
+                )
+
+                if not us_macro_allowed and not us_pcr_swing_bypass:
                     print(
                         f"  -> 🚨 미장 Phase4 글로벌 방어막: 신규 매수 중단. "
-                        f"({(macro_snap.get('market_buy_block_reason') or {}).get('US', '')})"
+                        f"({us_block_reason})"
                     )
-                else:
+                elif not us_macro_allowed and us_pcr_swing_bypass:
+                    print(
+                        f"  📌 [US] Phase4 PCR 방어막 — V8 추세 매수 중단, SWING_FIB 후보만 검증 "
+                        f"({us_block_reason})"
+                    )
+
+                if us_macro_allowed or us_pcr_swing_bypass:
                     # 지수 급락 체크
                     us_index_change = get_market_index_change("US")
                     print(f"  📊 [S&P500 지수] 변화율: {us_index_change:+.2f}% 날씨는 {weather['US']}")
@@ -4693,7 +4985,15 @@ def run_trading_bot():
                                     print(
                                         f"  ⏭️ {us_name}({t}): BEAR 시장 — V8 신호 통과했으나 추세 매수 차단 (스윙만 허용)"
                                     )
-                                if v8_ok:
+                                if v8_ok and not macro_buy_allowed_for_strategy(
+                                    macro_snap, "US", "TREND_V8"
+                                ):
+                                    print(
+                                        f"  ⏭️ {us_name}({t}): Phase4 US PCR — V8 추세 매수 차단 (스윙만 허용)"
+                                    )
+                                if v8_ok and macro_buy_allowed_for_strategy(
+                                    macro_snap, "US", "TREND_V8"
+                                ):
                                     print(f"  ✅ [V8-BUY] {us_name}({t}) 진입")
                                 else:
                                     sw_ok, sw_fib, sw_why = check_swing_entry(
@@ -4708,10 +5008,16 @@ def run_trading_bot():
                                         _sw_o = float(ohlcv[-1].get("o", 0) or 0)
                                         _sw_c = float(live_px_us) if live_px_us > 0 else float(ohlcv[-1].get("c", 0) or 0)
                                         _sw_src = "KIS실시간" if live_px_us > 0 else "일봉종가"
+                                        _pcr_note = (
+                                            " | Phase4 PCR 스윙 예외"
+                                            if us_pcr_swing_bypass
+                                            else ""
+                                        )
                                         print(
                                             f"  ✅ [SWING-BUY] {us_name}({t}) entry_fib={entry_fib_level:.2f} "
                                             f"| 양봉({_sw_src} 시가 {_sw_o:.2f} < 종가 {_sw_c:.2f})"
                                             f"{' | BEAR 시장 스윙 예외' if weather['US'] == WEATHER_LABEL_BEAR else ''}"
+                                            f"{_pcr_note}"
                                         )
                                     else:
                                         _prog = f"[{idx}/{total_us}]" if total_us > 0 else ""
@@ -4871,11 +5177,25 @@ def run_trading_bot():
             max_p = pos_info.get('max_p', curr_p)
             profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
             if len(ohlcv) < 20:
-                exit_line = _calc_hard_stop(pos_info, float(buy_p))
+                exit_line = _calc_hard_stop(
+                    pos_info,
+                    float(buy_p),
+                    ohlcv=ohlcv,
+                    strategy_type=strategy_type,
+                    ticker=t,
+                )
             else:
-                exit_line = _resolve_exit_display_price(t, curr_p, pos_info, ohlcv, strategy_type)
+                exit_line = _resolve_exit_display_price(
+                    t, curr_p, pos_info, ohlcv, strategy_type, state=state
+                )
             _persist_exit_line_sl_p(state, t, pos_info, exit_line)
-            hard_stop = _calc_hard_stop(pos_info, float(buy_p))
+            hard_stop = _calc_hard_stop(
+                pos_info,
+                float(buy_p),
+                ohlcv=ohlcv,
+                strategy_type=strategy_type,
+                ticker=t,
+            )
 
             _exit_tag = "스윙" if strategy_type == "SWING_FIB" else "V8"
             _sw_suffix = (
@@ -4908,7 +5228,11 @@ def run_trading_bot():
 
             if strategy_type == "SWING_FIB":
                 sw_action, sw_reason = check_swing_exit(
-                    pos_info, pd.DataFrame(ohlcv), reference_price=float(curr_p)
+                    pos_info,
+                    pd.DataFrame(ohlcv),
+                    reference_price=float(curr_p),
+                    market="COIN",
+                    ticker=t,
                 )
                 if sw_action == "HALF":
                     sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
@@ -4916,12 +5240,14 @@ def run_trading_bot():
                         print(f"  ⏭️ [SWING-SELL] {t} HALF 수량 0 (패스)")
                         continue
                     r_half = coin_broker.sell_market(t, float(sell_q))
-                    if r_half:
+                    if _coin_sell_order_ok(r_half):
                         state.setdefault("positions", {})[t] = post_partial_ledger(
                             pos_info, float(sell_q), float(curr_p), float(qty)
                         )
                         state["positions"][t]["strategy_type"] = "SWING_FIB"
-                        state["positions"][t]["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
+                        state["positions"][t]["entry_fib_level"] = float(
+                            pos_info.get("entry_fib_level", 0.0) or 0.0
+                        )
                         save_state(STATE_PATH, state)
                         _record_trade_event(
                             "COIN",
@@ -4932,16 +5258,56 @@ def run_trading_bot():
                             profit_rate=float(profit_rate_now),
                             reason=f"[SWING-SELL] {sw_reason}",
                         )
-                        print(f"  ✅ [SWING-SELL] {t} HALF | {sw_reason}")
+                        coin_nm = get_coin_name(t)
+                        print(f"  ✅ [SWING-SELL] {t}({coin_nm}) HALF | {sw_reason}")
+                        _qty_lbl = (
+                            f"{float(sell_q):.8f}".rstrip("0").rstrip(".")
+                            + (" USDT" if coin_config.is_binance() else "")
+                        )
+                        _telegram_swing_sell(
+                            "COIN",
+                            t,
+                            name=coin_nm,
+                            half=True,
+                            qty_label=_qty_lbl,
+                            profit_rate=float(profit_rate_now),
+                            reason=sw_reason,
+                        )
                     else:
                         print(f"  ❌ [SWING-SELL] {t} HALF 실패: 거래소 응답 없음")
                     continue
                 if sw_action == "FULL":
                     r_full = coin_broker.sell_market(t, qty)
-                    if r_full:
-                        p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
-                        _record_trade_event("COIN", t, "SELL", qty, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
-                        print(f"  ✅ [SWING-SELL] {t} FULL | {sw_reason}")
+                    if _coin_sell_order_ok(r_full):
+                        p_full = (
+                            (float(curr_p) - float(buy_p)) / float(buy_p) * 100
+                            if float(buy_p) > 0
+                            else 0.0
+                        )
+                        _record_trade_event(
+                            "COIN",
+                            t,
+                            "SELL",
+                            qty,
+                            price=float(curr_p),
+                            profit_rate=float(p_full),
+                            reason=f"[SWING-SELL] {sw_reason}",
+                        )
+                        coin_nm = get_coin_name(t)
+                        print(f"  ✅ [SWING-SELL] {t}({coin_nm}) FULL | {sw_reason}")
+                        _qty_lbl = (
+                            f"{float(qty):.8f}".rstrip("0").rstrip(".")
+                            + (" USDT" if coin_config.is_binance() else "")
+                        )
+                        _telegram_swing_sell(
+                            "COIN",
+                            t,
+                            name=coin_nm,
+                            half=False,
+                            qty_label=_qty_lbl,
+                            profit_rate=float(p_full),
+                            reason=sw_reason,
+                        )
                         del state["positions"][t]
                         set_cooldown(state, t)
                         set_ticker_cooldown_after_sell(
@@ -4989,7 +5355,7 @@ def run_trading_bot():
                         chunks = plan_coin_sell_chunks(float(sell_q), float(curr_p), threshold_krw=float(tw_th))
 
                         def _coin_so_vol(vv: float) -> bool:
-                            return bool(coin_broker.sell_market(t, float(vv)))
+                            return _coin_sell_order_ok(coin_broker.sell_market(t, float(vv)))
 
                         ok_so = run_coin_scale_out_chunks(chunks, _coin_so_vol, TWAP_SLICE_DELAY_SEC)
                         if ok_so:
@@ -5038,14 +5404,14 @@ def run_trading_bot():
                     f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
                 )
 
-            # 2. 하드스탑 체크 (타임스탑이 발동되지 않았을 때만)
-            if not is_exit and profit_rate_now < 0:
+            # 2. 하드스탑 (SWING_FIB는 check_swing_exit 피보·구름 FULL 전담)
+            if not is_exit and profit_rate_now < 0 and strategy_type != "SWING_FIB":
                 if curr_p <= hard_stop:
                     is_exit = True
                     reason = "하드스탑 이탈 (손실구간 방어)"
                     print(f"🔴 [하드스탑 발동] {t} - 현재가: {curr_p:,.0f}원 <= 손절가: {hard_stop:,.0f}원. 강제 청산! (is_exit={is_exit})")
 
-            # 3. 수익 구간 트레일링 (스윙 매도선 / V8 샹들리에)
+            # 3. 수익 구간 트레일링 (스윙: 수익 락만 / V8: 샹들리에)
             if not is_exit and profit_rate_now >= 0:
                 if strategy_type == "SWING_FIB" and len(ohlcv) >= 20:
                     is_exit, reason = _check_swing_trailing_exit(
@@ -5065,7 +5431,7 @@ def run_trading_bot():
                 # 1. 매도 주문 실행 루프
                 while retry_count < max_retries:
                     resp = coin_broker.sell_market(t, qty)
-                    if resp:
+                    if _coin_sell_order_ok(resp):
                         break # 성공 시 while 루프 즉시 탈출 (정상)
                     
                     retry_count += 1
@@ -5074,7 +5440,7 @@ def run_trading_bot():
                         time.sleep(0.5) # API 호출 제한(Rate Limit) 방지를 위해 약간 대기
 
                 # 2. 루프 종료 후, 매도 성공 여부에 따라 장부 기록
-                if resp: # 매도가 성공적으로 체결되었다면
+                if _coin_sell_order_ok(resp): # 매도가 성공적으로 체결되었다면
                     profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                     stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                     
@@ -5089,7 +5455,16 @@ def run_trading_bot():
                     
                     coin_name = get_coin_name(t)
                     print(f"  ✅ [코인 매도 체결] {t}({coin_name}) | 수익률: {profit_rate:+.2f}% | 사유: {reason}")
-                    send_telegram(f"🚨 [코인 추세종료 매도] {t}({coin_name})\n사유: {reason}\n최종 수익률: {profit_rate:.2f}%")
+                    if strategy_type == "SWING_FIB":
+                        send_telegram(
+                            f"🚨 [코인 스윙 청산] {t}({coin_name})\n"
+                            f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
+                        )
+                    else:
+                        send_telegram(
+                            f"🚨 [코인 추세종료 매도] {t}({coin_name})\n"
+                            f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
+                        )
                     # 장부 업데이트 및 저장
                     del state["positions"][t]
                     set_cooldown(state, t)
