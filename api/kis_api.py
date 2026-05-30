@@ -327,6 +327,112 @@ def get_kis_ohlcv(broker, code, timeframe='D', count=60):
         return []
 
 
+def get_ohlcv_kis_us_daily(broker, ticker: str, exchange: str | None = None) -> list:
+    """
+    해외 주식 일별 시세 → OHLCV 리스트 (최대 약 100거래일/호출, 200봉은 역순 페이징).
+
+    ``exchange``: NAS(나스닥), NYS(뉴욕), AMS(아멕스). None이면 NAS→NYS→AMS 순 시도.
+    """
+    if not broker or not str(ticker or "").strip():
+        return []
+    sym = str(ticker).strip().upper()
+    excds = [exchange] if exchange else ["NAS", "NYS", "AMS"]
+    clean_token = str(getattr(broker, "access_token", "") or "").replace("Bearer ", "").strip()
+    base_url = getattr(broker, "base_url", "https://openapi.koreainvestment.com:9443")
+    is_mock = "vps" in str(base_url) or "vts" in str(base_url)
+    tr_id = "VHFSTEPT10000" if is_mock else "HHDFS76240000"
+    url = f"{base_url}/uapi/overseas-price/v1/quotations/dailyprice"
+
+    all_rows: list[dict] = []
+    bymd = datetime.now().strftime("%Y%m%d")
+
+    for excd in excds:
+        if not excd:
+            continue
+        rows_acc: list[dict] = []
+        cursor = bymd
+        for _page in range(4):
+            headers = {
+                "content-type": "application/json",
+                "authorization": f"Bearer {clean_token}",
+                "appkey": getattr(broker, "api_key", ""),
+                "appsecret": getattr(broker, "api_secret", ""),
+                "tr_id": tr_id,
+                "custtype": "P",
+            }
+            params = {
+                "AUTH": "",
+                "EXCD": str(excd),
+                "SYMB": sym,
+                "GUBN": "0",
+                "BYMD": cursor,
+                "MODP": "0",
+            }
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=12)
+                data = res.json() if res is not None else {}
+            except Exception:
+                break
+            if str(data.get("rt_cd", "")) != "0":
+                break
+            chunk = data.get("output2") or data.get("output") or []
+            if not isinstance(chunk, list) or not chunk:
+                break
+            page_rows = []
+            for item in chunk:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    c = float(
+                        item.get("clos")
+                        or item.get("close")
+                        or item.get("stck_clpr")
+                        or item.get("ovrs_nmix_prpr")
+                        or 0
+                    )
+                    if c <= 0:
+                        continue
+                    page_rows.append(
+                        {
+                            "o": float(item.get("open") or item.get("stck_oprc") or c),
+                            "h": float(item.get("high") or item.get("stck_hgpr") or c),
+                            "l": float(item.get("low") or item.get("stck_lwpr") or c),
+                            "c": c,
+                            "v": float(item.get("tvol") or item.get("acml_vol") or item.get("volume") or 0),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    continue
+            if not page_rows:
+                break
+            rows_acc = page_rows + rows_acc
+            if len(rows_acc) >= 200:
+                break
+            oldest = chunk[-1] if chunk else {}
+            d_raw = str(
+                oldest.get("xymd")
+                or oldest.get("stck_bsop_date")
+                or oldest.get("date")
+                or ""
+            ).strip()
+            if len(d_raw) < 8 or not d_raw[:8].isdigit():
+                break
+            try:
+                from datetime import datetime as _dt
+
+                od = _dt.strptime(d_raw[:8], "%Y%m%d")
+                cursor = (od - timedelta(days=1)).strftime("%Y%m%d")
+            except ValueError:
+                break
+        if len(rows_acc) >= 14:
+            all_rows = rows_acc
+            if len(all_rows) > 260:
+                all_rows = all_rows[-260:]
+            print(f"     ✅ [{sym}] KIS 해외 일봉 {len(all_rows)}봉 (EXCD={excd})")
+            return all_rows
+    return []
+
+
 def get_real_us_positions(broker):
     """[불필요한 토큰 발급 제거] 모지토 기본 토큰 정제기"""
     clean_token = broker.access_token.replace("Bearer ", "").strip()

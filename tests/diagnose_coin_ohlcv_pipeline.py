@@ -109,7 +109,7 @@ def main() -> int:
         from api import binance_api as _bna
 
         try:
-            tops = _bna.top_usdt_symbols_by_quote_volume(int(cfg.get("binance_universe_top", 50) or 50))
+            tops = _bna.top_usdt_symbols_by_quote_volume(int(cfg.get("binance_universe_top", 10) or 10))
         except Exception as e:
             tops = []
             print(f"⚠️ top_usdt_symbols_by_quote_volume 실패: {e}")

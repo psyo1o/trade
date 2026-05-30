@@ -218,6 +218,13 @@ class _TelegramAlertHandler(logging.Handler):
             return
         if self._suppress_routine_alert(msg):
             return
+        try:
+            from utils.yfinance_guard import is_yahoo_noise_line
+
+            if is_yahoo_noise_line(msg):
+                return
+        except Exception:
+            pass
         with self._lock:
             if not self._is_alert(record, msg):
                 return

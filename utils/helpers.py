@@ -220,12 +220,16 @@ def get_us_company_name(ticker):
         return _us_name_cache[ticker]
 
     try:
-        info = yf.Ticker(ticker).info
-        name = info.get('longName', ticker)
-        _us_name_cache[ticker] = name  # 찾은 이름은 뇌에 저장
-        return name
-    except:
-        return ticker
+        from utils.yfinance_guard import yf_call
+
+        info = yf_call(lambda: yf.Ticker(ticker).info, label="us_name", ticker=ticker)
+        if isinstance(info, dict):
+            name = info.get("longName", ticker)
+            _us_name_cache[ticker] = name
+            return name
+    except Exception:
+        pass
+    return ticker
 
 
 def get_kr_company_name(code):

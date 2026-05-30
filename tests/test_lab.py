@@ -53,7 +53,12 @@ if str(_BOT_ROOT) not in sys.path:
 
 import yfinance as yf
 
-from strategy.macro_guard import evaluate_market_macro_buy_permission, get_macro_guard_snapshot
+from strategy.macro_guard import (
+    evaluate_market_macro_buy_permission,
+    get_macro_guard_snapshot,
+    is_us_put_call_macro_block,
+    macro_buy_allowed_for_strategy,
+)
 
 from execution.circuit_break import evaluate_total_account_circuit, estimate_usdkrw
 from execution.guard import (
@@ -913,6 +918,22 @@ def run_phase4_macro_guard_lab() -> None:
             f"    {name:18s} | {mk} allowed={d.get('allowed')} "
             f"({'OK' if ok else 'FAIL'}) | {d.get('reason')}"
         )
+
+    print("\n  --- US PCR 차단 시 V8·SWING 동일 차단 (Mock 스냅샷) ---")
+    pcr_snap = {
+        "enabled": True,
+        "market_buy_allowed": {"KR": True, "US": False, "COIN": True},
+        "market_buy_block_reason": {
+            "US": "SPY Put/Call 1.250 >= 1.2",
+            "KR": "",
+            "COIN": "",
+        },
+    }
+    assert is_us_put_call_macro_block(pcr_snap)
+    assert not macro_buy_allowed_for_strategy(pcr_snap, "US", "TREND_V8")
+    assert not macro_buy_allowed_for_strategy(pcr_snap, "US", "SWING_FIB")
+    assert not macro_buy_allowed_for_strategy(pcr_snap, "KR", "SWING_FIB")
+    print("    US_PCR_NO_SWING_BYPASS | V8·SWING US=False (OK)")
 
 
 def evaluate_account_killswitch(

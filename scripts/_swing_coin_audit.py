@@ -13,7 +13,8 @@ from api import coin_broker, coin_config
 from strategy.rules import (
     check_swing_exit,
     get_swing_exit_display_price,
-    get_swing_half_target_price,
+    get_swing_scale_out_target_price,
+    SWING_SCALE_OUT_R_MULT,
     get_swing_hard_stop_floor,
     get_swing_profit_lock_floor,
     reconcile_swing_position,
@@ -45,7 +46,7 @@ for t, pos in coins.items():
     hard = get_swing_hard_stop_floor(pos2, ohlcv)
     lock = get_swing_profit_lock_floor(buy, max_p)
     exit_line = get_swing_exit_display_price(curr, pos2, ohlcv)
-    half = get_swing_half_target_price(pos2, ohlcv)
+    half = get_swing_scale_out_target_price(pos2)
     action, reason = check_swing_exit(pos2, pd.DataFrame(ohlcv), reference_price=curr)
 
     profit = (curr - buy) / buy * 100 if buy else 0

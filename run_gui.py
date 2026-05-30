@@ -73,6 +73,9 @@ from run_bot import (
     get_us_positions_with_retry,
     refresh_brokers_if_needed,
     _to_float,
+    _holding_duration_human,
+    build_holding_display_bundle,
+    resolve_holding_display_price,
 )
 from execution.guard import load_state, save_state
 from strategy.rules import (
@@ -171,6 +174,50 @@ def _dashboard_strategy_short(pos_info: dict) -> str:
     if st == "SWING_FIB" or tier in ("SWING_FIB", "SWING") or "SWING" in tier:
         return "스윙"
     return "V8"
+
+
+def _gui_market_code_from_label(market_label: str) -> str:
+    s = str(market_label or "")
+    if "국장" in s:
+        return "KR"
+    if "미장" in s:
+        return "US"
+    if "코인" in s:
+        return "COIN"
+    return "KR"
+
+
+def _build_strategy_guide_text() -> str:
+    """GUI 안내 탭: 타임스탑·매도선 계산 요약."""
+    v8_eq = float(getattr(run_bot, "V8_TIME_STOP_HOURS_EQUITY", 72.0))
+    v8_coin = float(getattr(run_bot, "V8_TIME_STOP_HOURS_COIN", 48.0))
+    sw_eq = float(getattr(run_bot, "SWING_TIME_STOP_HOURS_EQUITY", 48.0))
+    sw_coin = float(getattr(run_bot, "SWING_TIME_STOP_HOURS_COIN", 24.0))
+    v8_ex = float(getattr(run_bot, "V8_TIME_STOP_EXEMPT_PROFIT_PCT", 4.0))
+    sw_ex = float(getattr(run_bot, "SWING_TIME_STOP_EXEMPT_PROFIT_PCT", 2.0))
+    sw_r = float(getattr(run_bot, "SWING_SCALE_OUT_R_MULT", 1.5))
+    return (
+        "📘 타임스탑·매도선 계산 요약\n"
+        "============================\n\n"
+        "1) 타임스탑 (run_bot.py)\n"
+        "- KR/US: 휴장일(주말·공휴일) Pause, 거래일은 장외 포함 연속 누적\n"
+        "- COIN: 24/7 연속 시간\n"
+        f"- V8: 주식 {v8_eq:.0f}h / 코인 {v8_coin:.0f}h, 유예 +{v8_ex:.1f}%\n"
+        f"- 스윙: 주식 {sw_eq:.0f}h / 코인 {sw_coin:.0f}h, 유예 +{sw_ex:.1f}%\n"
+        "- 발동 시 reason 태그: [V8_TIME_STOP_*] / [SWING_TIME_STOP_*]\n"
+        "- 전량 청산 후 ticker_cooldowns 24h 적용\n\n"
+        "2) 매도선 (strategy/rules.py + run_bot.py)\n"
+        "- V8: get_final_exit_price (샹들리에 + 기술선 + 본절락)\n"
+        "- 스윙: get_swing_exit_display_price (피보 + 일목 + 시간가중)\n"
+        f"- 스윙 1차 익절(HALF): {sw_r:.1f}R\n"
+        "- 매도선은 매 사이클(15분)마다 재계산 후 sl_p 갱신\n"
+        "- 텔레그램 형식 보유 한 줄: GUI 로그는 30분 생존신고 시에만 출력\n"
+        "- OHLCV 200봉: 국 KIS→pykrx→yfinance / 미 KIS해외→yfinance\n"
+        "- data/ohlcv_cache 디스크(3일), yfinance 401 시 전역 차단 없음\n\n"
+        "3) 현재 탭 용도\n"
+        "- 실시간 현황: 현재가/보유수량/전략 중심 (즉시 의사결정)\n"
+        "- 장부: 최고가/매도선/보유시간 포함 (기록·리스크 점검)\n"
+    )
 
 
 def _table_cell(text) -> QTableWidgetItem:
@@ -397,11 +444,11 @@ def _configure_holding_table(table: QTableWidget) -> None:
     hdr = table.horizontalHeader()
     hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
     hdr.setSectionResizeMode(1, QHeaderView.Interactive)
-    for col in (2, 3, 4, 5, 6):
+    for col in (2, 3, 4, 5):
         hdr.setSectionResizeMode(col, QHeaderView.Stretch)
-    hdr.setSectionResizeMode(7, QHeaderView.Interactive)
+    hdr.setSectionResizeMode(6, QHeaderView.Interactive)
     table.setColumnWidth(1, 200)
-    table.setColumnWidth(7, 300)
+    table.setColumnWidth(6, 300)
 
 
 def _balance_holding_table_columns(table: QTableWidget) -> None:
@@ -780,6 +827,7 @@ class BalanceUpdaterThread(QThread):
             "strategy": _dashboard_strategy_short(pos),
             "m_code": market_code,
             "t_code": ledger_key or str(ticker_code).strip().upper(),
+            "pos_info": pos,
         }
 
 
@@ -1055,16 +1103,15 @@ class BotDashboard(QMainWindow):
         dashboard_tab = QWidget()
         dashboard_layout = QVBoxLayout(dashboard_tab)
         
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 7)
         self.table.setAlternatingRowColors(True)
         self.table.setHorizontalHeaderLabels(
             [
                 "시장",
                 "종목명(코드)",
                 "보유수량",
-                "매수단가",
+                "매수가",
                 "현재가",
-                "수익률",
                 "전략",
                 "수량·수동매도",
             ]
@@ -1099,13 +1146,28 @@ class BotDashboard(QMainWindow):
         
         self.ledger_table = QTableWidget(0, 9)
         self.ledger_table.setAlternatingRowColors(True)
-        self.ledger_table.setHorizontalHeaderLabels(["시장", "종목명(코드)", "매수가", "손절가", "수익률", "최고가", "수량", "매수시간", "전략"])
+        self.ledger_table.setHorizontalHeaderLabels(
+            ["시장", "종목명(코드)", "매수가", "현재가", "최고가", "매도선", "수량", "매수·보유기간", "전략"]
+        )
         _configure_data_table(self.ledger_table, stretch_cols=(1, 8))
         ledger_layout.addWidget(self.ledger_table)
         
         tabs.addTab(ledger_tab, "장부 (현재 포지션)")
 
-        # 4. 합산 고점 보정 (adjust_capital.py와 동일 로직)
+        # 4. 전략 계산 안내 (타임스탑·매도선)
+        guide_tab = QWidget()
+        guide_layout = QVBoxLayout(guide_tab)
+        guide_title = QLabel("📘 전략 계산 안내")
+        guide_title.setObjectName("SectionTitle")
+        self.guide_console = QTextEdit()
+        self.guide_console.setReadOnly(True)
+        self.guide_console.setObjectName("LogConsole")
+        self.guide_console.setText(_build_strategy_guide_text())
+        guide_layout.addWidget(guide_title)
+        guide_layout.addWidget(self.guide_console, 1)
+        tabs.addTab(guide_tab, "전략 계산 안내")
+
+        # 5. 합산 고점 보정 (adjust_capital.py와 동일 로직)
         capital_tab = QWidget()
         capital_layout = QVBoxLayout(capital_tab)
         capital_help = QLabel(
@@ -1387,7 +1449,7 @@ class BotDashboard(QMainWindow):
         state = load_state(STATE_PATH)
         positions = state.get("positions", {})
         live_qty_by_key = _build_live_qty_lookup()
-        
+
         for ticker, pos_info in positions.items():
             if not ticker or not isinstance(pos_info, dict):
                 continue
@@ -1467,73 +1529,59 @@ class BotDashboard(QMainWindow):
                 except Exception:
                     pass
             
-            # 장부 수익률: 매수가 대비 기록된 최고가(max_p). 실시간 보유 표·상단 ROI는 현재가 기준.
-            if buy_p > 0:
-                peak_p = max_p if max_p > 0 else buy_p
-                profit_rate = ((peak_p - buy_p) / buy_p) * 100
-            else:
-                profit_rate = 0.0
-            
             strategy_label = _position_strategy_label(pos_info)
             buy_time = pos_info.get('buy_time', '')
             row_key = _ledger_row_key(ticker)
             qty_val = float(_to_float(live_qty_by_key.get(row_key), _to_float(pos_info.get("qty"), 0.0)))
             qty_text = _format_position_qty_for_table(market, qty_val)
-            
-            # 테이블에 행 추가
+
+            m_led = (
+                "KR"
+                if market == "🇰🇷 국장"
+                else ("US" if market == "🇺🇸 미장" else "COIN")
+            )
+            curr_p = float(
+                resolve_holding_display_price(m_led, ticker, buy_p, None, pos_info)
+            )
+            roi_led = (
+                ((curr_p - buy_p) / buy_p) * 100.0 if buy_p > 0 and curr_p > 0 else 0.0
+            )
+            bundle = build_holding_display_bundle(
+                m_led, ticker, name, buy_p, curr_p, pos_info, roi_pct=roi_led
+            )
+
             self.ledger_table.setItem(row, 0, _table_cell(market))
             self.ledger_table.setItem(row, 1, _table_cell(f"{name} ({ticker})"))
-            
-            # 가격 표시 (시장별 포맷)
-            if market == "🇺🇸 미장":
-                buy_p_str = f"${buy_p:.2f}"
-                sl_p_str = f"${sl_p:.2f}"
-                max_p_str = f"${max_p:.2f}"
-            elif market == "🪙 코인":
-                try:
-                    from api import coin_config as _cc_led
-
-                    _led_usdt = _cc_led.is_binance()
-                except Exception:
-                    _led_usdt = False
-                if _led_usdt:
-                    buy_p_str = _gui_coin_unit_price_str(buy_p)
-                    sl_p_str = _gui_coin_unit_price_str(sl_p)
-                    max_p_str = _gui_coin_unit_price_str(max_p)
-                else:
-                    buy_p_str = f"{buy_p:,.4f}원" if buy_p < 100 else f"{int(buy_p):,}원"
-                    sl_p_str = f"{sl_p:,.4f}원" if sl_p < 100 else f"{int(sl_p):,}원"
-                    max_p_str = f"{max_p:,.4f}원" if max_p < 100 else f"{int(max_p):,}원"
-            else: # 국장
-                buy_p_str = f"{int(buy_p):,}원"
-                sl_p_str = f"{int(sl_p):,}원"
-                max_p_str = f"{int(max_p):,}원"
-            
-            self.ledger_table.setItem(row, 2, _table_cell(buy_p_str))
-            self.ledger_table.setItem(row, 3, _table_cell(sl_p_str))
-            self.ledger_table.setItem(row, 4, _table_cell(f"{profit_rate:+.2f}%"))
-            self.ledger_table.setItem(row, 5, _table_cell(max_p_str))
+            self.ledger_table.setItem(row, 2, _table_cell(bundle["buy_txt"]))
+            self.ledger_table.setItem(row, 3, _table_cell(bundle["curr_txt"]))
+            self.ledger_table.setItem(row, 4, _table_cell(bundle["max_txt"]))
+            self.ledger_table.setItem(row, 5, _table_cell(bundle["sl_txt"]))
             self.ledger_table.setItem(row, 6, _table_cell(qty_text))
-            
-            # 매수시간 포맷 (buy_date 우선 사용)
-            buy_date_str = pos_info.get('buy_date', '')
+            # 매수 시각 + 보유시간 (타임스탑과 동일 — KR/US 영업·COIN 연속, N.Nh)
+            buy_date_str = pos_info.get("buy_date", "")
             if buy_date_str:
                 try:
-                    # ISO 형식 문자열을 파싱하여 포맷팅
                     buy_datetime_obj = datetime.fromisoformat(buy_date_str)
                     buy_time_display_str = buy_datetime_obj.strftime("%Y-%m-%d %H:%M")
                 except ValueError:
-                    # 파싱 실패 시 원본 문자열 사용
-                    buy_time_display_str = buy_date_str[:16] # "YYYY-MM-DDTHH:MM"에서 T 이후를 자름
+                    buy_time_display_str = buy_date_str[:16]
             else:
-                # buy_date가 없을 경우 buy_time (timestamp) 사용
                 try:
                     if isinstance(buy_time, (int, float)):
-                        buy_time_display_str = datetime.fromtimestamp(buy_time).strftime("%Y-%m-%d %H:%M")
+                        buy_time_display_str = datetime.fromtimestamp(buy_time).strftime(
+                            "%Y-%m-%d %H:%M"
+                        )
                     else:
                         buy_time_display_str = str(buy_time)[:16]
-                except:
+                except Exception:
                     buy_time_display_str = ""
+            dur_led = _holding_duration_human(pos_info, m_led)
+            if dur_led:
+                buy_time_display_str = (
+                    f"{buy_time_display_str}\n{dur_led}"
+                    if buy_time_display_str
+                    else dur_led
+                )
             self.ledger_table.setItem(row, 7, _table_cell(buy_time_display_str))
             self.ledger_table.setItem(row, 8, _table_cell(strategy_label))
 
@@ -1541,6 +1589,18 @@ class BotDashboard(QMainWindow):
         blob = (text or "").replace("\r", "").rstrip()
         if not blob:
             return
+        try:
+            from utils.yfinance_guard import is_yahoo_noise_line
+
+            filtered = [
+                ln for ln in blob.splitlines()
+                if ln.strip() and not is_yahoo_noise_line(ln)
+            ]
+            if not filtered:
+                return
+            blob = "\n".join(filtered)
+        except Exception:
+            pass
         lg = get_quant_logger()
         if lg:
             try:
@@ -1680,42 +1740,24 @@ class BotDashboard(QMainWindow):
         for d in rows_data:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            
-            # 종목명 포맷팅
+
             name_text, code_text = str(d['name']).strip(), str(d['t_code']).strip()
-            display_name = f"{name_text}({code_text})" if name_text and code_text and name_text != code_text else (code_text or name_text)
-            
-            try:
-                from api import coin_config as _cc_tbl
-
-                _coin_usdt = _cc_tbl.is_binance()
-            except Exception:
-                _coin_usdt = False
-
-            # 매수단가 포맷팅
-            if d['market'] == "🇰🇷 국장":
-                price_str = f"{int(d['buy_p_float']):,}원"
-            elif d['market'] == "🇺🇸 미장":
-                price_str = f"${d['buy_p_float']:,.2f}"
-            elif d['market'] == "🪙 코인" and _coin_usdt:
-                price_str = _gui_coin_unit_price_str(d['buy_p_float'])
-            else:
-                price_str = f"{d['buy_p_float']:,.4f}원" if d['buy_p_float'] < 100 else f"{int(d['buy_p_float']):,}원"
-
-            # 현재가 포맷팅
-            if d['market'] == "🇰🇷 국장":
-                curr_str = f"{int(d['current_price']):,}원"
-            elif d['market'] == "🇺🇸 미장":
-                curr_str = f"${d['current_price']:.2f}"
-            elif d['market'] == "🪙 코인" and _coin_usdt:
-                curr_str = _gui_coin_unit_price_str(d['current_price'])
-            else:
-                curr_str = (
-                    f"{d['current_price']:,.4f}원"
-                    if d['current_price'] < 100
-                    else f"{int(d['current_price']):,}원"
-                )
-
+            display_name = (
+                f"{name_text}({code_text})"
+                if name_text and code_text and name_text != code_text
+                else (code_text or name_text)
+            )
+            m_code = str(d.get("m_code") or _gui_market_code_from_label(d["market"]))
+            pos_info = d.get("pos_info") if isinstance(d.get("pos_info"), dict) else {}
+            bundle = build_holding_display_bundle(
+                m_code,
+                code_text,
+                name_text,
+                float(d["buy_p_float"]),
+                float(d["current_price"]),
+                pos_info,
+                roi_pct=float(d["roi"]),
+            )
             self.table.setItem(row, 0, _table_cell(d['market']))
             self.table.setItem(row, 1, _table_cell(display_name))
             self.table.setItem(
@@ -1723,10 +1765,12 @@ class BotDashboard(QMainWindow):
                 2,
                 _table_cell(_format_position_qty_for_table(d["market"], float(_to_float(d["qty"], 0.0)))),
             )
-            self.table.setItem(row, 3, _table_cell(price_str))
-            self.table.setItem(row, 4, _table_cell(curr_str))
-            self.table.setItem(row, 5, _table_cell(f"{d['roi']:+.2f}%"))
-            self.table.setItem(row, 6, _table_cell(str(d.get("strategy", "V8"))))
+            qty_item = self.table.item(row, 2)
+            if qty_item is not None:
+                qty_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 3, _table_cell(bundle["buy_txt"]))
+            self.table.setItem(row, 4, _table_cell(bundle["curr_txt"]))
+            self.table.setItem(row, 5, _table_cell(str(d.get("strategy", "V8"))))
 
             cell = QWidget()
             row_lay = QHBoxLayout(cell)
@@ -1747,7 +1791,7 @@ class BotDashboard(QMainWindow):
             sell_btn.clicked.connect(
                 lambda _checked=False, rp=row_copy, ed=qty_edit: self._on_manual_sell_click(rp, ed)
             )
-            self.table.setCellWidget(row, 7, cell)
+            self.table.setCellWidget(row, 6, cell)
 
         _balance_holding_table_columns(self.table)
 

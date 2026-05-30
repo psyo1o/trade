@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Phase 2 보조 — 상대강도(RS) 정렬·변동성 타겟 비중."""
+"""Phase 2 보조 — 상대강도(RS) 정렬·변동성 타겟 비중·포트폴리오 Heat."""
 from __future__ import annotations
 
 from typing import Callable, Sequence
+
+from strategy.indicators import get_safe_atr
 
 
 def _pct_return_last_n(ohlcv: Sequence[dict], n: int = 10) -> float | None:
@@ -73,3 +75,78 @@ def volatility_target_ratio(
         return br
     vol_ratio = float(target_vol) / atr_pct
     return min(br, vol_ratio)
+
+
+def atr_pct_from_ohlcv(ohlcv: Sequence[dict], ticker: str = "") -> float:
+    """종가 대비 ATR% (소수). 산출 불가 시 0."""
+    if not ohlcv:
+        return 0.0
+    try:
+        atr_val = float(get_safe_atr(ticker, ohlcv) or 0.0)
+        close_px = float(ohlcv[-1].get("c", 0) or 0.0)
+    except (TypeError, ValueError, IndexError, KeyError):
+        return 0.0
+    if atr_val <= 0 or close_px <= 0:
+        return 0.0
+    return atr_val / close_px
+
+
+def position_heat_contribution(weight_ratio: float, atr_pct: float) -> float:
+    """단일 종목 Heat = 배분 비중 × ATR%."""
+    w = float(weight_ratio)
+    a = float(atr_pct)
+    if w <= 0 or a <= 0:
+        return 0.0
+    return w * a
+
+
+def compute_market_portfolio_heat(
+    positions: dict,
+    market: str,
+    market_equity: float,
+    *,
+    resolve_market: Callable[[str], str],
+    position_qty: Callable[[str, dict], float],
+    fetch_ohlcv: Callable[[str], list],
+    extra_weight: float = 0.0,
+    extra_atr_pct: float = 0.0,
+) -> float:
+    """
+    시장별 Portfolio Heat = Σ (종목 비중 × ATR%).
+
+    ``extra_weight`` × ``extra_atr_pct`` — 신규 매수 1건 가산(사전 검증용).
+    """
+    eq = float(market_equity)
+    if eq <= 0:
+        return 0.0
+    m = str(market or "").strip().upper()
+    total = 0.0
+    if not isinstance(positions, dict):
+        positions = {}
+    for ticker, pos in positions.items():
+        if not isinstance(pos, dict):
+            continue
+        if resolve_market(str(ticker)) != m:
+            continue
+        try:
+            buy_p = float(pos.get("buy_p", 0) or pos.get("avg_price", 0) or 0)
+            qty = float(position_qty(str(ticker), pos) or 0)
+        except (TypeError, ValueError):
+            continue
+        if buy_p <= 0 or qty <= 0:
+            continue
+        weight = (buy_p * qty) / eq
+        ohlcv = fetch_ohlcv(str(ticker)) or []
+        ap = atr_pct_from_ohlcv(ohlcv, str(ticker))
+        total += position_heat_contribution(weight, ap)
+    if extra_weight > 0 and extra_atr_pct > 0:
+        total += position_heat_contribution(extra_weight, extra_atr_pct)
+    return float(total)
+
+
+def portfolio_heat_blocks_entry(
+    heat_pct: float,
+    max_heat_pct: float,
+) -> bool:
+    """Heat가 임계 이상이면 신규 매수 차단."""
+    return float(heat_pct) >= float(max_heat_pct)

@@ -6,10 +6,11 @@ Phase 4 — 거시 방어막 (시장별 글로벌 알파).
 ``run_bot`` 은 매 사이클 ``get_macro_guard_snapshot(config)`` 로 스냅샷을 받는다.
 
 규칙(기본)
-    * **US** — ``us_put_call_ratio`` >= 1.2 → US 시장 V8(TREND_V8) 신규 매수 차단
-      (``SWING_FIB`` 스윙은 ``macro_buy_allowed_for_strategy`` 로 PCR 시에만 예외 허용)
-    * **COIN** — ``coin_whale_long_short_ratio`` <= 0.8 → 차단 (스윙 예외 없음)
-    * **KR** — ``usd_krw_momentum_ratio`` >= 1.015 (5일 이평 대비 1.5% 급등) → 차단 (스윙 예외 없음)
+    * **US** — ``us_put_call_ratio`` >= 1.2 → US 시장 **V8·SWING 포함** 신규 매수 차단
+    * **COIN** — ``coin_whale_long_short_ratio`` <= 0.8 → 차단
+    * **KR** — ``usd_krw_momentum_ratio`` >= 1.015 (5일 이평 대비 1.5% 급등) → 차단
+
+전략별 예외(SWING_FIB PCR 우회 등) 없음 — ``market_buy_allowed[market]`` 만 사용.
 
 VIX·Crypto Fear&Greed 및 환율 절대값(1500원) 차단은 제거됨.
 Phase5 MDD·계좌 서킷 등은 이 모듈 밖에서 전략 무관하게 적용.
@@ -77,14 +78,6 @@ def is_us_put_call_block_reason(reason: str) -> bool:
     return "put/call" in low or "put call" in low
 
 
-def is_swing_strategy_type(strategy_type: str) -> bool:
-    """스윙 계열 전략 태그 (Phase4 US PCR 예외 대상)."""
-    st = str(strategy_type or "").strip().upper()
-    if not st:
-        return False
-    return st == "SWING_FIB" or st == "SWING" or "SWING" in st
-
-
 def is_us_put_call_macro_block(macro_snap: Dict[str, Any]) -> bool:
     """US 신규 매수가 Phase4 PCR 로 차단된 상태 (다른 시장·Phase5 와 무관)."""
     if not macro_snap or not macro_snap.get("enabled"):
@@ -104,21 +97,12 @@ def macro_buy_allowed_for_strategy(
     """
     시장·전략별 Phase4 신규 매수 허용.
 
-    US PCR 차단 시 ``SWING_FIB`` 등 스윙만 예외 허용. KR 환율·COIN 고래·기타 차단은 예외 없음.
+    ``market_buy_allowed[market]`` 만 따른다. V8·SWING 예외 없음.
+    (호출부 호환용 래퍼 — ``strategy_type`` 은 무시.)
     """
+    del strategy_type  # 전략별 예외 폐지
     mk = str(market or "").strip().upper()
-    base_allowed = bool(
-        ((macro_snap or {}).get("market_buy_allowed") or {}).get(mk, True)
-    )
-    if base_allowed:
-        return True
-    if (
-        mk == "US"
-        and is_swing_strategy_type(strategy_type)
-        and is_us_put_call_macro_block(macro_snap)
-    ):
-        return True
-    return False
+    return bool(((macro_snap or {}).get("market_buy_allowed") or {}).get(mk, True))
 
 
 def _coerce_float(val: Any) -> Optional[float]:

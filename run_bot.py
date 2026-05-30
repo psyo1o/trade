@@ -40,6 +40,14 @@ run_bot — V5.0 통합 자동매매 엔진 (국장 / 미장 / 코인)
       **중복 없이** 금액·비중·macro 등 **호출부만 아는 맥락**을 덧붙인다.
     * ``services/account_read_facade`` — 주말/예외 시 **장부 폴백** 또는 빈 리스트 반환 시에도 한 줄 로그로 이유를 남긴다.
 """
+import warnings
+# pandas_market_calendars 내부 공지성 UserWarning이 stderr로 찍혀 텔레그램 경고 감시에 걸린다.
+# 타임스탑/거래일 판별에는 영향이 없으므로 해당 경고만 선택적으로 무시한다.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*break_start.*break_end.*discontinued.*",
+    category=UserWarning,
+)
 import time, json, schedule, pyupbit, requests, traceback, threading, sys, os
 import pytz
 from ta.trend import ADXIndicator
@@ -99,15 +107,19 @@ from strategy.rules import (
     check_pro_exit,
     get_final_exit_price,
     get_swing_exit_display_price,
-    get_swing_half_target_price,
+    get_swing_scale_out_target_price,
     get_swing_hard_stop_floor,
-    _v8_max_stop_cap_floor,
     reconcile_swing_position,
-    SWING_BB_HALF_MIN_PROFIT_PCT,
+    register_swing_entry_risk_fields,
+    swing_entry_sl_p,
+    SWING_SCALE_OUT_R_MULT,
     get_ohlcv_yfinance,
+    get_ohlcv_stooq,
+    get_ohlcv_pykrx,
     get_ohlcv_realtime,
     get_ohlcv_kis_domestic_daily,
 )
+from strategy.market_hours import trading_hours_elapsed
 from strategy.indicators import get_safe_atr
 from services.account_snapshot import (
     resolve_display_current_price as _resolve_display_current_price,
@@ -117,10 +129,14 @@ from services import account_read_facade
 from strategy.sector_lock import allow_kr_sector_entry, allow_us_sector_entry, seed_us_sector_cache
 from strategy.macro_guard import (
     get_macro_guard_snapshot,
-    is_us_put_call_macro_block,
-    macro_buy_allowed_for_strategy,
 )
-from strategy.alpha_sizing import sort_targets_by_relative_strength, volatility_target_ratio
+from strategy.alpha_sizing import (
+    atr_pct_from_ohlcv,
+    compute_market_portfolio_heat,
+    portfolio_heat_blocks_entry,
+    sort_targets_by_relative_strength,
+    volatility_target_ratio,
+)
 from execution.order_twap import plan_krw_slices, plan_usd_slices
 import screener
 
@@ -506,6 +522,7 @@ TWAP_USD_THRESHOLD = float(config.get("twap_usd_threshold", 5000))
 TWAP_SLICE_DELAY_SEC = float(config.get("twap_slice_delay_sec", 90))
 # 매수: 장(또는 일봉 기준) 마감 직전 N분만 허용 (기본 30분). TWAP 분할 시 마감 직후 주문 방지
 BUY_WINDOW_MINUTES_BEFORE_CLOSE = int(config.get("buy_window_minutes_before_close", 30))
+PORTFOLIO_HEAT_MAX_PCT = float(config.get("portfolio_heat_max_pct", 0.06))
 
 # Phase 4: VIX / Fear&Greed 거시 방어막 (매 루프 `get_macro_guard_snapshot(config)` 로 적용)
 # config: macro_guard_enabled, macro_us_put_call_*, macro_coin_whale_*, macro_krw_fx_momentum_*
@@ -525,10 +542,10 @@ def _v8_trend_buy_allowed_in_weather(weather_label: str) -> bool:
 # 업비트 코인 시장가 매수 — 가용 잔고 캡(수수료·반올림 오차로 InsufficientFundsBid 방지)
 UPBIT_KRW_AVAILABLE_CAP_RATIO = 0.999  # 주문 직전: min(목표액, get_balance(KRW) * 이 값)
 UPBIT_COIN_MIN_ORDER_KRW = 5000.0      # KRW 마켓 최소 주문 금액(업비트 기준)
-# 바이낸스: 24h USDT 거래대금 상위 N (`binance_universe_top`, 기본 50)
-BINANCE_UNIVERSE_TOP = int(config.get("binance_universe_top", 50))
-# 업비트: KRW 마켓 거래대금 상위 N (`upbit_universe_top`, 기본 20 — 예전 하드코드(:20)와 동일)
-UPBIT_UNIVERSE_TOP = int(config.get("upbit_universe_top", 20))
+# 바이낸스: 24h USDT 거래대금 상위 N (`binance_universe_top`, 기본 10)
+BINANCE_UNIVERSE_TOP = int(config.get("binance_universe_top", 10))
+# 업비트: KRW 마켓 거래대금 상위 N (`upbit_universe_top`, 기본 10)
+UPBIT_UNIVERSE_TOP = int(config.get("upbit_universe_top", 10))
 # 코인(업비트·바이낸스 공통): ``_is_coin_buy_window_now`` 일봉 직전 창만 매수. V8→스윙 순서는 국·미장과 동일.
 
 
@@ -590,21 +607,7 @@ def prefetch_ohlcv(tickers, market="KR", broker=None):
             success += 1
             continue
         try:
-            ohlcv = None
-            if use_kis_first and str(t).isdigit():
-                _throttle_kis_ohlcv()
-                ohlcv = list(get_ohlcv_kis_domestic_daily(broker, t) or [])
-                yf = []
-                if len(ohlcv) < 200:
-                    yf = get_ohlcv_yfinance(t) or []
-                if yf and len(yf) > len(ohlcv):
-                    ohlcv = yf
-                    print(f"     ✅ [{t}] yfinance로 일봉 확장·백업 ({len(ohlcv)}봉)")
-                elif len(ohlcv) < 14 and yf:
-                    ohlcv = yf
-                    print(f"     ⚠️ [{t}] KIS 미달 → yfinance 백업 ({len(ohlcv)}봉)")
-            else:
-                ohlcv = get_ohlcv_yfinance(t)
+            ohlcv = get_cached_ohlcv(t, broker if use_kis_first else None)
 
             if ohlcv and len(ohlcv) >= 14:
                 _ohlcv_cache[t] = ohlcv
@@ -624,48 +627,93 @@ def prefetch_ohlcv(tickers, market="KR", broker=None):
     print(f"  📦 [{market}] OHLCV 캐시 완료: 성공 {success}개, 실패 {fail}개")
 
 
+def _store_ohlcv_cache(ticker: str, ohlcv: list) -> list:
+    """메모리·디스크 캐시에 저장 후 동일 리스트 반환."""
+    if ohlcv and len(ohlcv) >= 14:
+        _ohlcv_cache[ticker] = ohlcv
+        try:
+            from utils.ohlcv_store import save_disk_ohlcv
+
+            save_disk_ohlcv(ticker, ohlcv)
+        except Exception:
+            pass
+    return ohlcv
+
+
 def get_cached_ohlcv(ticker, broker=None):
-    """캐시에서 OHLCV. 국장은 **KIS 일봉 우선**(쓰로틀) 후 **yfinance 백업**, 미장 등은 yfinance 우선."""
-    # 1순위: 캐시 확인
+    """OHLCV 확보(200봉). 메모리·디스크 → 국장 KIS→pykrx → 미장 KIS→Stooq(키)→yfinance."""
+    try:
+        from utils.ohlcv_store import load_disk_ohlcv
+    except Exception:
+        load_disk_ohlcv = lambda _t, **kw: None  # type: ignore
+
     if ticker in _ohlcv_cache and _ohlcv_cache[ticker] and len(_ohlcv_cache[ticker]) >= 200:
         return _ohlcv_cache[ticker]
 
-    kr_digit = broker is not None and str(ticker).isdigit()
+    disk = load_disk_ohlcv(ticker)
+    if disk and len(disk) >= 200:
+        _ohlcv_cache[ticker] = disk
+        return disk
 
-    # 2순위(국장): KIS만 먼저 — 야후 401·크럼 노이즈 회피
+    kr_digit = broker is not None and str(ticker).isdigit()
+    best: list = (_ohlcv_cache.get(ticker) or disk or [])[:]
+
+    def _take(candidate: list) -> None:
+        nonlocal best
+        if not candidate:
+            return
+        if len(candidate) > len(best):
+            best = candidate
+
+    # 국장: KIS → Stooq → yfinance
     if kr_digit:
         _throttle_kis_ohlcv()
-        ohlcv_kis = []
         try:
             ohlcv_kis = get_ohlcv_kis_domestic_daily(broker, ticker) or []
         except Exception as e:
             print(f"     ⚠️ [{ticker}] KIS 일봉 조회 예외: {e}")
-        if ohlcv_kis and len(ohlcv_kis) >= 200:
-            _ohlcv_cache[ticker] = ohlcv_kis
-            return ohlcv_kis
-        if ohlcv_kis and len(ohlcv_kis) >= 14:
-            _ohlcv_cache[ticker] = ohlcv_kis
-            if len(ohlcv_kis) < 200:
-                print(f"     ⚠️ [{ticker}] KIS 데이터 200일 미만 ({len(ohlcv_kis)}봉) — yfinance로 보강 시도.")
+            ohlcv_kis = []
+        _take(ohlcv_kis)
+        if len(best) >= 200:
+            return _store_ohlcv_cache(ticker, best)
+        if len(best) < 200:
+            _take(get_ohlcv_pykrx(ticker) or [])
+        if len(best) >= 200:
+            return _store_ohlcv_cache(ticker, best)
+        if ohlcv_kis and len(ohlcv_kis) < 200:
+            print(f"     ⚠️ [{ticker}] KIS {len(ohlcv_kis)}봉 — pykrx/yfinance 보강")
 
-    # 3순위: yfinance (미장 기본 / 국장 백업·200봉 보강)
+    # 미장: KIS 해외(장중) → Stooq(키) → yfinance
+    if not kr_digit and not kis_equities_weekend_suppress_window_kst():
+        try:
+            from api import kis_api
+            from api.kis_api import get_ohlcv_kis_us_daily
+
+            bus = kis_api.broker_us
+            if bus:
+                _take(get_ohlcv_kis_us_daily(bus, ticker) or [])
+        except Exception as e:
+            print(f"     ⚠️ [{ticker}] KIS 해외 일봉 예외: {e}")
+
+    stooq_key = str(config.get("stooq_apikey", "") or "").strip()
+    if stooq_key:
+        _take(get_ohlcv_stooq(ticker, apikey=stooq_key) or [])
+    if len(best) >= 200:
+        return _store_ohlcv_cache(ticker, best)
+
     try:
-        ohlcv_yf = get_ohlcv_yfinance(ticker)
-        if ohlcv_yf and len(ohlcv_yf) >= 200:
-            _ohlcv_cache[ticker] = ohlcv_yf
-            return ohlcv_yf
-        if ohlcv_yf:
-            prev = _ohlcv_cache.get(ticker) or []
-            if len(ohlcv_yf) > len(prev):
-                _ohlcv_cache[ticker] = ohlcv_yf
-            if len(ohlcv_yf) < 200:
-                print(f"     ⚠️ [{ticker}] yfinance 데이터 200일 미만 ({len(ohlcv_yf)}봉).")
+        ohlcv_yf = get_ohlcv_yfinance(ticker) or []
+        _take(ohlcv_yf)
+        if ohlcv_yf and len(ohlcv_yf) < 200:
+            print(f"     ⚠️ [{ticker}] yfinance {len(ohlcv_yf)}봉 (<200)")
     except Exception as e:
         print(f"     ⚠️ [{ticker}] yfinance 조회 실패: {e}")
 
-    # 최종: 캐시에 쌓인 것 중 최선
-    if ticker in _ohlcv_cache and len(_ohlcv_cache[ticker]) > 0:
-        return _ohlcv_cache[ticker]
+    if len(best) >= 200:
+        return _store_ohlcv_cache(ticker, best)
+    if best:
+        _store_ohlcv_cache(ticker, best)
+        return best
 
     print(f"     🔴 [{ticker}] OHLCV 데이터 전체 실패 (200일 이상 확보 불가).")
     return []
@@ -1043,7 +1091,15 @@ def get_real_weather(broker_kr, broker_us):
         print("  📌 [기상] KIS 주말·점검 창 — 국·미 날씨 Yahoo 생략 (코인만 실조회)")
     if not suppress_kr_us_yahoo:
         try:
-            df_kr = yf.Ticker("069500.KS").history(period="2mo")
+            from utils.yfinance_guard import yf_call
+
+            df_kr = yf_call(
+                lambda: yf.Ticker("069500.KS").history(period="2mo"),
+                label="weather_kr",
+                ticker="069500.KS",
+            )
+            if df_kr is None:
+                df_kr = pd.DataFrame()
             if not df_kr.empty and len(df_kr) >= 30:
                 # ADX 계산 (기본 14일)
                 adx_kr = ADXIndicator(high=df_kr['High'], low=df_kr['Low'], close=df_kr['Close'], window=14)
@@ -1066,7 +1122,15 @@ def get_real_weather(broker_kr, broker_us):
     # -----------------------------------------------------------
     if not suppress_kr_us_yahoo:
         try:
-            df_us = yf.Ticker("SPY").history(period="2mo")
+            from utils.yfinance_guard import yf_call
+
+            df_us = yf_call(
+                lambda: yf.Ticker("SPY").history(period="2mo"),
+                label="weather_us",
+                ticker="SPY",
+            )
+            if df_us is None:
+                df_us = pd.DataFrame()
             if not df_us.empty and len(df_us) >= 30:
                 adx_us = ADXIndicator(high=df_us['High'], low=df_us['Low'], close=df_us['Close'], window=14)
                 df_us['adx'] = adx_us.adx()
@@ -1329,7 +1393,9 @@ def manual_sell(market, code, quantity):
             if ok:
                 st0 = load_state(STATE_PATH)
                 pos0 = (st0.get("positions") or {}).get(code, {})
-                hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
+                hold_note = _holding_duration_suffix(
+                    pos0 if isinstance(pos0, dict) else {}, "KR"
+                )
                 exec_price = curr_p
                 meta = _apply_manual_sell_state_update(code, exec_price, "KR", float(int(qty)))
                 profit_rate = meta.get("profit_rate")
@@ -1381,7 +1447,9 @@ def manual_sell(market, code, quantity):
             if ok:
                 st0 = load_state(STATE_PATH)
                 pos0 = (st0.get("positions") or {}).get(code, {})
-                hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
+                hold_note = _holding_duration_suffix(
+                    pos0 if isinstance(pos0, dict) else {}, "US"
+                )
                 meta = _apply_manual_sell_state_update(code, current_price, "US", float(int(qty)))
                 profit_rate = meta.get("profit_rate")
                 full_exit = bool(meta.get("full_exit", True))
@@ -1412,7 +1480,9 @@ def manual_sell(market, code, quantity):
             if resp:
                 st0 = load_state(STATE_PATH)
                 pos0 = (st0.get("positions") or {}).get(code, {})
-                hold_note = _holding_duration_suffix(pos0 if isinstance(pos0, dict) else {})
+                hold_note = _holding_duration_suffix(
+                    pos0 if isinstance(pos0, dict) else {}, "COIN"
+                )
                 meta = _apply_manual_sell_state_update(code, current_p, "COIN", float(qty))
                 profit_rate = meta.get("profit_rate")
                 full_exit = bool(meta.get("full_exit", True))
@@ -2373,53 +2443,42 @@ def _execute_coin_market_buy_twap(
     return True
 
 
-def _holding_duration_human(pos: dict) -> str:
-    """장부 매수 시각 기준 보유 기간 (텔레그램 등 표시용)."""
-    import time as _time
+def _holding_duration_human(pos: dict, market: str = "") -> str:
+    """
+    장부 매수 시각 기준 보유 시간 (텔레그램·GUI·타임스탑과 동일).
 
+    KR/US: 거래일 기준 24시간(주말 제외) · COIN: 24/7 연속 — 모두 ``N.Nh`` 만 표기.
+    """
     if not isinstance(pos, dict):
         return ""
-    anchor = None
-    bt = pos.get("buy_time")
-    if bt not in (None, "", 0):
+    buy_dt = _position_buy_anchor_dt(pos)
+    if buy_dt is None:
+        return ""
+    now = datetime.now()
+    m = str(market or "").strip().upper()
+    if m in ("KR", "US", "COIN"):
         try:
-            anchor = float(bt)
-        except (TypeError, ValueError):
-            pass
-    if anchor is None and pos.get("buy_date"):
-        try:
-            bd = str(pos["buy_date"]).strip()
-            if bd.endswith("Z"):
-                bd = bd[:-1] + "+00:00"
-            anchor = datetime.fromisoformat(bd).timestamp()
+            th = _time_stop_hours_elapsed(m, buy_dt, now)
+            return f"{float(th):.1f}h"
         except Exception:
             pass
-    if anchor is None:
-        return ""
     try:
-        delta_sec = max(0.0, float(_time.time()) - float(anchor))
+        delta_sec = max(0.0, (now - buy_dt).total_seconds())
+        return f"{delta_sec / 3600.0:.1f}h"
     except Exception:
         return ""
-    days, rem = divmod(int(delta_sec), 86400)
-    hrs, rem2 = divmod(rem, 3600)
-    mins = rem2 // 60
-    if days >= 1:
-        return f"{days}일 {hrs}시간"
-    if hrs >= 1:
-        return f"{hrs}시간 {mins}분"
-    return f"{mins}분"
 
 
-def _holding_duration_suffix(pos: dict) -> str:
-    d = _holding_duration_human(pos)
+def _holding_duration_suffix(pos: dict, market: str = "") -> str:
+    d = _holding_duration_human(pos, market)
     return f" | 보유 {d}" if d else ""
 
 
-def _holding_duration_clause(pos: dict) -> str:
-    """생존신고 보유 한 줄 접미사. 예전 형식(| 보유 N일 N시간 등). SWING도 동일."""
+def _holding_duration_clause(pos: dict, market: str = "") -> str:
+    """생존신고 보유 한 줄 접미사 — 타임스탑과 동일한 누적 시간(N.Nh)."""
     if not isinstance(pos, dict):
         return ""
-    d = _holding_duration_human(pos)
+    d = _holding_duration_human(pos, market)
     return f" | 보유 {d}" if d else ""
 
 
@@ -2525,9 +2584,15 @@ def _heartbeat_resolve_sl_p(
         pos2 = dict(p)
         pos2["max_p"] = max(float(_to_float(pos2.get("max_p", bp), bp)), cp)
         reconcile_swing_position(pos2, ohlcv, reference_price=cp)
+        _, _, trading_h, _ = _compute_holding_time_info(pos2, market)
         sl = float(
-            get_swing_exit_display_price(
-                cp, pos2, ohlcv, market=market, ticker=ticker
+            _resolve_exit_display_price(
+                ticker,
+                cp,
+                pos2,
+                ohlcv,
+                "SWING_FIB",
+                trading_hours_held=trading_h,
             )
         )
         if sl > 0:
@@ -2561,6 +2626,108 @@ def _fmt_price_for_heartbeat(market: str, price: float) -> str:
     return f"{int(p):,}원"
 
 
+def _fmt_price_with_pct_vs_buy(market: str, price: float, buy_p: float) -> str:
+    """가격 + 매수가 대비 %(텔레·GUI 공통)."""
+    px = float(_to_float(price, 0.0))
+    bp = float(_to_float(buy_p, 0.0))
+    base = _fmt_price_for_heartbeat(market, px)
+    if bp <= 0 or px <= 0:
+        return base
+    pct = (px / bp - 1.0) * 100.0
+    return f"{base}({pct:+.2f}%)"
+
+
+def build_holding_display_bundle(
+    market: str,
+    ticker: str,
+    name: str,
+    buy_p: float,
+    curr_p: float,
+    pos: dict,
+    *,
+    roi_pct: float | None = None,
+    source_tag: str = "",
+    line_prefix: str = "  ",
+) -> dict:
+    """
+    보유 종목 표시 번들 — 텔레그램 생존신고·GUI 로그·표가 동일 포맷을 씁니다.
+
+    Returns:
+        line, strategy, buy_txt, curr_txt, max_txt, sl_txt, roi_pct, duration_clause
+    """
+    p = pos if isinstance(pos, dict) else {}
+    strat = _heartbeat_strategy_label(p, ticker=ticker, market=market)
+    buy_ref = float(_to_float(buy_p, 0.0))
+    curr_ref = float(_to_float(curr_p, 0.0))
+    roi = (
+        float(roi_pct)
+        if roi_pct is not None
+        else (((curr_ref - buy_ref) / buy_ref) * 100.0 if buy_ref > 0 else 0.0)
+    )
+    max_p = float(_to_float(p.get("max_p", 0), 0.0))
+    if max_p <= 0:
+        max_p = curr_ref if curr_ref > 0 else buy_ref
+    if curr_ref > 0:
+        max_p = max(max_p, curr_ref)
+    sl_p = _heartbeat_resolve_sl_p(market, ticker, p, buy_ref, curr_ref)
+    buy_txt = _fmt_price_for_heartbeat(market, buy_ref) if buy_ref > 0 else "-"
+    curr_txt = _fmt_price_with_pct_vs_buy(market, curr_ref, buy_ref)
+    if sl_p > 0:
+        sl_txt = _fmt_price_with_pct_vs_buy(market, sl_p, buy_ref)
+    else:
+        sl_txt = "-"
+    if max_p > 0:
+        max_txt = _fmt_price_with_pct_vs_buy(market, max_p, buy_ref)
+    else:
+        max_txt = "-"
+    dur_txt = _holding_duration_clause(p, market)
+    tag_txt = f" {source_tag}" if source_tag else ""
+    disp_name = str(name or ticker).strip() or str(ticker)
+    line = (
+        f"{line_prefix}{ticker}({disp_name}) | 전략:{strat} | "
+        f"매수가 {buy_txt} | "
+        f"현재가 {curr_txt} | "
+        f"최고가 {max_txt} | "
+        f"매도선 {sl_txt}{dur_txt}{tag_txt}"
+    )
+    return {
+        "line": line,
+        "strategy": strat,
+        "buy_txt": buy_txt,
+        "curr_txt": curr_txt,
+        "max_txt": max_txt,
+        "sl_txt": sl_txt,
+        "roi_pct": float(roi),
+        "duration_clause": dur_txt,
+    }
+
+
+def format_holding_display_line(
+    market: str,
+    ticker: str,
+    name: str,
+    buy_p: float,
+    curr_p: float,
+    roi: float,
+    pos: dict,
+    *,
+    source_tag: str = "",
+    line_prefix: str = "  ",
+) -> str:
+    """텔레그램·GUI 공용 보유 한 줄 문자열."""
+    return build_holding_display_bundle(
+        market,
+        ticker,
+        name,
+        buy_p,
+        curr_p,
+        pos,
+        roi_pct=roi,
+        source_tag=source_tag,
+        line_prefix=line_prefix,
+    )["line"]
+
+
 def _format_holding_line(
     market: str,
     ticker: str,
@@ -2572,33 +2739,9 @@ def _format_holding_line(
     *,
     source_tag: str = "",
 ) -> str:
-    p = pos if isinstance(pos, dict) else {}
-    strat = _heartbeat_strategy_label(p, ticker=ticker, market=market)
-    buy_ref = float(_to_float(buy_p, 0.0))
-    curr_ref = float(_to_float(curr_p, 0.0))
-    max_p = float(_to_float(p.get("max_p", 0), 0.0))
-    if max_p <= 0:
-        max_p = curr_ref if curr_ref > 0 else buy_ref
-    if curr_ref > 0:
-        max_p = max(max_p, curr_ref)
-    sl_p = _heartbeat_resolve_sl_p(market, ticker, p, buy_ref, curr_ref)
-    sl_txt = _fmt_price_for_heartbeat(market, sl_p) if sl_p > 0 else "-"
-    if buy_ref > 0:
-        max_pct = (float(max_p) / buy_ref - 1.0) * 100.0
-        max_txt = f"{_fmt_price_for_heartbeat(market, max_p)}({max_pct:+.2f}%)"
-    else:
-        max_txt = _fmt_price_for_heartbeat(market, max_p)
-    if sl_p > 0 and buy_ref > 0:
-        sl_pct = (float(sl_p) / buy_ref - 1.0) * 100.0
-        sl_txt = f"{_fmt_price_for_heartbeat(market, sl_p)}({sl_pct:+.2f}%)"
-    dur_txt = _holding_duration_clause(p)
-    tag_txt = f" {source_tag}" if source_tag else ""
-    return (
-        f"  {ticker}({name}) | 전략:{strat} | "
-        f"매수가 {_fmt_price_for_heartbeat(market, buy_p)} | "
-        f"현재가 {_fmt_price_for_heartbeat(market, curr_p)}({roi:+.2f}%) | "
-        f"최고가 {max_txt} | "
-        f"매도선 {sl_txt}{dur_txt}{tag_txt}"
+    """하위 호환 — ``format_holding_display_line`` 와 동일."""
+    return format_holding_display_line(
+        market, ticker, name, buy_p, curr_p, roi, pos, source_tag=source_tag
     )
 
 
@@ -3059,6 +3202,11 @@ def heartbeat_report():
         us_holdings_str = "\n".join(us_holdings) if us_holdings else "  (보유 없음)"
         coin_holdings_str = "\n".join(coin_holdings) if coin_holdings else "  (보유 없음)"
 
+        # GUI 작동 로그: 30분 생존신고와 동일 시각·동일 한 줄 (잔고 갱신마다 출력하지 않음)
+        print("📊 [생존신고] 보유 (텔레그램 동일)")
+        for _hb_line in kr_holdings + us_holdings + coin_holdings:
+            print(_hb_line)
+
         if coin_config.is_binance():
             if coin_disp_fb:
                 kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
@@ -3241,12 +3389,9 @@ def _build_market_context(state: dict) -> tuple[dict, float, str, dict]:
             )
         for mk in ("KR", "US", "COIN"):
             if not _macro_market_buy_allowed(_macro_snap, mk):
-                extra = ""
-                if mk == "US" and is_us_put_call_macro_block(_macro_snap):
-                    extra = " — SWING_FIB는 매수 창에서만 예외 검증"
                 print(
                     f"  🚫 [Phase4 글로벌] {mk} 신규 매수 차단 — "
-                    f"{(_macro_snap.get('market_buy_block_reason') or {}).get(mk, '')}{extra}"
+                    f"{(_macro_snap.get('market_buy_block_reason') or {}).get(mk, '')}"
                 )
     else:
         print(f"  🛡️ [Phase4 거시] 비활성 | {macro_reason}")
@@ -3578,36 +3723,181 @@ def _format_coin_price_log_fields(
     return curr_fmt, buy_fmt, max_fmt, chan_fmt, hard_fmt
 
 
-def _compute_holding_time_info(pos_info: dict) -> tuple[str, float, str]:
-    """포지션 보유시간/매수시각 로그 문자열 계산(기존 로직 동일)."""
-    now = datetime.now()
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+def _position_buy_anchor_dt(pos_info: dict) -> datetime | None:
+    """타임스탑·영업시간 계산용 매수 시각."""
     buy_date_str = pos_info.get("buy_date")
     buy_time_ts = pos_info.get("buy_time")
-    hours_held = 0.0
-    buy_time_log = "알 수 없음"
-
     if buy_date_str:
         try:
-            buy_datetime = datetime.fromisoformat(buy_date_str)
-            hours_held = (now - buy_datetime).total_seconds() / 3600
-            buy_time_log = buy_datetime.strftime("%Y-%m-%d %H:%M:%S")
+            return datetime.fromisoformat(str(buy_date_str).strip())
         except Exception:
             pass
+    if buy_time_ts:
+        try:
+            return datetime.fromtimestamp(float(buy_time_ts))
+        except (TypeError, ValueError, OSError):
+            pass
+    return None
 
-    if hours_held == 0 and buy_time_ts:
-        hours_held = (time.time() - buy_time_ts) / 3600
-        buy_time_log = datetime.fromtimestamp(buy_time_ts).strftime("%Y-%m-%d %H:%M:%S")
 
-    return now_str, float(hours_held), buy_time_log
+def _time_stop_hours_elapsed(
+    market: str,
+    start: datetime | float,
+    end: datetime | float | None = None,
+) -> float:
+    """
+    타임스탑·보유시간용 경과 시간(h).
+
+    * COIN: 연속 시간 그대로 (24/7).
+    * KR/US: ``start``~``end`` 중 **휴장일(주말·공휴일)만 제외**하고 나머지는 24시간 기준으로 연속 누적.
+      - 예: 월 15:00 매수 → 화 장 열림이면 **그 사이(밤 포함)** 는 계속 누적.
+      - 수 휴장이면 수요일 24h는 누적에서 제외(Pause).
+    """
+    m = str(market or "").strip().upper()
+    if isinstance(start, (int, float)):
+        start_dt = datetime.fromtimestamp(float(start))
+    else:
+        start_dt = start
+    if end is None:
+        end_dt = datetime.now()
+    elif isinstance(end, (int, float)):
+        end_dt = datetime.fromtimestamp(float(end))
+    else:
+        end_dt = end
+
+    if end_dt <= start_dt:
+        return 0.0
+
+    if m == "COIN":
+        return max(0.0, (end_dt - start_dt).total_seconds() / 3600.0)
+
+    # KR/US: "휴장일만 Pause" (개장일은 장외 포함 24h 연속 누적)
+    open_dates: set = set()
+    try:
+        cal_name = "XKRX" if m == "KR" else "NYSE"
+        cal = mcal.get_calendar(cal_name)
+        # 거래일만 반환(주말·공휴일 제외)
+        valid = cal.valid_days(start_date=start_dt.date(), end_date=end_dt.date())
+        open_dates = {pd.Timestamp(x).date() for x in valid}
+    except Exception:
+        # 폴백: 주말만 거래일 취급(공휴일은 모름)
+        d = start_dt.date()
+        last = end_dt.date()
+        while d <= last:
+            if d.weekday() < 5:
+                open_dates.add(d)
+            d = d + timedelta(days=1)
+
+    total_sec = 0.0
+    cur = start_dt
+    while cur < end_dt:
+        day_start = datetime(cur.year, cur.month, cur.day)
+        day_end = day_start + timedelta(days=1)
+        seg_end = min(day_end, end_dt)
+        if cur.date() in open_dates:
+            total_sec += max(0.0, (seg_end - cur).total_seconds())
+        cur = seg_end
+    return max(0.0, total_sec / 3600.0)
+
+
+def _compute_holding_time_info(
+    pos_info: dict, market: str = ""
+) -> tuple[str, float, float, str]:
+    """(now_str, calendar_hours, trading_hours_for_time_stop, buy_time_log)."""
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    buy_dt = _position_buy_anchor_dt(pos_info)
+    buy_time_log = "알 수 없음"
+    calendar_h = 0.0
+    trading_h = 0.0
+
+    if buy_dt is not None:
+        buy_time_log = buy_dt.strftime("%Y-%m-%d %H:%M:%S")
+        calendar_h = max(0.0, (now - buy_dt).total_seconds() / 3600.0)
+        m = str(market or "").strip().upper()
+        if m in ("KR", "US", "COIN"):
+            trading_h = _time_stop_hours_elapsed(m, buy_dt, now)
+        else:
+            trading_h = calendar_h
+
+    return now_str, float(calendar_h), float(trading_h), buy_time_log
 
 
 def _print_position_hold_status(
-    now_str: str, ticker: str, buy_time_log: str, hours_held: float, *, line_prefix: str = ""
+    now_str: str,
+    ticker: str,
+    buy_time_log: str,
+    hours_held: float,
+    *,
+    line_prefix: str = "",
+    trading_hours: float | None = None,
+    market: str = "",
 ) -> None:
-    """보유시간 상태 로그 출력(기존 문자열 포맷 동일)."""
+    """보유시간 상태 로그 — 타임스탑과 동일한 누적 시간만 표시."""
     print(f"{line_prefix}📊 [{now_str}] {ticker} 상태 체크")
-    print(f"{line_prefix}   ⏱️ 매수일시: {buy_time_log} ➔ 보유시간: {hours_held:.1f}시간")
+    disp_h = (
+        float(trading_hours)
+        if trading_hours is not None
+        else float(hours_held)
+    )
+    print(f"{line_prefix}   ⏱️ 매수일시: {buy_time_log} ➔ 보유: {disp_h:.1f}h")
+
+
+def _position_qty_for_heat(ticker: str, pos: dict) -> float:
+    try:
+        return float(pos.get("qty", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _portfolio_heat_snapshot(
+    state: dict,
+    market: str,
+    market_equity: float,
+    fetch_ohlcv,
+    *,
+    extra_weight: float = 0.0,
+    extra_atr_pct: float = 0.0,
+) -> tuple[float, bool]:
+    """(heat 비율, 차단 여부)."""
+    heat = compute_market_portfolio_heat(
+        state.get("positions", {}) or {},
+        market,
+        float(market_equity),
+        resolve_market=_market_from_ticker,
+        position_qty=_position_qty_for_heat,
+        fetch_ohlcv=fetch_ohlcv,
+        extra_weight=float(extra_weight),
+        extra_atr_pct=float(extra_atr_pct),
+    )
+    blocked = portfolio_heat_blocks_entry(heat, PORTFOLIO_HEAT_MAX_PCT)
+    return float(heat), bool(blocked)
+
+
+def _log_portfolio_heat_block(market: str, heat: float, *, prospective: bool = False) -> None:
+    tag = "신규 포함" if prospective else "현재"
+    print(
+        f"  🚫 [{market} Portfolio Heat] {tag} Heat {heat * 100:.2f}% "
+        f"≥ 한도 {PORTFOLIO_HEAT_MAX_PCT * 100:.1f}% — 신규 매수 차단 (V8·스윙 공통)"
+    )
+
+
+def _register_swing_risk_after_buy(
+    state: dict,
+    ticker: str,
+    ohlcv,
+    market: str,
+) -> None:
+    """SWING_FIB 체결 직후 1R·초기 하드 바닥을 장부에 기록."""
+    pos = (state.get("positions") or {}).get(ticker)
+    if not pos or str(pos.get("strategy_type", "")).upper() != "SWING_FIB":
+        return
+    buy_p = float(_to_float(pos.get("buy_p", 0), 0.0))
+    if buy_p <= 0:
+        return
+    register_swing_entry_risk_fields(pos, buy_p, ohlcv, market=market, ticker=ticker)
+    state.setdefault("positions", {})[ticker] = pos
+    save_state(STATE_PATH, state)
 
 
 def _iter_coin_asset_rows(balances):
@@ -3669,22 +3959,28 @@ def _calc_hard_stop(
     ohlcv=None,
     strategy_type: str = "",
     ticker: str = "",
+    trading_hours_held: float | None = None,
 ) -> float:
-    """포지션 하드스탑 — 스윙: 피보·구름+cap / V8: sl_p·90% 폴백 + -8%·-12% cap."""
+    """포지션 하드스탑 — 스윙: 피보·구름·시간가중 / V8: ``sl_p``·90% 폴백."""
     st = str(strategy_type or pos_info.get("strategy_type") or "TREND_V8").upper()
     if st == "SWING_FIB":
         m = _market_from_ticker(ticker)
+        th = trading_hours_held
+        if th is None:
+            _, _, th, _ = _compute_holding_time_info(pos_info, m)
         hard = float(
-            get_swing_hard_stop_floor(pos_info, ohlcv, market=m, ticker=ticker)
+            get_swing_hard_stop_floor(
+                pos_info,
+                ohlcv,
+                market=m,
+                ticker=ticker,
+                trading_hours_held=th,
+            )
         )
         if hard > 0:
             return hard
         return 0.0
-    sl = float(pos_info.get("sl_p", buy_p * 0.9))
-    cap = float(_v8_max_stop_cap_floor(buy_p, ticker=ticker))
-    if cap > 0:
-        sl = max(sl, cap)
-    return sl
+    return float(pos_info.get("sl_p", buy_p * 0.9))
 
 
 def _update_position_max_p(state: dict, ticker: str, pos_info: dict, curr_p: float) -> float:
@@ -3706,6 +4002,7 @@ def _resolve_exit_display_price(
     strategy_type: str,
     *,
     state: dict | None = None,
+    trading_hours_held: float | None = None,
 ) -> float:
     """V8 샹들리에+콘크리트 또는 SWING_FIB 전용 매도선."""
     st = str(strategy_type or "TREND_V8").upper()
@@ -3715,9 +4012,17 @@ def _resolve_exit_display_price(
                 state.setdefault("positions", {})[ticker] = pos_info
                 save_state(STATE_PATH, state)
         m = _market_from_ticker(ticker)
+        th = trading_hours_held
+        if th is None:
+            _, _, th, _ = _compute_holding_time_info(pos_info, m)
         return float(
             get_swing_exit_display_price(
-                curr_p, pos_info, ohlcv, market=m, ticker=ticker
+                curr_p,
+                pos_info,
+                ohlcv,
+                market=m,
+                ticker=ticker,
+                trading_hours_held=th,
             )
         )
     return float(get_final_exit_price(ticker, curr_p, pos_info, ohlcv))
@@ -3734,23 +4039,17 @@ def _persist_exit_line_sl_p(
 def _format_swing_exit_log_suffix(
     market: str, pos_info: dict, ohlcv, curr_p: float, buy_p: float
 ) -> str:
-    """스윙 보유 로그: 1차 익절(볼밴) 목표가 보조 표시."""
-    half = get_swing_half_target_price(pos_info, ohlcv)
+    """스윙 보유 로그: 1.5R 1차 익절 목표가."""
+    half = get_swing_scale_out_target_price(pos_info)
     if half is None or half <= 0:
         return ""
-    try:
-        profit = _calc_profit_rate_pct(float(curr_p), float(buy_p))
-    except Exception:
-        profit = 0.0
-    if profit < SWING_BB_HALF_MIN_PROFIT_PCT:
-        return ""
     if market == "US":
-        return f" | 1차익절(볼밴): ${half:.2f}"
+        return f" | 1차익절({SWING_SCALE_OUT_R_MULT:.1f}R): ${half:.2f}"
     if market == "COIN":
         if half < 100:
-            return f" | 1차익절(볼밴): {half:,.4f}"
-        return f" | 1차익절(볼밴): {half:,.0f}"
-    return f" | 1차익절(볼밴): {int(half):,}"
+            return f" | 1차익절({SWING_SCALE_OUT_R_MULT:.1f}R): {half:,.4f}"
+        return f" | 1차익절({SWING_SCALE_OUT_R_MULT:.1f}R): {half:,.0f}"
+    return f" | 1차익절({SWING_SCALE_OUT_R_MULT:.1f}R): {int(half):,}"
 
 
 def _check_swing_trailing_exit(
@@ -3765,17 +4064,15 @@ def _check_swing_trailing_exit(
     return check_swing_profit_lock_trailing_exit(curr_p, pos_info, ohlcv=ohlcv)
 
 
-# 타임스탑 (보유 = 달력·연속시간, 주말·휴장 포함 — 영업일 환산 아님)
-#   V8 주식(KR/US): 240h(10일) + 수익 < +4% 전량 / ≥4% 유예 — 돌파 후 10일 내 미달 시 가짜 돌파 정리
-#   V8 코인: 72h(3일) + 수익 < +4% 전량 / ≥4% 유예 — 코인 3일 횡보 ≈ 주식 장기 횡보
-#   SWING 주식(KR/US): 120h(5일) + 수익 < +2% 전량 / ≥2% 유예 — 5일 내 V반등 없으면 모멘텀 소멸
-#   SWING 코인: 48h(2일) + 수익 < +2% 전량 / ≥2% 유예
-# (보유시간: buy_date 우선, 없으면 buy_time)
-V8_TIME_STOP_HOURS_EQUITY = 10.0 * 24.0
-V8_TIME_STOP_HOURS_COIN = 3.0 * 24.0
+# 타임스탑 — KR/US는 **영업시간** 누적, COIN은 24/7 연속시간
+#   V8 주식: 72h(≈3영업일) + 유예 +4% | V8 코인: 48h + 유예 +4%
+#   SWING 주식: 48h + 유예 +2% | SWING 코인: 24h + 유예 +2%
+# (보유시각: buy_date 우선, 없으면 buy_time)
+V8_TIME_STOP_HOURS_EQUITY = 72.0
+V8_TIME_STOP_HOURS_COIN = 48.0
 V8_TIME_STOP_EXEMPT_PROFIT_PCT = 4.0
-SWING_TIME_STOP_HOURS_EQUITY = 5.0 * 24.0
-SWING_TIME_STOP_HOURS_COIN = 2.0 * 24.0
+SWING_TIME_STOP_HOURS_EQUITY = 48.0
+SWING_TIME_STOP_HOURS_COIN = 24.0
 SWING_TIME_STOP_EXEMPT_PROFIT_PCT = 2.0
 
 
@@ -3826,6 +4123,13 @@ def _new_buy_protection_remaining_sec(buy_time) -> int:
     elapsed = time.time() - buy_time if buy_time else 900
     remain = int(900 - elapsed)
     return remain if remain > 0 else 0
+
+
+def _new_buy_sell_protection_blocks(profit_rate_pct: float, buy_time) -> bool:
+    """매수 후 15분·수익률 +1% 미만이면 매도 판정 스킵 (손실 구간 포함, KR/US/COIN 공통)."""
+    if _new_buy_protection_remaining_sec(buy_time) <= 0:
+        return False
+    return float(profit_rate_pct) < 1.0
 
 
 def _ai_false_breakout_buy_gate(
@@ -3990,8 +4294,17 @@ def run_trading_bot():
                 pos_info = state.get("positions", {}).get(t, pos_info)
                 buy_p = pos_info.get('buy_p', curr_p)
                 max_p = pos_info.get('max_p', curr_p)
+                now_str, hours_held, trading_h, buy_time_log = _compute_holding_time_info(
+                    pos_info, "KR"
+                )
                 exit_line = _resolve_exit_display_price(
-                    t, curr_p, pos_info, ohlcv, strategy_type, state=state
+                    t,
+                    curr_p,
+                    pos_info,
+                    ohlcv,
+                    strategy_type,
+                    state=state,
+                    trading_hours_held=trading_h,
                 )
                 _persist_exit_line_sl_p(state, t, pos_info, exit_line)
                 hard_stop = _calc_hard_stop(
@@ -4000,6 +4313,7 @@ def run_trading_bot():
                     ohlcv=ohlcv,
                     strategy_type=strategy_type,
                     ticker=t,
+                    trading_hours_held=trading_h,
                 )
                 profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
 
@@ -4023,9 +4337,13 @@ def run_trading_bot():
                     if curr_p <= hard_stop:
                         print(f"     ➜ 손절 체크: 현재가 {curr_p:,.0f} ≤ 손절가 {hard_stop:,.0f} = 🔴 매도 신호!")
 
-                # 0%~+1% 구간은 신규 매수 후 15분간만 매도 보류
+                # 수익률 +1% 미만·매수 후 15분: 매도 보류 (손실 구간 포함)
                 buy_time = pos_info.get('buy_time', time.time() - 900)
-                if 0 <= profit_rate_now < 1.0 and _new_buy_protection_remaining_sec(buy_time) > 0:
+                if _new_buy_sell_protection_blocks(profit_rate_now, buy_time):
+                    print(
+                        f"  ⏭️ {t}: 신규 매수 보호 구간 "
+                        f"({_new_buy_protection_remaining_sec(buy_time)}초 남음, 수익률 {profit_rate_now:+.2f}%)"
+                    )
                     continue
 
                 if strategy_type == "SWING_FIB":
@@ -4035,6 +4353,7 @@ def run_trading_bot():
                         reference_price=float(curr_p),
                         market="KR",
                         ticker=t,
+                        trading_hours_held=trading_h,
                     )
                     if sw_action == "HALF":
                         sq = compute_stock_scale_out_qty(int(qty))
@@ -4167,13 +4486,19 @@ def run_trading_bot():
                 # 매도 결정 로직 (우선순위: 타임스탑 > 하드스탑 > 샹들리에)
                 reason = ""
                 is_exit = False
-                now_str, hours_held, buy_time_log = _compute_holding_time_info(pos_info)
-                _print_position_hold_status(now_str, t, buy_time_log, hours_held)
+                _print_position_hold_status(
+                    now_str,
+                    t,
+                    buy_time_log,
+                    hours_held,
+                    trading_hours=trading_h,
+                    market="KR",
+                )
 
                 ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
                     market="KR",
                     strategy_type=strategy_type,
-                    hours_held=float(hours_held),
+                    hours_held=float(trading_h),
                     profit_rate_now=float(profit_rate_now),
                 )
                 if ts_exit:
@@ -4183,7 +4508,7 @@ def run_trading_bot():
                 elif ts_exempt:
                     _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("KR", strategy_type)
                     print(
-                        f"   ✅ 타임스탑 유예 {_ts_tag} — 보유 {hours_held:.1f}h (≥{_ts_min_h:.0f}h), "
+                        f"   ✅ 타임스탑 유예 {_ts_tag} — 보유 {trading_h:.1f}h (≥{_ts_min_h:.0f}h), "
                         f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
                     )
 
@@ -4374,14 +4699,14 @@ def run_trading_bot():
                                     if sw_ok:
                                         strategy_type = "SWING_FIB"
                                         entry_fib_level = float(sw_fib)
-                                        sl_p = float(sw_fib)
-                                        s_name = "SWING_FIB"
                                         _sw_o = float(ohlcv_200[-1].get("o", 0) or 0)
                                         _sw_c = (
                                             float(live_px_kr)
                                             if live_px_kr > 0
                                             else float(ohlcv_200[-1].get("c", 0) or 0)
                                         )
+                                        sl_p = swing_entry_sl_p(_sw_c, sw_fib)
+                                        s_name = "SWING_FIB"
                                         _sw_src = "KIS실시간" if live_px_kr > 0 else "일봉종가"
                                         print(
                                             f"  ✅ [SWING-BUY] {kr_name}({t}) entry_fib={entry_fib_level:,.2f} "
@@ -4401,6 +4726,21 @@ def run_trading_bot():
                                     target_vol=_alpha_target_vol,
                                     ticker=t,
                                 )
+
+                                _prospect_atr = atr_pct_from_ohlcv(ohlcv_200, t)
+                                _mkt_heat, _heat_blocked = _portfolio_heat_snapshot(
+                                    state,
+                                    "KR",
+                                    total_kr_equity,
+                                    lambda tk, _b=kis_api.broker_kr: get_cached_ohlcv(
+                                        tk, broker=_b
+                                    ),
+                                    extra_weight=float(ratio),
+                                    extra_atr_pct=float(_prospect_atr or 0.0),
+                                )
+                                if _heat_blocked:
+                                    _log_portfolio_heat_block("KR", _mkt_heat, prospective=True)
+                                    continue
 
                                 target_budget = total_kr_equity * ratio * macro_mult
                                 kr_min_budget = 50000.0
@@ -4491,6 +4831,7 @@ def run_trading_bot():
                                     )
                                 else:
                                     _cycle_buy_fills += 1
+                                    _register_swing_risk_after_buy(state, t, ohlcv_200, "KR")
                                 kr_cash = int(kr_box[0])
                             except Exception as e:
                                 print(f"  ❌ [KR BUY 예외] {t}: {type(e).__name__}: {e}")
@@ -4595,8 +4936,17 @@ def run_trading_bot():
                 pos_info = state.get("positions", {}).get(t, pos_info)
                 buy_p = pos_info.get('buy_p', curr_p)
                 max_p = pos_info.get('max_p', curr_p)
+                now_str, hours_held, trading_h, buy_time_log = _compute_holding_time_info(
+                    pos_info, "US"
+                )
                 exit_line = _resolve_exit_display_price(
-                    t, curr_p, pos_info, ohlcv, strategy_type, state=state
+                    t,
+                    curr_p,
+                    pos_info,
+                    ohlcv,
+                    strategy_type,
+                    state=state,
+                    trading_hours_held=trading_h,
                 )
                 _persist_exit_line_sl_p(state, t, pos_info, exit_line)
                 hard_stop = _calc_hard_stop(
@@ -4605,6 +4955,7 @@ def run_trading_bot():
                     ohlcv=ohlcv,
                     strategy_type=strategy_type,
                     ticker=t,
+                    trading_hours_held=trading_h,
                 )
                 profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
 
@@ -4622,11 +4973,14 @@ def run_trading_bot():
                     f"수익률: {profit_rate_now:+.2f}%{_sw_suffix}"
                 )
 
-                # 0%~+1% 구간은 매도 보류 (신규 매수 후 15분 동안)
+                # 수익률 +1% 미만·매수 후 15분: 매도 보류 (손실 구간 포함)
                 buy_time = pos_info.get('buy_time', 0)
-                remain_sec = _new_buy_protection_remaining_sec(buy_time)
-                if 0 <= profit_rate_now < 1.0 and remain_sec > 0:
-                    print(f"  ⏭️ {t}: 신규 매수 보호 구간 ({remain_sec}초 남음)")
+                if _new_buy_sell_protection_blocks(profit_rate_now, buy_time):
+                    remain_sec = _new_buy_protection_remaining_sec(buy_time)
+                    print(
+                        f"  ⏭️ {t}: 신규 매수 보호 구간 "
+                        f"({remain_sec}초 남음, 수익률 {profit_rate_now:+.2f}%)"
+                    )
                     continue
 
                 if strategy_type == "SWING_FIB":
@@ -4636,6 +4990,7 @@ def run_trading_bot():
                         reference_price=float(curr_p),
                         market="US",
                         ticker=t,
+                        trading_hours_held=trading_h,
                     )
                     if sw_action == "HALF":
                         sq = compute_stock_scale_out_qty(int(float(qty_holding)))
@@ -4768,14 +5123,21 @@ def run_trading_bot():
 
                 reason = ""
                 is_exit = False
-                
-                now_str, hours_held, buy_time_log = _compute_holding_time_info(pos_info)
-                _print_position_hold_status(now_str, t, buy_time_log, hours_held, line_prefix="  ")
+
+                _print_position_hold_status(
+                    now_str,
+                    t,
+                    buy_time_log,
+                    hours_held,
+                    line_prefix="  ",
+                    trading_hours=trading_h,
+                    market="US",
+                )
 
                 ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
                     market="US",
                     strategy_type=strategy_type,
-                    hours_held=float(hours_held),
+                    hours_held=float(trading_h),
                     profit_rate_now=float(profit_rate_now),
                 )
                 if ts_exit:
@@ -4785,7 +5147,7 @@ def run_trading_bot():
                 elif ts_exempt:
                     _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("US", strategy_type)
                     print(
-                        f"     ✅ 타임스탑 유예 {_ts_tag} — 보유 {hours_held:.1f}h (≥{_ts_min_h:.0f}h), "
+                        f"     ✅ 타임스탑 유예 {_ts_tag} — 보유 {trading_h:.1f}h (≥{_ts_min_h:.0f}h), "
                         f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
                     )
 
@@ -4904,24 +5266,12 @@ def run_trading_bot():
                 )
             else:
                 _cycle_buy_zone_us = True
-                us_macro_allowed = _macro_market_buy_allowed(macro_snap, "US")
-                us_pcr_swing_bypass = is_us_put_call_macro_block(macro_snap)
-                us_block_reason = str(
-                    (macro_snap.get("market_buy_block_reason") or {}).get("US", "") or ""
-                )
-
-                if not us_macro_allowed and not us_pcr_swing_bypass:
+                if not _macro_market_buy_allowed(macro_snap, "US"):
                     print(
                         f"  -> 🚨 미장 Phase4 글로벌 방어막: 신규 매수 중단. "
-                        f"({us_block_reason})"
+                        f"({(macro_snap.get('market_buy_block_reason') or {}).get('US', '')})"
                     )
-                elif not us_macro_allowed and us_pcr_swing_bypass:
-                    print(
-                        f"  📌 [US] Phase4 PCR 방어막 — V8 추세 매수 중단, SWING_FIB 후보만 검증 "
-                        f"({us_block_reason})"
-                    )
-
-                if us_macro_allowed or us_pcr_swing_bypass:
+                else:
                     # 지수 급락 체크
                     us_index_change = get_market_index_change("US")
                     print(f"  📊 [S&P500 지수] 변화율: {us_index_change:+.2f}% 날씨는 {weather['US']}")
@@ -4985,15 +5335,7 @@ def run_trading_bot():
                                     print(
                                         f"  ⏭️ {us_name}({t}): BEAR 시장 — V8 신호 통과했으나 추세 매수 차단 (스윙만 허용)"
                                     )
-                                if v8_ok and not macro_buy_allowed_for_strategy(
-                                    macro_snap, "US", "TREND_V8"
-                                ):
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): Phase4 US PCR — V8 추세 매수 차단 (스윙만 허용)"
-                                    )
-                                if v8_ok and macro_buy_allowed_for_strategy(
-                                    macro_snap, "US", "TREND_V8"
-                                ):
+                                if v8_ok:
                                     print(f"  ✅ [V8-BUY] {us_name}({t}) 진입")
                                 else:
                                     sw_ok, sw_fib, sw_why = check_swing_entry(
@@ -5003,21 +5345,15 @@ def run_trading_bot():
                                     if sw_ok:
                                         strategy_type = "SWING_FIB"
                                         entry_fib_level = float(sw_fib)
-                                        sl_p = float(sw_fib)
-                                        s_name = "SWING_FIB"
                                         _sw_o = float(ohlcv[-1].get("o", 0) or 0)
                                         _sw_c = float(live_px_us) if live_px_us > 0 else float(ohlcv[-1].get("c", 0) or 0)
+                                        sl_p = swing_entry_sl_p(_sw_c, sw_fib)
+                                        s_name = "SWING_FIB"
                                         _sw_src = "KIS실시간" if live_px_us > 0 else "일봉종가"
-                                        _pcr_note = (
-                                            " | Phase4 PCR 스윙 예외"
-                                            if us_pcr_swing_bypass
-                                            else ""
-                                        )
                                         print(
                                             f"  ✅ [SWING-BUY] {us_name}({t}) entry_fib={entry_fib_level:.2f} "
                                             f"| 양봉({_sw_src} 시가 {_sw_o:.2f} < 종가 {_sw_c:.2f})"
                                             f"{' | BEAR 시장 스윙 예외' if weather['US'] == WEATHER_LABEL_BEAR else ''}"
-                                            f"{_pcr_note}"
                                         )
                                     else:
                                         _prog = f"[{idx}/{total_us}]" if total_us > 0 else ""
@@ -5032,6 +5368,19 @@ def run_trading_bot():
                                     target_vol=_alpha_target_vol,
                                     ticker=t,
                                 )
+
+                                _prospect_atr = atr_pct_from_ohlcv(ohlcv, t)
+                                _mkt_heat, _heat_blocked = _portfolio_heat_snapshot(
+                                    state,
+                                    "US",
+                                    total_us_equity,
+                                    get_cached_ohlcv,
+                                    extra_weight=float(ratio),
+                                    extra_atr_pct=float(_prospect_atr or 0.0),
+                                )
+                                if _heat_blocked:
+                                    _log_portfolio_heat_block("US", _mkt_heat, prospective=True)
+                                    continue
 
                                 target_budget = total_us_equity * ratio * macro_mult
                                 us_min_budget = 50.0
@@ -5096,6 +5445,7 @@ def run_trading_bot():
                                     )
                                 else:
                                     _cycle_buy_fills += 1
+                                    _register_swing_risk_after_buy(state, t, ohlcv, "US")
                                 us_cash = float(us_box[0])
                             except Exception as e:
                                 print(f"  ❌ [US BUY 예외] {t}: {type(e).__name__}: {e}")
@@ -5175,6 +5525,9 @@ def run_trading_bot():
             pos_info = state.get("positions", {}).get(t, pos_info)
             buy_p = pos_info.get('buy_p', curr_p)
             max_p = pos_info.get('max_p', curr_p)
+            now_str, hours_held, trading_h, buy_time_log = _compute_holding_time_info(
+                pos_info, "COIN"
+            )
             profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
             if len(ohlcv) < 20:
                 exit_line = _calc_hard_stop(
@@ -5183,10 +5536,17 @@ def run_trading_bot():
                     ohlcv=ohlcv,
                     strategy_type=strategy_type,
                     ticker=t,
+                    trading_hours_held=trading_h,
                 )
             else:
                 exit_line = _resolve_exit_display_price(
-                    t, curr_p, pos_info, ohlcv, strategy_type, state=state
+                    t,
+                    curr_p,
+                    pos_info,
+                    ohlcv,
+                    strategy_type,
+                    state=state,
+                    trading_hours_held=trading_h,
                 )
             _persist_exit_line_sl_p(state, t, pos_info, exit_line)
             hard_stop = _calc_hard_stop(
@@ -5195,6 +5555,7 @@ def run_trading_bot():
                 ohlcv=ohlcv,
                 strategy_type=strategy_type,
                 ticker=t,
+                trading_hours_held=trading_h,
             )
 
             _exit_tag = "스윙" if strategy_type == "SWING_FIB" else "V8"
@@ -5219,11 +5580,14 @@ def run_trading_bot():
                 if curr_p <= hard_stop:
                     print(f"     ➜ 손절 체크: 현재가 {curr_fmt} ≤ 손절가 {hard_fmt} = 🔴 매도 신호!")
 
-            # 0%~+1% 구간은 매도 보류 (신규 매수 후 15분 동안)
+            # 수익률 +1% 미만·매수 후 15분: 매도 보류 (손실 구간 포함)
             buy_time = pos_info.get('buy_time', 0)
-            remain_sec = _new_buy_protection_remaining_sec(buy_time)
-            if 0 <= profit_rate_now < 1.0 and remain_sec > 0:
-                print(f"  ⏭️ {t}: 신규 매수 보호 구간 ({remain_sec}초 남음)")
+            if _new_buy_sell_protection_blocks(profit_rate_now, buy_time):
+                remain_sec = _new_buy_protection_remaining_sec(buy_time)
+                print(
+                    f"  ⏭️ {t}: 신규 매수 보호 구간 "
+                    f"({remain_sec}초 남음, 수익률 {profit_rate_now:+.2f}%)"
+                )
                 continue
 
             if strategy_type == "SWING_FIB":
@@ -5233,6 +5597,7 @@ def run_trading_bot():
                     reference_price=float(curr_p),
                     market="COIN",
                     ticker=t,
+                    trading_hours_held=trading_h,
                 )
                 if sw_action == "HALF":
                     sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
@@ -5384,13 +5749,19 @@ def run_trading_bot():
             # 매도 결정 로직 (우선순위: 타임스탑 > 하드스탑 > 샹들리에)
             reason = ""
 
-            now_str, hours_held, buy_time_log = _compute_holding_time_info(pos_info)
-            _print_position_hold_status(now_str, t, buy_time_log, hours_held)
+            _print_position_hold_status(
+                now_str,
+                t,
+                buy_time_log,
+                hours_held,
+                trading_hours=trading_h,
+                market="COIN",
+            )
 
             ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
                 market="COIN",
                 strategy_type=strategy_type,
-                hours_held=float(hours_held),
+                hours_held=float(trading_h),
                 profit_rate_now=float(profit_rate_now),
             )
             if ts_exit:
@@ -5400,7 +5771,7 @@ def run_trading_bot():
             elif ts_exempt:
                 _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("COIN", strategy_type)
                 print(
-                    f"   ✅ 타임스탑 유예 {_ts_tag} — 보유 {hours_held:.1f}h (≥{_ts_min_h:.0f}h), "
+                    f"   ✅ 타임스탑 유예 {_ts_tag} — 보유 {trading_h:.1f}h (≥{_ts_min_h:.0f}h), "
                     f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
                 )
 
@@ -5639,10 +6010,10 @@ def run_trading_bot():
                                 if sw_ok:
                                     strategy_type = "SWING_FIB"
                                     entry_fib_level = float(sw_fib)
-                                    sl_p = float(sw_fib)
-                                    s_name = "SWING_FIB"
                                     _sw_o = float(ohlcv[-1].get("o", 0) or 0)
                                     _sw_c = live_px_coin if live_px_coin > 0 else float(ohlcv[-1].get("c", 0) or 0)
+                                    sl_p = swing_entry_sl_p(_sw_c, sw_fib)
+                                    s_name = "SWING_FIB"
                                     _sw_src = "실시간" if live_px_coin > 0 else "일봉종가"
                                     print(
                                         f"  ✅ [SWING-BUY] {t} entry_fib={entry_fib_level:,.2f} "
@@ -5663,6 +6034,19 @@ def run_trading_bot():
                                 target_vol=_alpha_target_vol,
                                 ticker=t,
                             )
+
+                            _prospect_atr = atr_pct_from_ohlcv(ohlcv, t)
+                            _mkt_heat, _heat_blocked = _portfolio_heat_snapshot(
+                                state,
+                                "COIN",
+                                total_coin_equity,
+                                lambda tk, _cb=coin_broker: _cb.fetch_ohlcv(tk, "day", 200),
+                                extra_weight=float(ratio),
+                                extra_atr_pct=float(_prospect_atr or 0.0),
+                            )
+                            if _heat_blocked:
+                                _log_portfolio_heat_block("COIN", _mkt_heat, prospective=True)
+                                continue
 
                             budget = total_coin_equity * ratio * macro_mult
                             coin_min_budget = _coin_min_order_krw()
@@ -5722,6 +6106,7 @@ def run_trading_bot():
                                 )
                             else:
                                 _cycle_buy_fills += 1
+                                _register_swing_risk_after_buy(state, t, ohlcv, "COIN")
                             krw_bal = float(krw_box[0])
     else:
         print("💤 코인은 점검 또는 데이터 조회 불가 상태입니다.")

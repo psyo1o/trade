@@ -31,8 +31,9 @@
   strategy/      … 진입·청산 규칙(rules.py, indicators.py), 섹터·AI·거시
   execution/     … 장부·동기화·TWAP·분할익절·서킷브레이커
   services/      … 잔고 facade, GUI/heartbeat 공용 스냅샷, 테이블 어댑터
-  utils/         … 로그, 텔레그램, 공통 헬퍼(주말 KIS 차단 판별 등)
-  tests/         … test_lab.py(실험), test_kis_parsers.py 등
+  utils/         … 로그, 텔레그램, ohlcv_store, yfinance_guard, 공통 헬퍼
+  data/ohlcv_cache/ … 일봉 디스크 캐시(JSON, Git 제외)
+  tests/         … test_lab.py, test_ohlcv_pipeline.py, test_kis_parsers.py 등
   조건검색/      … HTS 조건검색식 원본. 최신 V8: v8조건검색 26.05(외국인수급제외 간결화).txt
                  (외국인·기관 수급 제거, A∧B∧((C∧D∧E∧F)∨(G∧H)) — README §8)
 
@@ -59,10 +60,15 @@ run_bot.py
     스윙 보조는 check_swing_entry 실패 시 [스윙] 한 줄(run_bot에서 출력).
   - 매수 시간창: 국 ``_is_kr_buy_window_now`` (KRX 15:30 KST 직전 N분), 미 ``_is_us_buy_window_now`` (NYSE 16:00 ET 직전 N분),
     코인 ``_is_coin_buy_window_now`` (일봉 KST 09:00 직전 N분, 업비트·바이낸스 공통). 창 안에서 V8→스윙·스캔·주문.
+    코인 스캔 유니버스: 업비트 KRW·바이낸스 USDT **24h 거래대금 상위 N**(기본 **10**, ``config.json`` ``upbit_universe_top`` / ``binance_universe_top``).
   - Phase4 글로벌: 사이클 시작 ``🛡️ [Phase4 거시]`` / ``🛡️ [Phase4 글로벌]`` / ``🚫 [Phase4 글로벌] MK …`` 는 매 사이클.
     ``-> 🚨 국장|미장|코인 Phase4 글로벌 방어막`` 은 **해당 시장 매수 창 안**에서만(창 밖은 ``[KR|US|COIN 매수 대기]``만).
     Phase4 예산 축소(VIX/FGI) 제거 — ``macro_mult`` 항상 1.0. 시장별 글로벌만 ``-> 🚨 … 글로벌 방어막`` (매수 창 안).
   - 동기화: ``fetch_equity_held_lists_for_position_sync`` — 국·미 비정규장이면 KIS 보유 목록 조회 생략. ``sync_all_positions`` 에서 비장중 held 보강 등.
+  - 일봉 OHLCV: ``get_cached_ohlcv`` — ``_ohlcv_cache``·``utils/ohlcv_store`` 디스크(3일) → 국 KIS→pykrx → 미 KIS→Stooq(``stooq_apikey``)→yfinance.
+    목표 200봉; V8 진입 120·스윙 60·매도 ATR 14+ (``OHLCV_MIN_BARS``). Yahoo 401 시 전역 차단 없음(``yfinance_guard`` 티커별 백오프).
+  - 타임스탑 시계: ``_time_stop_hours_elapsed`` — COIN 연속; KR/US 거래일 24h 누적·주말·공휴 0 (XKRX/NYSE 캘린더).
+    ``pandas_market_calendars`` break_start 공지 UserWarning — import 시 ``filterwarnings`` + ``is_yahoo_noise_line`` 텔레 제외.
   - 텔레 heartbeat: ``heartbeat_report`` → ``get_*_holdings_with_roi`` → ``_format_holding_line``
     (``전략:V8|스윙 | 매수가 | 현재가 | 최고가 | 매도선 | 보유기간``).
     ``_heartbeat_strategy_label`` — 장부 strategy_type·tier; 없으면 ``_strategy_from_trade_history_buy``(trade_history 최근 BUY reason).
@@ -80,9 +86,10 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
   - 스핀: 국·미·코인 max_positions + "설정 실시간 적용" → run_bot.MAX_* 즉시 + bot_state settings 저장.
   - 실시간 현황 보유표: **전략** 열(V8/스윙) 다음 **수동매도** 열 — 수량 QLineEdit(기본=행 보유 전량, 비우면 전량) + 매도 버튼 → _on_manual_sell_click
     (보유 초과·정수 주/코인 소수 검증) → run_bot.manual_sell.
-  - 탭: 실시간 현황(보유표·수동매도), 매매 내역(trade_history), 장부(positions, 수익률=max_p 기준, 마지막 열=전략명=tier),
-    고점 보정(입출금, adjust_capital 동일·CapitalAdjustThread).
-    실시간 현황 보유표: 시장·종목명·수량·매수단가·현재가·수익률·전략(V8/스윙, _dashboard_strategy_short)·수동매도.
+  - 탭: 실시간 현황(7열: 시장·종목·수량·매수가·현재가·전략·수동매도), 매매 내역, 장부(텔레 동일 보유 한 줄+상세),
+    전략 계산 안내(타임스탑·매도선 요약), 고점 보정(CapitalAdjustThread).
+    실시간: 최고가·매도선·보유시간 없음 — 장부·heartbeat·15분 매매 로그에 ``format_holding_display_line`` 공용.
+    보유 로그: 기동·잔고 갱신만으로 찍지 않음 — ``heartbeat_report``·매매 사이클 시.
     종목명 열 Interactive(약 절반 cap), 수량·가격·전략·매도 열 Stretch(_configure_holding_table).
     실시간·장부 수량: _build_live_qty_lookup 실계좌 우선. 코인 BUY qty는 체결 base 수량.
     봇 브리핑 로그는 탭 아래 공통 영역(QSplitter, run_gui.py setSizes).
@@ -140,13 +147,17 @@ us_universe_cache.json
 kr_targets.json
   - screener 출력. 자주 변하므로 Git 추적 제외.
 
+data/ohlcv_cache/
+  - ``utils/ohlcv_store.save_disk_ohlcv`` / ``load_disk_ohlcv`` — 티커별 JSON, 기본 72h TTL.
+
 
 --------------------------------------------------------------------------------
 3) 디렉터리별 — 코드를 어디서 고치나
 --------------------------------------------------------------------------------
 
 api/
-  kis_api.py, upbit_api.py … 주문·잔고·토큰; coin_config에 따라 업비트만/바이낸스만 초기화
+  kis_api.py … ``get_ohlcv_kis_us_daily``(해외 일봉 페이징) 포함; upbit_api.py …
+  coin_config에 따라 업비트만/바이낸스만 초기화
   coin_config.py … 코인 거래소 선택·환율 힌트 등
   coin_broker.py … 스캔·주문·잔고 공통 진입(업비트/바이낸스 분기)
   binance_api.py … 바이낸스 현물(CCXT)
@@ -154,25 +165,32 @@ api/
   kis_parsers.py … output2 list/dict 혼합 파싱 공통화
 
 strategy/
-  rules.py … calculate_pro_signals(V8, Hurst<0.45 차단),
-    check_swing_entry(Pullback KR/US/COIN: 60MA~+30%·거래량·갭3%·양봉·윗꼬리5%·피보),
+  rules.py … ``get_ohlcv_pykrx``(국장 백업), ``get_ohlcv_stooq``(키 필요), ``get_ohlcv_yfinance``(stderr·티커 백오프),
+    calculate_pro_signals(V8: Hurst<0.45·120MA 위(20일 최고 거래량 갱신 시 예외)·20MA 우상향·MACD·RSI 등, 최소 120봉),
+    check_swing_entry(Pullback: 60MA~+30%·거래량 Dry-up 당일<5일평균·갭3%·양봉·윗꼬리5%·RSI≥35·피보),
+      SWING_ENTRY_RSI_MIN=35, _swing_entry_rsi_at_price(판정종가 반영 RSI14),
       SWING_MA60_MAX_EXTENSION_PCT, SWING_VOL_MIN_VS_PREV_RATIO, SWING_GAP_UP_MAX_PCT,
       _pick_swing_fib_support_below: 38.2/50/61.8% 중 현재가 아래 지지),
-    check_swing_exit(피보/구름 FULL·HALF 볼밴OR+5%·RSI FULL +1~10%),
+    check_swing_exit(피보/구름+시간가중 FULL·HALF 1.5R·RSI FULL +1~10%),
+    register_swing_entry_risk_fields / resolve_swing_initial_1r (1R·초기 하드 바닥),
+    get_swing_scale_out_target_price(1.5R HALF 목표), _apply_swing_time_decaying_stop,
     check_swing_profit_lock_trailing_exit(수익 락 이탈만), reconcile_swing_position,
-    get_swing_exit_display_price(표시·sl_p), get_swing_hard_stop_floor, infer_swing_entry_fib_from_ohlcv,
-    get_swing_half_target_price(1차익절 볼밴·로그용), _SWING_PROFIT_LOCK_TIERS(4/8/15/25%),
-    SWING_BB_HALF_MIN_PROFIT_PCT=2.0, SWING_HALF_FIXED_TARGET_PCT=5.0, SWING_UPPER_WICK_DROP_PCT=5.0,
-    get_final_exit_price/get_chandelier_exit(V8: 샹들리에+이익락+절대cap -8%/-12%),
-    V8_MAX_STOP_CAP_MULT_EQUITY=0.92, V8_MAX_STOP_CAP_MULT_COIN=0.88,
-    _v8_max_stop_cap_floor; SWING_MAX_STOP_CAP_* (-5%/-7%) 등
-  alpha_sizing.py … 10일 RS 정렬, volatility_target_ratio (min(1/N, target_vol/ATR%))
+    get_swing_exit_display_price(표시·sl_p), get_swing_hard_stop_floor(trading_hours 반영),
+    infer_swing_entry_fib_from_ohlcv,
+    SWING_SCALE_OUT_R_MULT=1.5, SWING_TIME_DECAY_START_TRADING_HOURS=24,
+    SWING_TIME_DECAY_GAP_CLOSE_PER_24H=0.40, SWING_UPPER_WICK_DROP_PCT=5.0,
+    SWING_PROFIT_LOCK_ACTIVATE_PCT=3, V8_PROFIT_LOCK_ACTIVATE_PCT=4, BREAKEVEN_LOCK_MULT=1.005,
+    get_final_exit_price/get_chandelier_exit(V8: 샹들리에+20MA/ATR+본절락≥4%, 고정% 캡 없음),
+    get_v8_profit_lock_floor, get_swing_profit_lock_floor(본절락>3%) 등
+  market_hours.py … trading_hours_elapsed(KR/US 영업시간, COIN 24/7) — 타임스탑·스윙 시간가중용
+  alpha_sizing.py … 10일 RS, volatility_target_ratio, Portfolio Heat
+    (compute_market_portfolio_heat, portfolio_heat_blocks_entry, atr_pct_from_ohlcv)
   indicators.py … get_safe_atr (V8 ATR 무결성)
   sector_lock.py … Phase1 섹터 과다 방지
   ai_filter.py … Phase3 뉴스 LLM 0~100, 듀얼 프롬프트(v8_strict / swing_terminal_risk), Gemini→OpenAI 폴백
   macro_guard.py … Phase4 시장별 글로벌 매수 차단(US PCR / COIN 고래 / KR 환율 모멘텀).
-    US PCR 차단 시 SWING_FIB만 macro_buy_allowed_for_strategy 예외(V8 TREND_V8 차단 유지).
-    is_us_put_call_macro_block, macro_buy_allowed_for_strategy — run_bot US 매수 루프 연동
+    market_buy_allowed만 사용 — V8·SWING 전략 예외 없음.
+    macro_buy_allowed_for_strategy(호환 래퍼), is_us_put_call_macro_block — run_bot _macro_market_buy_allowed
 
 execution/
   guard.py … load/save_state, cooldown, MDD, Phase5, can_open_new,
@@ -193,11 +211,14 @@ services/
 
 utils/
   math_utils.py … calculate_hurst_exponent (R/S)
+  ohlcv_store.py … ``OHLCV_MIN_BARS``, ``ohlcv_len_ok``, ``data/ohlcv_cache`` 디스크
+  yfinance_guard.py … ``yf_ticker_allowed`` / 백오프, ``is_yahoo_noise_line``(야후 401·mcal 경고), stderr 억제
   logger.py … 일별 롤오버, 보관 파일명 bot.YYYY-MM-DD.log
   telegram.py, helpers.py … COIN_MIN_POSITION_QTY, coin_min_notional_usd,
     kis_equities_weekend_suppress_window_kst() 등
 
 tests/
+  test_ohlcv_pipeline.py … 최소 봉·V8/스윙 게이트·get_cached_ohlcv 폴백·pykrx 실조회
   test_lab.py, test_kis_parsers.py, test_news_fetch.py, test_alt_data_research.py
 
 
@@ -210,27 +231,29 @@ tests/
   3) 리스크 … 시장별 MDD, Phase5 합산 서킷, Phase4 글로벌 알파 스냅샷, 섹터·(매수 전) AI(TREND_V8만)·Hurst 등
   4) 매도 … KR → US → COIN
        - 보유 로그: SWING_FIB → 매도선(스윙)=get_swing_exit_display_price, sl_p·max_p 매 사이클 갱신(기존 포지션 포함)
-       - strategy_type==SWING_FIB → check_swing_exit(reference_price=현재가)
-         HALF=50% 익절(볼밴 상단·평단+2%↑) / FULL=피보·구름·RSI(평단↑) — 1차익절은 매도선 아님
+       - strategy_type==SWING_FIB → check_swing_exit(reference_price, trading_hours_held)
+         HALF=50% 익절(≥1.5R) / FULL=피보·구름+시간가중·RSI — 1차익절은 매도선 아님
          HALF·FULL이면 continue, HOLD면 아래로
        - 분할익절(Scale-Out) → 타임스탑 → SWING: 수익 락만(_check_swing_trailing_exit→profit_lock;
          피보/구름 FULL은 check_swing_exit, 손실구간 V8 hard_stop 스킵), TREND_V8: hard_stop·샹들리에
-       - 타임스탑: V8 주식 240h/+4%, V8 코인 72h/+4%, SWING 주식 120h/+2%, SWING 코인 48h/+2%
-         (run_bot V8_TIME_STOP_* / SWING_TIME_STOP_*, 주말 포함 연속시간)
-       - 하드·매도선: V8 get_final_exit_price(샹들리에×2.5ATR+이익락+max(기술선,평단×0.92/0.88));
-         기술이 -15%여도 국장 V8은 -8% cap(예). SWING get_swing_hard_stop_floor(max 피보·구름·cap -5%/-7%))
-       - V8 매수 초기 sl_p: calculate_pro_signals 듀얼 ATR 후 동일 cap 적용
-         표시 get_swing_exit_display_price(max 하드+수익락 4/8/15/25%)
+       - 타임스탑: V8 주식 72h/+4%, V8 코인 48h/+4%, SWING 주식 48h/+2%, SWING 코인 24h/+2%
+         (KR/US: 거래일 24h 누적·휴장 0 — ``_time_stop_hours_elapsed``; COIN 연속)
+       - 하드·매도선: V8 get_final_exit_price(샹들리에+20MA/ATR+본절락≥4%, 고정% 캡 없음).
+         SWING get_swing_hard_stop_floor(피보·구름+영업24h후 시간가중 10%/24h)
+       - V8 매수 초기 sl_p: calculate_pro_signals 기술 ATR선
+         SWING 표시 get_swing_exit_display_price(하드+본절락>3%→평단×1.005)
        - 타임스탑 reason 태그: [V8_TIME_STOP_*], [SWING_TIME_STOP_*] — ticker_cooldowns는 guard.py
        - 타임스탑/하드스탑/샹들리에 전량 청산: 단일 시장가 주문(재시도). TWAP는 매수·분할익절 전용(의도 설계)
   5) 매수 … KR → US → COIN (시간창·필터 통과 시)
-       - Phase4 글로벌 차단은 시장별 **매수 창 안**에서만 ``-> 🚨 … 글로벌 방어막`` (사이클 시작 ``🚫 [Phase4 글로벌]`` 요약은 매 사이클)
-       - BEAR 날씨: V8 신규 매수만 차단(_v8_trend_buy_allowed_in_weather), SWING_FIB 스윙 매수·스캔은 계속
+       - Phase4: market_buy_allowed false → 해당 시장 매수 창 전체 중단(V8·SWING 공통, US PCR 스윙 예외 없음)
+       - BEAR 날씨: V8 신규 매수만 차단(_v8_trend_buy_allowed_in_weather), SWING_FIB 스윙 매수·스캔은 계속(Phase4 통과 시)
        - 후보 RS 정렬(alpha_sizing) → V8 calculate_pro_signals(Hurst<0.45) 우선, 실패 시 check_swing_entry
          (국장 갭+5%·KR/US/COIN reference_close 실시간 양봉; V8 필터 없음)
+       - Portfolio Heat: 시장별 Σ(비중×ATR%) ≥ portfolio_heat_max_pct(기본 0.06) → 해당 시장 신규 매수 차단
        - Phase3 AI: _ai_false_breakout_buy_gate → strategy_type 전달·듀얼 프롬프트
        - 이미 보유(held_*) 종목은 신규 매수 스킵 (Holding Lock)
        - 비중: min(1/N, alpha_target_vol/ATR%) 후 예수금·최소주문 (macro_mult=1.0)
+       - SWING 체결 후 register_swing_entry_risk_fields (1R·entry_initial_hard_floor)
   6) (선택) 매수 존·조건 충족인데 신규 체결 0건 → 텔레그램 [매수 패스]
   7) trade_history / bot_state 저장
 
