@@ -78,7 +78,20 @@ from run_bot import (
     resolve_holding_display_price,
 )
 from execution.guard import load_state, save_state
+from execution import ledger_apply as ledger_apply
 from strategy.rules import (
+    SWING_ENTRY_RSI_MIN,
+    SWING_GAP_UP_MAX_PCT,
+    SWING_MA60_MAX_EXTENSION_PCT_COIN,
+    SWING_MA60_MAX_EXTENSION_PCT_KR,
+    SWING_MA60_MAX_EXTENSION_PCT_US,
+    SWING_PROFIT_LOCK_ACTIVATE_PCT,
+    SWING_RUNNER_TRAIL_MA_DAYS,
+    SWING_SCALE_OUT_R_MULT,
+    SWING_TIME_DECAY_GAP_CLOSE_PER_24H,
+    SWING_TIME_DECAY_START_TRADING_HOURS,
+    SWING_UPPER_WICK_DROP_PCT,
+    V8_PROFIT_LOCK_ACTIVATE_PCT,
     get_swing_exit_display_price,
     reconcile_swing_position,
 )
@@ -188,35 +201,107 @@ def _gui_market_code_from_label(market_label: str) -> str:
 
 
 def _build_strategy_guide_text() -> str:
-    """GUI 안내 탭: 타임스탑·매도선 계산 요약."""
+    """GUI 매매·전략 안내 탭 — README §8·run_bot 엔진과 동기화된 전체 요약."""
     v8_eq = float(getattr(run_bot, "V8_TIME_STOP_HOURS_EQUITY", 72.0))
     v8_coin = float(getattr(run_bot, "V8_TIME_STOP_HOURS_COIN", 48.0))
     sw_eq = float(getattr(run_bot, "SWING_TIME_STOP_HOURS_EQUITY", 48.0))
     sw_coin = float(getattr(run_bot, "SWING_TIME_STOP_HOURS_COIN", 24.0))
     v8_ex = float(getattr(run_bot, "V8_TIME_STOP_EXEMPT_PROFIT_PCT", 4.0))
     sw_ex = float(getattr(run_bot, "SWING_TIME_STOP_EXEMPT_PROFIT_PCT", 2.0))
-    sw_r = float(getattr(run_bot, "SWING_SCALE_OUT_R_MULT", 1.5))
+    sw_r = float(SWING_SCALE_OUT_R_MULT)
+    decay_pct = int(SWING_TIME_DECAY_GAP_CLOSE_PER_24H * 100)
+    heat_pct = float(getattr(run_bot, "PORTFOLIO_HEAT_MAX_PCT", 0.06)) * 100.0
+    max_kr = int(getattr(run_bot, "MAX_POSITIONS_KR", 3))
+    max_us = int(getattr(run_bot, "MAX_POSITIONS_US", 3))
+    max_coin = int(getattr(run_bot, "MAX_POSITIONS_COIN", 5))
+    buy_win = int(getattr(run_bot, "config", {}).get("buy_window_minutes_before_close", 30))
     return (
-        "📘 타임스탑·매도선 계산 요약\n"
-        "============================\n\n"
-        "1) 타임스탑 (run_bot.py)\n"
-        "- KR/US: 휴장일(주말·공휴일) Pause, 거래일은 장외 포함 연속 누적\n"
-        "- COIN: 24/7 연속 시간\n"
-        f"- V8: 주식 {v8_eq:.0f}h / 코인 {v8_coin:.0f}h, 유예 +{v8_ex:.1f}%\n"
-        f"- 스윙: 주식 {sw_eq:.0f}h / 코인 {sw_coin:.0f}h, 유예 +{sw_ex:.1f}%\n"
-        "- 발동 시 reason 태그: [V8_TIME_STOP_*] / [SWING_TIME_STOP_*]\n"
-        "- 전량 청산 후 ticker_cooldowns 24h 적용\n\n"
-        "2) 매도선 (strategy/rules.py + run_bot.py)\n"
-        "- V8: get_final_exit_price (샹들리에 + 기술선 + 본절락)\n"
-        "- 스윙: get_swing_exit_display_price (피보 + 일목 + 시간가중)\n"
-        f"- 스윙 1차 익절(HALF): {sw_r:.1f}R\n"
-        "- 매도선은 매 사이클(15분)마다 재계산 후 sl_p 갱신\n"
-        "- 텔레그램 형식 보유 한 줄: GUI 로그는 30분 생존신고 시에만 출력\n"
-        "- OHLCV 200봉: 국 KIS→pykrx→yfinance / 미 KIS해외→yfinance\n"
-        "- data/ohlcv_cache 디스크(3일), yfinance 401 시 전역 차단 없음\n\n"
-        "3) 현재 탭 용도\n"
-        "- 실시간 현황: 현재가/보유수량/전략 중심 (즉시 의사결정)\n"
-        "- 장부: 최고가/매도선/보유시간 포함 (기록·리스크 점검)\n"
+        "📘 매매·전략 안내 (V8 · SWING_FIB · Phase 1~5)\n"
+        "==========================================\n"
+        "README.md §8·run_bot.py 와 동일한 운영 요약입니다.\n\n"
+        "■ 0) 한 사이클·시장\n"
+        "- KST :00/:15/:30/:45 매매 사이클 (GUI·봇 동일 엔진)\n"
+        "- 시장: KR(국장) · US(미장) · COIN(업비트 KRW / 바이낸스 USDT)\n"
+        "- 종목마다 진입 순서: 10일 RS 정렬 → V8 먼저 → 실패 시 스윙\n"
+        f"- 매수 창: 장·일봉 마감 직전 {buy_win}분 (코인=KST 09:00 일봉 경계 직전, 업비트·바이낸스 동일)\n"
+        "- 장부 strategy_type: TREND_V8 | SWING_FIB (GUI·텔레: V8 / 스윙)\n\n"
+        "■ 1) 스캔 유니버스 (후보 종목)\n"
+        "- KR: HTS 조건검색 전체(kr_targets) + 시총200 ∩ 거래대금50 (14:50 KST screener)\n"
+        "  · HTS V8 26.05: 유동성 + (20MA·MACD·RSI 추세 OR 볼밴·RSI 턴어라운드)\n"
+        "- US: us_universe_cache 고베타 150 (NDX~90 + S&P 섹터 RR, 15:20 US/Eastern)\n"
+        "- COIN: 24h 거래대금 상위 N (config upbit/binance_universe_top, 기본 10)\n"
+        "  · 스테이블·페그 코인 자동 제외\n\n"
+        "■ 2) 매수 전 공통 게이트 (V8·스윙 공통)\n"
+        "- Phase5: 합산 계좌 MDD 서킷 (peak_total_equity, 월요일 주차 고점)\n"
+        "- Phase4: 시장별 신규 매수 차단 (macro_mult=1.0, 예산 축소 없음)\n"
+        "  · US: SPY Put/Call ≥1.2 → US 전면 차단\n"
+        "  · COIN: BTC 고래 롱숏 ≤0.8 → COIN 차단\n"
+        "  · KR: 원/달러 모멘텀 ≥1.015 → KR 차단\n"
+        "- Phase3: AI 뉴스 LLM (V8=엄격 / 스윙=Terminal Risk만)\n"
+        "- Phase1: GICS 섹터 과다 보유 방지 (sector_lock)\n"
+        "- Phase2: 매수·분할익절 TWAP (전량 청산은 시장가 1회)\n"
+        "  · 매수 멱등: 15분 사이클·슬라이스별 order_key, buy_inflight 중복 차단\n"
+        "  · 매도 멱등: sell:{lane}(swing_half/full, scale_out, exit, manual, phase5)\n"
+        "  · KIS: rt_cd 실패도 잔고 증감으로 체결 보정 / 바이낸스: clientOrderId\n"
+        "  · sell_inflight — 동일 사이클·티커·lane 중복 매도 차단\n"
+        "  · 장부 등록 120초 내 동일 BUY 중복 스킵(수량만 병합)\n"
+        "  · 잔고: balance_read TTL(체결검증 전용, 조회는 원래 멱등)\n"
+        "  · 상세: docs/idempotency/ (PROGRESS·BALANCE_READS·SMOKE_TEST)\n"
+        f"- Portfolio Heat: 시장별 Σ(비중×ATR%) < {heat_pct:.1f}% (기본 6%)\n"
+        f"- 비중: min(1/N, alpha_target_vol/ATR%) — KR {max_kr} / US {max_us} / COIN {max_coin} 슬롯\n"
+        "- BEAR 날씨: V8 신규만 차단, 스윙(SWING_FIB)은 허용\n"
+        "- 이미 보유·쿨다운·최소주문·예수금 부족 시 패스\n\n"
+        "■ 3) V8 추세 매수 — calculate_pro_signals (strategy_type=TREND_V8)\n"
+        "- 최소 120봉 OHLCV (목표 캐시 200봉)\n"
+        "- Hurst H<0.45 → 횡보·역추세 차단 (50~100봉 R/S)\n"
+        "- 양봉 필수 (종가>시가)\n"
+        "- 윗꼬리: 고가-종가 > ATR×0.5 거절\n"
+        "- 과열: 종가 > 20MA + 3×ATR 거절\n"
+        "- 20MA 위 + 20MA 우상향\n"
+        "- 120MA 위 (예외: 당일 거래량≥20일 최고 → 바닥권 턴어라운드 허용)\n"
+        "- 장기추세: 50MA>200MA (또는 종가>50MA)\n"
+        "- 3중 교차: 거래량>20일평균 · MACD>시그널 · RSI 50~75\n"
+        "- 초기 sl_p: max(20MA−ATR, 종가−2×ATR) — 평단 대비 고정% 캡 없음\n"
+        "- 국장 추가: V8 루프 갭 +5% 컷 (스윙 갭 +3%와 별도)\n"
+        "- 통과 로그: [V8-BUY] / 실패: [V8] … 패스 사유\n\n"
+        "■ 4) V8 매도 — get_final_exit_price · check_pro_exit\n"
+        "- 루프 순서: 분할익절(Scale-Out) → 타임스탑 → 손실 시 hard_stop(sl_p) → 수익 시 check_pro_exit\n"
+        f"- 타임스탑: 주식 {v8_eq:.0f}h / 코인 {v8_coin:.0f}h, 유예 수익 +{v8_ex:.1f}% 이상이면 유예\n"
+        "- 매도선 = max(샹들리에, 20MA−ATR·종가−2ATR 기술선, 본절락, 장부 sl_p)\n"
+        "  · 샹들리에: max_p − ATR×2.5\n"
+        f"  · 본절락: max_p 최고수익 ≥{V8_PROFIT_LOCK_ACTIVATE_PCT:.0f}% → 평단×1.005\n"
+        "- 수익 구간: 현재가 ≤ 매도선 → 전량 (락·샹들리에 사유 로그)\n"
+        "- 스윙 포지션에는 V8 샹들리에·check_pro_exit 미적용\n\n"
+        "■ 5) 스윙 매수 — check_swing_entry (V8 실패 후, SWING_FIB)\n"
+        "- 최소 60봉 · Hurst/120MA/V8 3중교차 없음 (눌림목 전용)\n"
+        "- 60MA 위 + 시장별 이격 상한 (칼날·과열 추격 차단)\n"
+        f"  · US +{SWING_MA60_MAX_EXTENSION_PCT_US:.0f}% / KR +{SWING_MA60_MAX_EXTENSION_PCT_KR:.0f}% / "
+        f"COIN +{SWING_MA60_MAX_EXTENSION_PCT_COIN:.0f}%\n"
+        f"- 양봉 · 갭<{SWING_GAP_UP_MAX_PCT:.0f}% · 거래량 Dry-up(당일<5일평균)\n"
+        f"- 윗꼬리<{SWING_UPPER_WICK_DROP_PCT:.0f}% · RSI(14)≥{SWING_ENTRY_RSI_MIN:.0f}\n"
+        "- 피보 38.2/50/61.8% 중 현재가 아래 지지 → entry_fib_level\n"
+        "- 통과: [SWING-BUY] · 실패: [스윙] 한 줄 사유\n\n"
+        "■ 6) 스윙 매도 — check_swing_exit · get_swing_exit_display_price\n"
+        "- 루프: check_swing_exit(FULL/HALF) → Scale-Out → 타임스탑 → 트레일링\n"
+        f"- 타임스탑: 주식 {sw_eq:.0f}h / 코인 {sw_coin:.0f}h, 유예 +{sw_ex:.1f}%\n"
+        "- FULL: 하드(피보·구름+시간가중) · 러너 5MA 이탈 · RSI +1~10%\n"
+        f"- HALF: 수익≥{sw_r:.1f}R → 50% 익절 → 러너 후보\n"
+        f"- 시간가중: 영업 {SWING_TIME_DECAY_START_TRADING_HOURS:.0f}h 후 24h마다 gap {decay_pct}% 상향\n"
+        f"- 본절락: max_p>{SWING_PROFIT_LOCK_ACTIVATE_PCT:.0f}% → 평단×1.005\n"
+        f"- 러너: scale_out 또는 max_p≥{sw_r:.1f}R → 5MA 트레일(고점 래칫, sl_p·표시선 하향 없음)\n"
+        "- 비러너 트레일: 본절락 이탈 전량 / 러너: 5MA 이탈 전량\n"
+        "- V8식 hard_stop 루프는 스윙에 미적용\n\n"
+        "■ 7) 타임스탑·쿨다운\n"
+        "- KR/US 보유시간: 거래일 연속(장외 포함), 휴장일 Pause (XKRX/NYSE 캘린더)\n"
+        "- COIN: 24/7 연속\n"
+        "- 전량 청산 후 ticker_cooldowns: 익절·트레일·Scale-Out 1h / 손절·타임스탑 24h\n"
+        "- 분할 익절 후 잔량 있으면 쿨다운 미부여\n\n"
+        "■ 8) 데이터·GUI 탭\n"
+        "- OHLCV: 메모리·data/ohlcv_cache(3일) → KIS→pykrx/Stooq→yfinance\n"
+        "- 매도선·sl_p: 15분마다 재계산 (장부 탭·생존신고 동일)\n"
+        "- 실시간 현황: 현재가·수량·전략(V8/스윙)\n"
+        "- 장부: 최고가(max_p)·매도선·보유시간(영업시간)\n"
+        "- 수동 매도: 수량 입력+버튼 (전량/부분, 부분은 stats 별도 누적)\n"
     )
 
 
@@ -724,6 +809,7 @@ class BalanceUpdaterThread(QThread):
                 allow_kis_fetch=_allow_kis_fetch,
                 with_backoff=_with_backoff,
                 force_kis_labels=self.force_kis,
+                fresh_balances=True,
             )
             labels = snap.get("labels", {})
             d2_kr = int(_safe_num((labels.get("kr") or {}).get("cash", 0), 0))
@@ -1154,10 +1240,10 @@ class BotDashboard(QMainWindow):
         
         tabs.addTab(ledger_tab, "장부 (현재 포지션)")
 
-        # 4. 전략 계산 안내 (타임스탑·매도선)
+        # 4. 매매·전략 안내 (타임스탑·매도선·러너 5MA)
         guide_tab = QWidget()
         guide_layout = QVBoxLayout(guide_tab)
-        guide_title = QLabel("📘 전략 계산 안내")
+        guide_title = QLabel("📘 매매·전략 안내 (V8 · SWING · Phase 1~5)")
         guide_title.setObjectName("SectionTitle")
         self.guide_console = QTextEdit()
         self.guide_console.setReadOnly(True)
@@ -1165,7 +1251,7 @@ class BotDashboard(QMainWindow):
         self.guide_console.setText(_build_strategy_guide_text())
         guide_layout.addWidget(guide_title)
         guide_layout.addWidget(self.guide_console, 1)
-        tabs.addTab(guide_tab, "전략 계산 안내")
+        tabs.addTab(guide_tab, "매매·전략 안내")
 
         # 5. 합산 고점 보정 (adjust_capital.py와 동일 로직)
         capital_tab = QWidget()
@@ -1839,7 +1925,13 @@ class BotDashboard(QMainWindow):
                     msg = f"🚀 [GUI 감지] {ticker_key} 최고가 갱신! ({old_max:,.2f} ➔ {current_p_float:,.2f})"
                     print(msg)
 
-                # 원자적 저장 — write_text 직접 덮어쓰기는 매매 루프와 충돌해 JSON 깨짐·WinError 5 유발
+                # 봇이 같은 구간에 저장했으면 병합 후 이 티커 가격만 다시 반영
+                ledger_apply.merge_disk_if_newer(state, STATE_PATH)
+                if ticker_key in state.get("positions", {}):
+                    pos = state["positions"][ticker_key]
+                    pos["curr_p"] = current_p_float
+                    if current_p_float > float(pos.get("max_p", 0.0)):
+                        pos["max_p"] = current_p_float
                 save_state(STATE_PATH, state)
 
         except Exception as e:

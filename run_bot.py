@@ -28,7 +28,7 @@ run_bot — V5.0 통합 자동매매 엔진 (국장 / 미장 / 코인)
     * ``strategy.sector_lock`` / ``strategy.ai_filter`` / ``strategy.macro_guard`` — 섹터·휩쏘·거시.
 
 코드 맵
-    * 상단 유틸 — 지수 변화율, 미장 유니버스(S&P100+Ndx50, ``us_universe_cache.json``) 등.
+    * 상단 유틸 — 지수 변화율, 미장 유니버스(고베타 NDX+S&P RR 150, ``us_universe_cache.json``) 등.
     * ``# 0. 기본 설정`` 이후 — 경로, 로깅, config 전역, Phase2~5 플래그.
     * ``run_trading_bot()`` — 한 사이클(동기화 → 손절/익절 → 스크리너 → 신규 매수).
     * ``run_continuously`` / ``start_scanner_scheduler`` — schedule 루프·스캐너(매매는 매시 KST :00/:15/:30/:45).
@@ -89,12 +89,15 @@ from execution.scale_out import (
     plan_coin_sell_chunks,
     position_scale_out_done,
     post_partial_ledger,
-    run_coin_scale_out_chunks,
-    run_stock_scale_out_slices,
     scale_out_trigger_ok,
     stock_scale_out_min_notional_ok,
+    truncate_coin_qty,
 )
 from execution.sync_positions import sync_all_positions, _last_buy_price_from_trade_history
+from execution.order_twap import plan_sell_qty_twap
+from execution import balance_read as bal_read
+from execution import idempotency as order_idem
+from execution import ledger_apply as ledger_apply
 from strategy.ai_filter import (
     evaluate_false_breakout_filter,
     summarize_ai_rationale,
@@ -277,150 +280,21 @@ def _fetch_us_sector_gics(sym: str) -> tuple[str, str]:
 
 def get_top_market_cap_tickers(limit=150, *, force_refresh: bool = False):
     """
-    미장 감시 유니버스: **S&P 500 시총 상위 100 + Nasdaq 100 중 Tier1 제외 상위 50** (총 150).
+    미장 감시 유니버스 — ``us_screener`` 고베타·섹터 분산 모델 (최대 150).
 
-    * ``us_universe_cache.json`` 에 티커·GICS 섹터를 저장하고 **24시간**마다만 재조회.
-    * ``force_refresh=True`` 면 캐시 TTL·기존 파일을 무시하고 즉시 재빌드(미장 스크리너 잡 용).
-    * ``seed_us_sector_cache`` 로 섹터를 주입해 ``allow_us_sector_entry`` 와 연동.
+    * NDX 우선(~90) + S&P 섹터 라운드로빈 잔여 슬롯
+    * 배제: Utilities, Consumer Staples/Defensive, Real Estate, Basic Materials
+    * ``us_universe_cache.json`` — tickers + GICS sectors, 24h TTL
     """
+    import us_screener
+
     base_dir = Path(__file__).resolve().parent
-    cache_path = base_dir / US_UNIVERSE_CACHE_FILE
-
-    if not force_refresh:
-        try:
-            if cache_path.exists():
-                age = time.time() - cache_path.stat().st_mtime
-                if age < US_UNIVERSE_CACHE_TTL_SEC:
-                    payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                    tickers = payload.get("tickers") or []
-                    sectors = payload.get("sectors") or {}
-                    if 100 <= len(tickers) <= 150 and all(isinstance(x, str) for x in tickers):
-                        seed_us_sector_cache(sectors)
-                        print(
-                            f"  -> ✅ 미장 유니버스 캐시 사용: {len(tickers)}개 "
-                            f"(갱신 후 {int(age // 3600)}h, {cache_path.name})"
-                        )
-                        return tickers
-        except Exception as e:
-            print(f"  ⚠️ 미장 유니버스 캐시 읽기 실패 — 재빌드: {e}")
-
-    print(
-        "  -> ⏳ [미장 유니버스] S&P500 시총 Top100 + Nasdaq100 Tier1 제외 상위 50 "
-        f"(총 {limit}개) 빌드 중… (최초·24h마다 yfinance 다발 호출)"
+    return us_screener.load_or_build_us_universe(
+        limit=limit,
+        force_refresh=force_refresh,
+        cache_path=base_dir / US_UNIVERSE_CACHE_FILE,
+        ttl_sec=US_UNIVERSE_CACHE_TTL_SEC,
     )
-
-    sp_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    # Nasdaq-100 은 ``List_of_Nasdaq-100_companies`` 가 404 반환하는 경우가 있어
-    # 본 문서(``/wiki/Nasdaq-100``) → ``NASDAQ-100`` → 과거 경로 순으로 폴백한다.
-    ndx_urls = [
-        "https://en.wikipedia.org/wiki/Nasdaq-100",
-        "https://en.wikipedia.org/wiki/NASDAQ-100",
-        "https://en.wikipedia.org/wiki/List_of_Nasdaq-100_companies",
-    ]
-
-    try:
-        sp_raw = _wiki_table_symbols(sp_url)
-    except Exception as e:
-        print(f"🚨 [미장 유니버스] S&P500 위키 파싱 실패 — 빌드 중단: {e}")
-        raise
-
-    ndx_raw: list[str] = []
-    ndx_err: Exception | None = None
-    for u in ndx_urls:
-        try:
-            ndx_raw = _wiki_table_symbols(u)
-            if ndx_raw:
-                break
-        except Exception as e:
-            ndx_err = e
-            print(f"  ⚠️ [미장 유니버스] Nasdaq100 위키 실패({u}): {e}")
-            continue
-    if not ndx_raw:
-        print(
-            f"  ⚠️ [미장 유니버스] Nasdaq100 위키 모든 경로 실패 — "
-            f"S&P500 Top100 만으로 빌드 진행 (마지막 오류: {ndx_err!r})"
-        )
-
-    print("     ... S&P 500 시총 병렬 조회 ...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-        sp_caps = list(ex.map(_fetch_market_cap_yf, sp_raw))
-    sp_caps = [(s, c) for s, c in sp_caps if c > 0]
-    sp_caps.sort(key=lambda x: x[1], reverse=True)
-    tier1 = [s for s, _ in sp_caps[:100]]
-    tier1_set = set(tier1)
-
-    tier2: list[str] = []
-    if ndx_raw:
-        print("     ... Nasdaq 100 시총 병렬 조회 ...")
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-                ndx_caps = list(ex.map(_fetch_market_cap_yf, ndx_raw))
-            ndx_caps = [(s, c) for s, c in ndx_caps if c > 0]
-            ndx_caps.sort(key=lambda x: x[1], reverse=True)
-            for s, _c in ndx_caps:
-                if s in tier1_set:
-                    continue
-                tier2.append(s)
-                if len(tier2) >= 50:
-                    break
-        except Exception as e:
-            print(f"  ⚠️ [미장 유니버스] Nasdaq 시총 조회 실패 — Tier2 생략: {e}")
-
-    if len(tier2) < 50:
-        print(
-            f"  ⚠️ [미장 유니버스] Tier2(Nasdaq100) {len(tier2)}개 확보 "
-            f"(목표 50). 유니버스가 {len(tier1) + len(tier2)}개로 줄어듭니다."
-        )
-
-    try:
-        final = (tier1 + tier2)[:limit]
-        if len(final) < limit:
-            print(f"  ⚠️ [미장 유니버스] 목표 {limit}개 미만 ({len(final)}개) — 그대로 캐시합니다.")
-        if not final:
-            raise RuntimeError("S&P500/Nasdaq100 모두 비어 유니버스 빌드 불가")
-
-        print(f"     ... GICS 섹터 병렬 조회 ({len(final)}종) ...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
-            sec_pairs = list(ex.map(_fetch_us_sector_gics, final))
-        sectors = {s: sec for s, sec in sec_pairs}
-
-        payload = {
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "tickers": final,
-            "sectors": sectors,
-            "meta": {
-                "tier1_n": len(tier1),
-                "tier2_n": len(tier2),
-                "target_limit": limit,
-                "actual_n": len(final),
-            },
-        }
-        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        seed_us_sector_cache(sectors)
-        print(f"✅ 미장 유니버스 {len(final)}개 빌드·캐시 저장 완료 ({cache_path.name})")
-        return final
-
-    except Exception as e:
-        print(f"⚠️ [경고] 미장 유니버스 빌드 실패: {e}")
-        try:
-            if cache_path.exists():
-                payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                tickers = payload.get("tickers") or []
-                sectors = payload.get("sectors") or {}
-                if 100 <= len(tickers) <= 150:
-                    seed_us_sector_cache(sectors)
-                    age_h = int((time.time() - cache_path.stat().st_mtime) // 3600)
-                    print(
-                        f"    -> 🗂️ 기존 캐시 재사용: {len(tickers)}개 "
-                        f"(갱신 후 {age_h}h, {cache_path.name}) — 신규 빌드 실패로 폴백"
-                    )
-                    return tickers
-        except Exception as e2:
-            print(f"    ⚠️ 기존 캐시 재사용도 실패: {e2}")
-        print("    -> 비상용 백업 목록으로 대신합니다.")
-        fb = ["QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA"]
-        seed_us_sector_cache({t: "Unknown" for t in fb})
-        return fb[: max(1, min(limit, len(fb)))]
 
 # =====================================================================
 # 0. 기본 설정 — 경로, 로깅, 텔레그램, config.json 단일 로드, Phase 전역
@@ -1256,16 +1130,23 @@ def get_safe_balance(data, key=None, default=0):
         if market == "KR":
             if kis_equities_weekend_suppress_window_kst():
                 return {}
-            try: return get_balance_with_retry()
-            except: return {}
+            try:
+                return ensure_dict(bal_read.kr_balance_for_report(refresh=False))
+            except Exception:
+                return {}
         elif market == "US":
             if kis_equities_weekend_suppress_window_kst():
                 return {}
-            try: return get_us_positions_with_retry()
-            except: return {}
+            try:
+                return ensure_dict(bal_read.us_balance_for_report(refresh=False))
+            except Exception:
+                return {}
         elif market == "COIN":
-            try: return coin_broker.get_balances()
-            except: return []
+            try:
+                raw = bal_read.coin_balances_for_report(refresh=False)
+                return raw if isinstance(raw, list) else []
+            except Exception:
+                return []
         return {}
     
     # 현재: dict 값 추출 모드
@@ -1297,9 +1178,20 @@ def _run_manual_sell_position_sync() -> None:
     sync_all_positions(state, held_kr, held_us, held_coins, STATE_PATH)
 
 
-def _apply_manual_sell_state_update(ticker: str, exec_price: float, market: str, sold_qty: float) -> dict:
+def _apply_manual_sell_state_update(
+    ticker: str,
+    exec_price: float,
+    market: str,
+    sold_qty: float,
+    *,
+    state: dict | None = None,
+) -> dict:
     """수동 매도 체결 후 장부 반영. 전량 청산 시에만 승패·total_profit·티커 쿨다운(Layer2) 종결."""
-    state = load_state(STATE_PATH)
+    if state is None:
+        state = load_state(STATE_PATH)
+    else:
+        ledger_apply.merge_disk_if_newer(state, STATE_PATH)
+    ticker = normalize_ticker(ticker)
     positions = state.setdefault("positions", {})
     pos_info = positions.get(ticker, {}) or {}
     strategy_st = pos_info.get("strategy_type")
@@ -1340,30 +1232,42 @@ def _apply_manual_sell_state_update(ticker: str, exec_price: float, market: str,
                 profit_rate
             ) * w
 
-    if ticker in positions:
-        if full_exit:
-            del positions[ticker]
-        elif qty_before > 0 and remaining > eps:
-            positions[ticker] = post_partial_ledger(
-                dict(pos_info),
-                float(sold_eff),
-                float(exec_px),
-                float(qty_before),
-                set_scale_out_done=False,
+    def _mut_manual_sell(st: dict) -> None:
+        set_cooldown(st, ticker)
+        set_ticker_cooldown_after_sell(
+            st,
+            ticker,
+            "수동 매도",
+            profit_rate=profit_rate,
+            strategy_type=strategy_st,
+            market=market,
+            remaining_qty=float(remaining) if not full_exit else 0.0,
+        )
+
+    ctx = f"수동매도 {market} {ticker}"
+    if full_exit:
+        if ticker in positions:
+            ledger_apply.persist_position_remove(
+                state, ticker, context=ctx, state_path=STATE_PATH, mutate_fn=_mut_manual_sell
             )
+        else:
+            _mut_manual_sell(state)
+            ledger_apply.save_state_verified(state, STATE_PATH, context=ctx)
+    elif qty_before > 0 and remaining > eps:
+        new_pos = post_partial_ledger(
+            dict(pos_info),
+            float(sold_eff),
+            float(exec_px),
+            float(qty_before),
+            set_scale_out_done=False,
+        )
+        ledger_apply.persist_position_set(
+            state, ticker, new_pos, context=ctx, state_path=STATE_PATH, mutate_fn=_mut_manual_sell
+        )
+    else:
+        _mut_manual_sell(state)
+        ledger_apply.save_state_verified(state, STATE_PATH, context=ctx)
 
-    set_cooldown(state, ticker)
-    set_ticker_cooldown_after_sell(
-        state,
-        ticker,
-        "수동 매도",
-        profit_rate=profit_rate,
-        strategy_type=strategy_st,
-        market=market,
-        remaining_qty=float(remaining) if not full_exit else 0.0,
-    )
-
-    save_state(STATE_PATH, state)
     return {
         "profit_rate": profit_rate,
         "full_exit": full_exit,
@@ -1371,14 +1275,20 @@ def _apply_manual_sell_state_update(ticker: str, exec_price: float, market: str,
         "sold_qty": float(sold_eff),
     }
 
-def manual_sell(market, code, quantity):
+def manual_sell(market, code, quantity, *, idem_lane: str | None = None):
     """수동 매도
     반환 형식: {"success": bool, "message": str}
+
+    ``idem_lane`` — Phase5 청산 등 멱등 lane (기본 ``manual``).
     """
+    lane = str(idem_lane or order_idem.LANE_MANUAL)
     try:
         qty = _to_float(quantity, 0)
         if qty <= 0:
             return {"success": False, "message": "매도 수량이 0 이하입니다."}
+
+        st = load_state(STATE_PATH)
+        order_idem.ensure_idempotency_state(st)
 
         if market == "KR":
             # 현재가 먼저 조회
@@ -1387,17 +1297,33 @@ def manual_sell(market, code, quantity):
             if curr_p <= 0:
                 return {"success": False, "message": "국장 현재가 조회 실패"}
             
-            resp = create_market_sell_order_kis(code, int(qty), is_us=False, curr_price=curr_p)
-            ok = isinstance(resp, dict) and resp.get("rt_cd") == "0"
-            msg = resp.get("msg1", "국장 시장가 매도 요청") if isinstance(resp, dict) else "국장 매도 응답 없음"
+            def _man_kr_place():
+                return create_market_sell_order_kis(
+                    code, int(qty), is_us=False, curr_price=curr_p
+                )
+
+            fill = _idempotent_kis_sell(
+                st,
+                market="KR",
+                ticker=code,
+                lane=lane,
+                qty=int(qty),
+                fallback_price=float(curr_p),
+                place_order=_man_kr_place,
+            )
+            ok = fill.ok
+            msg = fill.note or ("체결" if ok else "국장 매도 실패")
             if ok:
-                st0 = load_state(STATE_PATH)
-                pos0 = (st0.get("positions") or {}).get(code, {})
+                order_idem.persist_idempotency(st, STATE_PATH)
+                bal_read.invalidate("KR")
+                pos0 = (st.get("positions") or {}).get(code, {})
                 hold_note = _holding_duration_suffix(
                     pos0 if isinstance(pos0, dict) else {}, "KR"
                 )
                 exec_price = curr_p
-                meta = _apply_manual_sell_state_update(code, exec_price, "KR", float(int(qty)))
+                meta = _apply_manual_sell_state_update(
+                    code, exec_price, "KR", float(int(qty)), state=st
+                )
                 profit_rate = meta.get("profit_rate")
                 full_exit = bool(meta.get("full_exit", True))
                 rem_q = float(meta.get("remaining_qty") or 0.0)
@@ -1426,7 +1352,7 @@ def manual_sell(market, code, quantity):
             us_bal = (
                 {}
                 if kis_equities_weekend_suppress_window_kst()
-                else ensure_dict(get_us_positions_with_retry())
+                else ensure_dict(bal_read.us_balance_for_report(refresh=False))
             )
             current_price = 0.0
             for item in us_bal.get("output1", []) if isinstance(us_bal.get("output1", []), list) else []:
@@ -1440,17 +1366,32 @@ def manual_sell(market, code, quantity):
             if current_price <= 0:
                 return {"success": False, "message": "미장 현재가 조회 실패"}
 
-            # 시장가 매도
-            resp = execute_us_order_direct(kis_api.broker_us, "sell", code, int(qty), current_price)
-            ok = isinstance(resp, dict) and resp.get("rt_cd") == "0"
-            msg = resp.get("msg1", "미장 시장가 매도 요청") if isinstance(resp, dict) else "미장 매도 응답 없음"
+            def _man_us_place():
+                return execute_us_order_direct(
+                    kis_api.broker_us, "sell", code, int(qty), current_price
+                )
+
+            fill = _idempotent_kis_sell(
+                st,
+                market="US",
+                ticker=code,
+                lane=lane,
+                qty=int(qty),
+                fallback_price=float(current_price),
+                place_order=_man_us_place,
+            )
+            ok = fill.ok
+            msg = fill.note or ("체결" if ok else "미장 매도 실패")
             if ok:
-                st0 = load_state(STATE_PATH)
-                pos0 = (st0.get("positions") or {}).get(code, {})
+                order_idem.persist_idempotency(st, STATE_PATH)
+                bal_read.invalidate("US")
+                pos0 = (st.get("positions") or {}).get(code, {})
                 hold_note = _holding_duration_suffix(
                     pos0 if isinstance(pos0, dict) else {}, "US"
                 )
-                meta = _apply_manual_sell_state_update(code, current_price, "US", float(int(qty)))
+                meta = _apply_manual_sell_state_update(
+                    code, current_price, "US", float(int(qty)), state=st
+                )
                 profit_rate = meta.get("profit_rate")
                 full_exit = bool(meta.get("full_exit", True))
                 rem_q = float(meta.get("remaining_qty") or 0.0)
@@ -1476,14 +1417,23 @@ def manual_sell(market, code, quantity):
 
         if market == "COIN":
             current_p = _to_float(coin_broker.get_current_price(code) or 0, 0.0)
-            resp = coin_broker.sell_market(code, float(qty))
-            if resp:
-                st0 = load_state(STATE_PATH)
-                pos0 = (st0.get("positions") or {}).get(code, {})
+            fill = _idempotent_coin_sell(
+                st,
+                ticker=code,
+                lane=lane,
+                qty=float(qty),
+                fallback_price=float(current_p),
+            )
+            if fill.ok:
+                order_idem.persist_idempotency(st, STATE_PATH)
+                bal_read.invalidate("COIN")
+                pos0 = (st.get("positions") or {}).get(code, {})
                 hold_note = _holding_duration_suffix(
                     pos0 if isinstance(pos0, dict) else {}, "COIN"
                 )
-                meta = _apply_manual_sell_state_update(code, current_p, "COIN", float(qty))
+                meta = _apply_manual_sell_state_update(
+                    code, current_p, "COIN", float(qty), state=st
+                )
                 profit_rate = meta.get("profit_rate")
                 full_exit = bool(meta.get("full_exit", True))
                 rem_q = float(meta.get("remaining_qty") or 0.0)
@@ -1502,7 +1452,7 @@ def manual_sell(market, code, quantity):
                     )
                 _run_manual_sell_position_sync()
                 return {"success": True, "message": "코인 시장가 매도 요청 완료"}
-            return {"success": False, "message": "코인 매도 응답 없음"}
+            return {"success": False, "message": fill.note or "코인 매도 실패"}
 
         return {"success": False, "message": f"지원하지 않는 시장 코드: {market}"}
     except Exception as e:
@@ -1743,7 +1693,7 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
                 qty = int(_to_float(stock.get("hldg_qty", 0)))
                 if qty <= 0 or not code:
                     continue
-                manual_sell("KR", code, qty)
+                manual_sell("KR", code, qty, idem_lane=order_idem.LANE_PHASE5)
         except Exception as e:
             print(f"  ⚠️ [Phase5] 국장 전량 청산 루프 예외: {e}")
     else:
@@ -1758,7 +1708,7 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
                 q = int(_to_float(item.get("ovrs_cblc_qty", item.get("hldg_qty", 0))))
                 if q <= 0 or not c:
                     continue
-                manual_sell("US", c, q)
+                manual_sell("US", c, q, idem_lane=order_idem.LANE_PHASE5)
         except Exception as e:
             print(f"  ⚠️ [Phase5] 미장 전량 청산 루프 예외: {e}")
     else:
@@ -1777,7 +1727,7 @@ def _phase5_emergency_liquidate_all(state: dict) -> None:
             qf = float(_to_float(b.get("balance", 0)))
             if not coin_broker.should_include_coin_balance_row(b):
                 continue
-            manual_sell("COIN", t, qf)
+            manual_sell("COIN", t, qf, idem_lane=order_idem.LANE_PHASE5)
     except Exception as e:
         print(f"  ⚠️ [Phase5] 코인 전량 청산 루프 예외: {e}")
 
@@ -1985,26 +1935,31 @@ def persist_position_registration(state, ticker, position_payload, context="", s
     position_payload.setdefault("scale_out_done", False)
     if "entry_atr" not in position_payload:
         position_payload["entry_atr"] = float(_to_float(position_payload.get("current_atr", 0), 0.0))
-    state.setdefault("positions", {})[ticker] = position_payload
-    set_cooldown(state, ticker)
-
-    for attempt in range(1, 4):
+    existing = state.get("positions", {}).get(ticker)
+    if isinstance(existing, dict) and "BUY" in str(context or "").upper():
         try:
-            save_state(state_path, state)
-            latest = load_state(state_path)
-            latest_positions = latest.get("positions", {}) if isinstance(latest, dict) else {}
-            if ticker in latest_positions:
-                print(f"  ✅ [{context}] 장부 등록 확인: {ticker} (시도 {attempt}/3)")
+            old_bt = float(_to_float(existing.get("buy_time", 0), 0.0))
+            new_bt = float(_to_float(position_payload.get("buy_time", 0), 0.0))
+            old_qty = float(_to_float(existing.get("qty", 0), 0.0))
+            new_qty = float(_to_float(position_payload.get("qty", 0), 0.0))
+            if abs(new_bt - old_bt) < 120.0 and new_qty <= old_qty * 1.02:
+                print(f"  ✅ [{context}] 장부 이미 등록됨(멱등): {ticker}")
                 return True
-            print(f"  ⚠️ [{context}] 저장 후 미반영: {ticker} (시도 {attempt}/3)")
-        except Exception as e:
-            print(f"  ⚠️ [{context}] 장부 저장 예외 (시도 {attempt}/3): {e}")
+            if new_qty > old_qty:
+                position_payload["qty"] = new_qty
+        except (TypeError, ValueError):
+            pass
+    def _mut_buy(st: dict) -> None:
+        set_cooldown(st, ticker)
 
-        if attempt < 3:
-            time.sleep(0.2)
-
-    print(f"  ❌ [{context}] 장부 등록 최종 실패: {ticker}")
-    return False
+    return ledger_apply.persist_position_set(
+        state,
+        ticker,
+        position_payload,
+        context=context or "장부 등록",
+        state_path=state_path,
+        mutate_fn=_mut_buy,
+    )
 
 
 def ensure_position_registered(ticker, payload, context=""):
@@ -2022,6 +1977,247 @@ def ensure_position_registered(ticker, payload, context=""):
     except Exception as e:
         print(f"  ⚠️ [{context}] 장부 등록 검증 실패: {e}")
         return False
+
+
+def _kis_balance_qty_for_ticker(
+    market: str, ticker: str, *, refresh: bool = False
+) -> float | None:
+    try:
+        return bal_read.stock_qty(market, ticker, refresh=refresh)
+    except Exception:
+        return None
+
+
+def _coin_balance_qty_for_ticker(ticker: str, *, refresh: bool = False) -> float | None:
+    try:
+        return bal_read.coin_stock_qty(ticker, refresh=refresh)
+    except Exception:
+        return None
+
+
+def _idempotent_kis_sell(
+    state: dict,
+    *,
+    market: str,
+    ticker: str,
+    lane: str,
+    qty: int,
+    fallback_price: float,
+    place_order,
+    slice_index: int = 0,
+    cycle_tag: str | None = None,
+    use_inflight: bool = True,
+) -> order_idem.SliceFillResult:
+    """KIS 매도 1회(또는 Scale-Out 슬라이스) — 멱등·선택적 sell_inflight."""
+    ct = cycle_tag or order_idem.cycle_tag_15m_kst()
+    acquired = True
+    if use_inflight:
+        acquired = order_idem.try_acquire_sell_inflight(state, market, ticker, lane, ct)
+        if not acquired:
+            return order_idem.SliceFillResult(False, 0.0, 0.0, note="매도 진행 중(멱등)")
+    qty_before = None
+    bal_fn = None
+    if not TEST_MODE:
+        try:
+            qty_before = _kis_balance_qty_for_ticker(market, ticker, refresh=False)
+        except Exception:
+            qty_before = None
+
+        def _bal():
+            return _kis_balance_qty_for_ticker(market, ticker, refresh=True)
+
+        bal_fn = _bal
+    try:
+        fill = order_idem.run_kis_sell_slice_idempotent(
+            state,
+            market=market,
+            ticker=ticker,
+            lane=lane,
+            slice_index=int(slice_index),
+            qty=int(qty),
+            cycle_tag=ct,
+            place_order=place_order,
+            fallback_price=float(fallback_price),
+            balance_qty_fn=bal_fn,
+            qty_before=qty_before,
+            test_mode=TEST_MODE,
+        )
+        if not fill.ok and not TEST_MODE:
+            order_idem.persist_idempotency(state, STATE_PATH)
+            bal_read.invalidate(market)
+        elif fill.ok and not TEST_MODE:
+            bal_read.invalidate(market)
+        return fill
+    finally:
+        if use_inflight and acquired:
+            order_idem.release_sell_inflight(state, market, ticker, lane, ct)
+
+
+def _run_kis_scale_out_slices_idempotent(
+    state: dict,
+    *,
+    market: str,
+    ticker: str,
+    sell_qty: int,
+    notional_krw: float,
+    threshold_krw: float,
+    curr_p: float,
+    place_slice,
+    cycle_tag: str | None = None,
+) -> bool:
+    """V8 Scale-Out — 슬라이스별 멱등 매도( sell_inflight 없음 )."""
+    chunks = plan_sell_qty_twap(int(sell_qty), float(notional_krw), threshold_krw=float(threshold_krw))
+    ct = cycle_tag or order_idem.cycle_tag_15m_kst()
+    for si, qq in enumerate(chunks):
+        if int(qq) <= 0:
+            continue
+
+        def _place():
+            return place_slice(int(qq))
+
+        fill = _idempotent_kis_sell(
+            state,
+            market=market,
+            ticker=ticker,
+            lane=order_idem.LANE_SCALE_OUT,
+            qty=int(qq),
+            fallback_price=float(curr_p),
+            place_order=_place,
+            slice_index=si,
+            cycle_tag=ct,
+            use_inflight=False,
+        )
+        tag = "♻️" if fill.reused else "🧾"
+        print(
+            f"  {tag} [{market} Scale-Out {si + 1}/{len(chunks)}] {ticker} "
+            f"ok={fill.ok} qty={int(fill.qty)} note={fill.note}"
+        )
+        if not fill.ok:
+            return False
+        if TWAP_SLICE_DELAY_SEC > 0 and si < len(chunks) - 1:
+            time.sleep(TWAP_SLICE_DELAY_SEC)
+    return True
+
+
+def _idempotent_coin_sell(
+    state: dict,
+    *,
+    ticker: str,
+    lane: str,
+    qty: float,
+    fallback_price: float,
+    slice_index: int = 0,
+    cycle_tag: str | None = None,
+    use_inflight: bool = True,
+) -> order_idem.SliceFillResult:
+    """코인 매도 — 바이낸스 clientOrderId / 업비트 잔고 검증."""
+    ct = cycle_tag or order_idem.cycle_tag_15m_kst()
+    acquired = True
+    if use_inflight:
+        acquired = order_idem.try_acquire_sell_inflight(state, "COIN", ticker, lane, ct)
+        if not acquired:
+            return order_idem.SliceFillResult(False, 0.0, 0.0, note="매도 진행 중(멱등)")
+    qty_before = None
+    bal_fn = None
+    if not TEST_MODE:
+        try:
+            qty_before = _coin_balance_qty_for_ticker(ticker, refresh=False)
+        except Exception:
+            qty_before = None
+
+        def _bal():
+            return _coin_balance_qty_for_ticker(ticker, refresh=True)
+
+        bal_fn = _bal
+    try:
+        if coin_config.is_binance():
+
+            def _bn_place(cid: str):
+                return coin_broker.sell_market(
+                    ticker, float(qty), new_client_order_id=cid
+                )
+
+            fill = order_idem.run_binance_sell_idempotent(
+                state,
+                market="COIN",
+                ticker=ticker,
+                lane=lane,
+                slice_index=int(slice_index),
+                cycle_tag=ct,
+                qty=float(qty),
+                place_order=_bn_place,
+                fallback_price=float(fallback_price),
+                balance_qty_fn=bal_fn,
+                qty_before=qty_before,
+                test_mode=TEST_MODE,
+            )
+        else:
+
+            def _up_place():
+                if upbit_api.upbit is None:
+                    return None
+                return upbit_api.upbit.sell_market_order(ticker, float(qty))
+
+            fill = order_idem.run_upbit_sell_slice_idempotent(
+                state,
+                market="COIN",
+                ticker=ticker,
+                lane=lane,
+                slice_index=int(slice_index),
+                cycle_tag=ct,
+                qty=float(qty),
+                place_order=_up_place,
+                fallback_price=float(fallback_price),
+                balance_qty_fn=bal_fn,
+                qty_before=qty_before,
+                test_mode=TEST_MODE,
+            )
+        if not fill.ok and not TEST_MODE:
+            order_idem.persist_idempotency(state, STATE_PATH)
+            bal_read.invalidate("COIN")
+        elif fill.ok and not TEST_MODE:
+            bal_read.invalidate("COIN")
+        return fill
+    finally:
+        if use_inflight and acquired:
+            order_idem.release_sell_inflight(state, "COIN", ticker, lane, ct)
+
+
+def _run_coin_scale_out_slices_idempotent(
+    state: dict,
+    *,
+    ticker: str,
+    chunks: list[float],
+    curr_p: float,
+    cycle_tag: str | None = None,
+) -> bool:
+    """코인 Scale-Out — 덩어리별 멱등 매도."""
+    ct = cycle_tag or order_idem.cycle_tag_15m_kst()
+    flist = [truncate_coin_qty(float(c)) for c in chunks]
+    flist = [x for x in flist if x > 0]
+    if not flist:
+        return False
+    for si, vv in enumerate(flist):
+        fill = _idempotent_coin_sell(
+            state,
+            ticker=ticker,
+            lane=order_idem.LANE_SCALE_OUT,
+            qty=float(vv),
+            fallback_price=float(curr_p),
+            slice_index=si,
+            cycle_tag=ct,
+            use_inflight=False,
+        )
+        tag = "♻️" if fill.reused else "🧾"
+        print(
+            f"  {tag} [COIN Scale-Out {si + 1}/{len(flist)}] {ticker} "
+            f"ok={fill.ok} qty={fill.qty:.6f} note={fill.note}"
+        )
+        if not fill.ok:
+            return False
+        if TWAP_SLICE_DELAY_SEC > 0 and si < len(flist) - 1:
+            time.sleep(TWAP_SLICE_DELAY_SEC)
+    return True
 
 
 def _twap_krw_budget_slices(total_krw: float) -> list:
@@ -2052,6 +2248,11 @@ def _execute_kr_market_buy_twap(
     entry_fib_level: float = 0.0,
 ) -> bool:
     """시장가 매수(Phase2 분할). 성공 시 장부 1회 등록. TEST_MODE 시 로그만."""
+    cycle_tag = order_idem.cycle_tag_15m_kst()
+    if not order_idem.try_acquire_buy_inflight(state, "KR", t, cycle_tag):
+        print(f"  ⏭️ [KR TWAP] {kr_name}({t}): 동일 사이클 매수 진행 중(멱등)")
+        return False
+
     slices = _twap_krw_budget_slices(target_budget)
     if len(slices) > 1:
         print(
@@ -2063,71 +2264,102 @@ def _execute_kr_market_buy_twap(
     total_cost = 0.0
     fp = float(curr_p)
     any_fill = False
+    qty_before = None
+    if not TEST_MODE:
+        try:
+            qty_before = bal_read.kr_stock_qty(t, refresh=False)
+        except Exception:
+            qty_before = None
 
-    for si, krw_slice in enumerate(slices):
-        if krw_slice <= 0 or fp <= 0:
-            continue
-        q = int(float(krw_slice) / fp)
-        if q <= 0:
-            print(
-                f"  ⏭️ [KR TWAP] 슬라이스 {si + 1}/{len(slices)} 정수주 0 — "
-                f"액면 {int(krw_slice):,}원 < 1주 기준(~{int(fp):,}원)"
-            )
-            continue
-        est = int(q * fp)
-        if int(kr_cash_holder[0]) < est:
-            print(f"  ⏭️ [KR TWAP] 슬라이스 {si + 1}/{len(slices)} 예수 부족으로 중단")
-            break
-
-        if TEST_MODE:
-            print(f"  🧪 TEST_MODE [KR TWAP {si + 1}/{len(slices)}] {kr_name}({t}) qty={q} (~{est:,}원)")
-            send_telegram(f"🧪 TEST_MODE KR TWAP {t} ({kr_name}) {si + 1}/{len(slices)} qty={q}")
-            total_qty += q
-            total_cost += q * fp
-            kr_cash_holder[0] = float(int(kr_cash_holder[0]) - est)
-            any_fill = True
-        else:
-            resp = None
-            retry_count = 0
-            max_retries = 3
-            while retry_count < max_retries:
-                resp = create_market_buy_order_kis(t, q, is_us=False, curr_price=fp)
+    try:
+        for si, krw_slice in enumerate(slices):
+            if krw_slice <= 0 or fp <= 0:
+                continue
+            q = int(float(krw_slice) / fp)
+            if q <= 0:
                 print(
-                    f"  🧾 [KR BUY TWAP {si + 1}/{len(slices)}] {t} rt_cd={resp.get('rt_cd')} msg={resp.get('msg1', '')}"
+                    f"  ⏭️ [KR TWAP] 슬라이스 {si + 1}/{len(slices)} 정수주 0 — "
+                    f"액면 {int(krw_slice):,}원 < 1주 기준(~{int(fp):,}원)"
                 )
-                if isinstance(resp, dict) and resp.get("rt_cd") == "0":
-                    break
-                retry_count += 1
-                if retry_count < max_retries:
-                    print(f"  ⚠️ {kr_name}({t}) TWAP 슬라이스 실패 (#{retry_count}): {resp.get('msg1', '')} → 재시도")
-                    time.sleep(1)
+                continue
+            est = int(q * fp)
+            if int(kr_cash_holder[0]) < est:
+                print(f"  ⏭️ [KR TWAP] 슬라이스 {si + 1}/{len(slices)} 예수 부족으로 중단")
+                break
 
-            if not resp or resp.get("rt_cd") != "0":
-                msg1 = (resp or {}).get("msg1", "API 오류")
-                if "credentials_type" in str(msg1):
-                    print("  🔄 [토큰 오류] 토큰 갱신 후 TWAP 슬라이스 재시도...")
+            if TEST_MODE:
+                send_telegram(f"🧪 TEST_MODE KR TWAP {t} ({kr_name}) {si + 1}/{len(slices)} qty={q}")
+
+            def _kr_place():
+                return create_market_buy_order_kis(t, q, is_us=False, curr_price=fp)
+
+            def _kr_qty_now():
+                try:
+                    return bal_read.kr_stock_qty(t, refresh=True)
+                except Exception:
+                    return None
+
+            fill = order_idem.run_kis_buy_slice_idempotent(
+                state,
+                market="KR",
+                ticker=t,
+                slice_index=si,
+                qty=q,
+                cycle_tag=cycle_tag,
+                place_order=_kr_place,
+                fallback_price=fp,
+                balance_qty_fn=None if TEST_MODE else _kr_qty_now,
+                qty_before=qty_before,
+                test_mode=TEST_MODE,
+            )
+
+            if not fill.ok and not TEST_MODE:
+                msg_l = str(fill.note or "").lower()
+                if "credentials" in msg_l or "token" in msg_l:
+                    print("  🔄 [토큰 오류] 토큰 갱신 후 TWAP 슬라이스 1회 재시도...")
                     refresh_brokers_if_needed(force=True)
                     time.sleep(1)
-                    resp = create_market_buy_order_kis(t, q, is_us=False, curr_price=fp)
-                    print(f"  🧾 [KR BUY TWAP 재시도] {t} rt_cd={resp.get('rt_cd')}")
-                if not resp or resp.get("rt_cd") != "0":
-                    print(f"  ❌ [KR TWAP] {kr_name}({t}) 슬라이스 {si + 1} 최종 실패: {msg1}")
-                    break
+                    order_idem.pop_order_record(
+                        state,
+                        order_idem.order_key("KR", t, "buy", cycle_tag, si),
+                    )
+                    fill = order_idem.run_kis_buy_slice_idempotent(
+                        state,
+                        market="KR",
+                        ticker=t,
+                        slice_index=si,
+                        qty=q,
+                        cycle_tag=cycle_tag,
+                        place_order=_kr_place,
+                        fallback_price=fp,
+                        balance_qty_fn=_kr_qty_now,
+                        qty_before=qty_before,
+                    )
 
-            try:
-                output = resp.get("output", {}) if isinstance(resp, dict) else {}
-                ord_pric = _to_float(output.get("ORD_PRIC", 0), 0.0)
-                if ord_pric > 0:
-                    fp = float(ord_pric)
-            except Exception:
-                pass
-            total_qty += q
-            total_cost += q * fp
-            kr_cash_holder[0] = float(int(kr_cash_holder[0]) - int(q * fp))
+            tag = "♻️" if fill.reused else "🧾"
+            print(
+                f"  {tag} [KR BUY TWAP {si + 1}/{len(slices)}] {t} "
+                f"ok={fill.ok} qty={int(fill.qty)} note={fill.note}"
+            )
+
+            if not fill.ok:
+                print(f"  ❌ [KR TWAP] {kr_name}({t}) 슬라이스 {si + 1} 최종 실패: {fill.note}")
+                if not TEST_MODE:
+                    order_idem.persist_idempotency(state, STATE_PATH)
+                break
+
+            fp = float(fill.price) if fill.price > 0 else fp
+            total_qty += int(fill.qty)
+            total_cost += float(fill.qty) * fp
+            kr_cash_holder[0] = float(int(kr_cash_holder[0]) - int(fill.qty * fp))
             any_fill = True
+            if not TEST_MODE:
+                qty_before = bal_read.kr_stock_qty(t, refresh=True)
 
-        if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
-            time.sleep(TWAP_SLICE_DELAY_SEC)
+            if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
+                time.sleep(TWAP_SLICE_DELAY_SEC)
+    finally:
+        order_idem.release_buy_inflight(state, "KR", t, cycle_tag)
 
     if not any_fill or total_qty <= 0:
         return False
@@ -2174,6 +2406,11 @@ def _execute_us_market_buy_twap(
     strategy_type: str = "TREND_V8",
     entry_fib_level: float = 0.0,
 ) -> bool:
+    cycle_tag = order_idem.cycle_tag_15m_kst()
+    if not order_idem.try_acquire_buy_inflight(state, "US", t, cycle_tag):
+        print(f"  ⏭️ [US TWAP] {us_name}({t}): 동일 사이클 매수 진행 중(멱등)")
+        return False
+
     slices = _twap_usd_budget_slices(target_budget_usd)
     if len(slices) > 1:
         print(
@@ -2185,61 +2422,103 @@ def _execute_us_market_buy_twap(
     total_cost = 0.0
     fp = float(curr_p)
     any_fill = False
+    qty_before = None
+    if not TEST_MODE:
+        try:
+            qty_before = bal_read.us_stock_qty(t, refresh=False)
+        except Exception:
+            qty_before = None
 
-    for si, usd_slice in enumerate(slices):
-        if usd_slice <= 0 or fp <= 0:
-            continue
-        q = int(float(usd_slice) / fp)
-        if q <= 0:
-            print(
-                f"  ⏭️ [US TWAP] 슬라이스 {si + 1}/{len(slices)} 정수주 0 — "
-                f"${float(usd_slice):.2f} < 1주 기준(~${fp:.2f})"
-            )
-            continue
-        buy_price = round(fp * 1.01, 2)
-        est = q * fp
-        if us_cash_holder[0] < est * 0.99:
-            print(f"  ⏭️ [US TWAP] 슬라이스 {si + 1}/{len(slices)} 달러 예수 부족으로 중단")
-            break
-
-        if TEST_MODE:
-            print(f"  🧪 TEST_MODE [US TWAP {si + 1}/{len(slices)}] {us_name}({t}) qty={q} (~${est:.2f})")
-            send_telegram(f"🧪 TEST_MODE US TWAP {t} ({us_name}) {si + 1}/{len(slices)} qty={q}")
-            total_qty += q
-            total_cost += est
-            us_cash_holder[0] = float(us_cash_holder[0] - est)
-            any_fill = True
-        else:
-            resp = None
-            retry_count = 0
-            max_retries = 3
-            while retry_count < max_retries:
-                resp = execute_us_order_direct(kis_api.broker_us, "buy", t, q, buy_price)
+    try:
+        for si, usd_slice in enumerate(slices):
+            if usd_slice <= 0 or fp <= 0:
+                continue
+            q = int(float(usd_slice) / fp)
+            if q <= 0:
                 print(
-                    f"  🧾 [US BUY TWAP {si + 1}/{len(slices)}] {t} rt_cd={resp.get('rt_cd')} msg={resp.get('msg1', '')}"
+                    f"  ⏭️ [US TWAP] 슬라이스 {si + 1}/{len(slices)} 정수주 0 — "
+                    f"${float(usd_slice):.2f} < 1주 기준(~${fp:.2f})"
                 )
-                if isinstance(resp, dict) and resp.get("rt_cd") == "0":
-                    break
-                retry_count += 1
-                if retry_count < max_retries:
-                    time.sleep(1)
-            if not resp or resp.get("rt_cd") != "0":
-                msg1 = (resp or {}).get("msg1", "API 오류")
-                if "credentials_type" in str(msg1).lower() or "token" in str(msg1).lower():
-                    print("  🔄 [토큰 오류] 미장 TWAP 슬라이스 재시도...")
+                continue
+            buy_price = round(fp * 1.01, 2)
+            est = q * fp
+            if us_cash_holder[0] < est * 0.99:
+                print(f"  ⏭️ [US TWAP] 슬라이스 {si + 1}/{len(slices)} 달러 예수 부족으로 중단")
+                break
+
+            if TEST_MODE:
+                send_telegram(f"🧪 TEST_MODE US TWAP {t} ({us_name}) {si + 1}/{len(slices)} qty={q}")
+
+            def _us_place():
+                return execute_us_order_direct(kis_api.broker_us, "buy", t, q, buy_price)
+
+            def _us_qty_now():
+                try:
+                    return bal_read.us_stock_qty(t, refresh=True)
+                except Exception:
+                    return None
+
+            fill = order_idem.run_kis_buy_slice_idempotent(
+                state,
+                market="US",
+                ticker=t,
+                slice_index=si,
+                qty=q,
+                cycle_tag=cycle_tag,
+                place_order=_us_place,
+                fallback_price=fp,
+                balance_qty_fn=None if TEST_MODE else _us_qty_now,
+                qty_before=qty_before,
+                test_mode=TEST_MODE,
+            )
+
+            if not fill.ok and not TEST_MODE:
+                msg_l = str(fill.note or "").lower()
+                if "credentials" in msg_l or "token" in msg_l:
+                    print("  🔄 [토큰 오류] 미장 TWAP 슬라이스 1회 재시도...")
                     refresh_brokers_if_needed(force=True)
                     time.sleep(1)
-                    resp = execute_us_order_direct(kis_api.broker_us, "buy", t, q, buy_price)
-                if not resp or resp.get("rt_cd") != "0":
-                    print(f"  ❌ [US TWAP] {us_name}({t}) 슬라이스 실패: {msg1}")
-                    break
-            total_qty += q
-            total_cost += q * fp
-            us_cash_holder[0] = float(us_cash_holder[0] - q * fp)
-            any_fill = True
+                    order_idem.pop_order_record(
+                        state,
+                        order_idem.order_key("US", t, "buy", cycle_tag, si),
+                    )
+                    fill = order_idem.run_kis_buy_slice_idempotent(
+                        state,
+                        market="US",
+                        ticker=t,
+                        slice_index=si,
+                        qty=q,
+                        cycle_tag=cycle_tag,
+                        place_order=_us_place,
+                        fallback_price=fp,
+                        balance_qty_fn=_us_qty_now,
+                        qty_before=qty_before,
+                    )
 
-        if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
-            time.sleep(TWAP_SLICE_DELAY_SEC)
+            tag = "♻️" if fill.reused else "🧾"
+            print(
+                f"  {tag} [US BUY TWAP {si + 1}/{len(slices)}] {t} "
+                f"ok={fill.ok} qty={int(fill.qty)} note={fill.note}"
+            )
+
+            if not fill.ok:
+                print(f"  ❌ [US TWAP] {us_name}({t}) 슬라이스 실패: {fill.note}")
+                if not TEST_MODE:
+                    order_idem.persist_idempotency(state, STATE_PATH)
+                break
+
+            fp = float(fill.price) if fill.price > 0 else fp
+            total_qty += int(fill.qty)
+            total_cost += float(fill.qty) * fp
+            us_cash_holder[0] = float(us_cash_holder[0] - float(fill.qty) * fp)
+            any_fill = True
+            if not TEST_MODE:
+                qty_before = bal_read.us_stock_qty(t, refresh=True)
+
+            if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
+                time.sleep(TWAP_SLICE_DELAY_SEC)
+    finally:
+        order_idem.release_buy_inflight(state, "US", t, cycle_tag)
 
     if not any_fill or total_qty <= 0:
         return False
@@ -2306,6 +2585,11 @@ def _execute_coin_market_buy_twap(
     strategy_type: str = "TREND_V8",
     entry_fib_level: float = 0.0,
 ) -> bool:
+    cycle_tag = order_idem.cycle_tag_15m_kst()
+    if not order_idem.try_acquire_buy_inflight(state, "COIN", t, cycle_tag):
+        print(f"  ⏭️ [COIN TWAP] {t}: 동일 사이클 매수 진행 중(멱등)")
+        return False
+
     slices = _twap_krw_budget_slices(budget_krw)
     if len(slices) > 1:
         print(f"  📉 [Phase2 TWAP COIN] {t} 예산 {int(budget_krw):,}원 → {len(slices)}분할")
@@ -2315,90 +2599,165 @@ def _execute_coin_market_buy_twap(
     last_p = float(coin_broker.get_current_price(t) or 0.0)
     any_fill = False
     _min_krw = _coin_min_order_krw()
+    base_before = None
+    if not TEST_MODE:
+        try:
+            base_before = bal_read.coin_stock_qty(t, refresh=False)
+        except Exception:
+            base_before = None
 
-    for si, krw_slice in enumerate(slices):
-        if krw_slice <= 0:
-            continue
-        if krw_bal_holder[0] < float(krw_slice):
-            print(f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} 예산(원화환산) 부족으로 중단")
-            break
+    def _coin_qty_now():
+        try:
+            return bal_read.coin_stock_qty(t, refresh=True)
+        except Exception:
+            return None
 
-        if TEST_MODE:
+    try:
+        for si, krw_slice in enumerate(slices):
+            if krw_slice <= 0:
+                continue
+            if krw_bal_holder[0] < float(krw_slice):
+                print(f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} 예산(원화환산) 부족으로 중단")
+                break
+
+            if last_p <= 0:
+                last_p = float(coin_broker.get_current_price(t) or 0.0)
+            if last_p <= 0:
+                print(f"  ⏭️ [COIN TWAP] {t}: 현재가 없음 — 슬라이스 중단")
+                break
+
+            target_buy_amount = float(min(float(krw_slice), float(krw_bal_holder[0])))
+            pay_krw = float(target_buy_amount)
+
+            if not TEST_MODE:
+                avail_raw = coin_broker.get_quote_balance_direct()
+                if coin_config.is_binance():
+                    kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
+                    available_krw = float(avail_raw or 0) * kpx
+                else:
+                    available_krw = (
+                        float(avail_raw) if avail_raw is not None else float(krw_bal_holder[0])
+                    )
+                safe_ceiling = available_krw * UPBIT_KRW_AVAILABLE_CAP_RATIO
+                pay_krw = float(max(0, min(target_buy_amount, safe_ceiling)))
+                if pay_krw < _min_krw:
+                    exn = "바이낸스(USDT×환율)" if coin_config.is_binance() else "업비트"
+                    print(
+                        f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} 스킵 — "
+                        f"최종주문액 {pay_krw:,.0f}원 < 최소 {int(_min_krw):,}원 ({exn}) "
+                        f"(목표 {target_buy_amount:,.0f}원, 가용·API {available_krw:,.0f}원×{UPBIT_KRW_AVAILABLE_CAP_RATIO})"
+                    )
+                    break
+                if pay_krw < int(target_buy_amount):
+                    print(
+                        f"  🛡️ [COIN TWAP] 가용 캡 적용: 목표 {target_buy_amount:,.0f}원 → 최종 {pay_krw:,.0f}원 "
+                        f"(가용 {available_krw:,.0f}원×{UPBIT_KRW_AVAILABLE_CAP_RATIO})"
+                    )
+
+            if TEST_MODE:
+                if coin_config.is_binance():
+                    kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
+                    usdt_s = float(krw_slice) / kpx
+                    send_telegram(
+                        f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {usdt_s:,.2f} USDT"
+                    )
+                else:
+                    send_telegram(
+                        f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {int(krw_slice):,}KRW"
+                    )
+
             if coin_config.is_binance():
                 kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
-                usdt_s = float(krw_slice) / kpx
-                print(
-                    f"  🧪 TEST_MODE [COIN TWAP {si + 1}/{len(slices)}] {t} "
-                    f"{usdt_s:,.2f} USDT (≈{int(krw_slice):,}원 환산)"
-                )
-                send_telegram(
-                    f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {usdt_s:,.2f} USDT"
-                )
-            else:
-                print(f"  🧪 TEST_MODE [COIN TWAP {si + 1}/{len(slices)}] {t} {int(krw_slice):,}원")
-                send_telegram(
-                    f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {int(krw_slice):,}KRW"
-                )
-            spent += float(krw_slice)
-            filled_base_qty += _coin_twap_filled_base_qty(None, float(krw_slice), t, last_p)
-            krw_bal_holder[0] = float(krw_bal_holder[0]) - float(krw_slice)
-            any_fill = True
-        else:
-            avail_raw = coin_broker.get_quote_balance_direct()
-            if coin_config.is_binance():
-                kpx = float(coin_broker.get_krw_per_usdt())
-                available_krw = float(avail_raw or 0) * kpx
-            else:
-                available_krw = float(avail_raw) if avail_raw is not None else float(krw_bal_holder[0])
-            target_buy_amount = float(min(float(krw_slice), float(krw_bal_holder[0])))
-            safe_ceiling = available_krw * UPBIT_KRW_AVAILABLE_CAP_RATIO
-            final_order_amount = min(target_buy_amount, safe_ceiling)
-            pay_krw = float(max(0, final_order_amount))
-            if pay_krw < _min_krw:
-                exn = "바이낸스(USDT×환율)" if coin_config.is_binance() else "업비트"
-                print(
-                    f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} 스킵 — "
-                    f"최종주문액 {pay_krw:,.0f}원 < 최소 {int(_min_krw):,}원 ({exn}) "
-                    f"(목표 {target_buy_amount:,.0f}원, 가용·API {available_krw:,.0f}원×{UPBIT_KRW_AVAILABLE_CAP_RATIO})"
-                )
-                break
-            if pay_krw < int(target_buy_amount):
-                print(
-                    f"  🛡️ [COIN TWAP] 가용 캡 적용: 목표 {target_buy_amount:,.0f}원 → 최종 {pay_krw:,.0f}원 "
-                    f"(가용 {available_krw:,.0f}원×{UPBIT_KRW_AVAILABLE_CAP_RATIO})"
-                )
-            if coin_config.is_binance():
-                resp = coin_broker.buy_market_budget_krw(t, pay_krw)
-            else:
-                pay_krw_i = int(max(0, pay_krw))
-                resp = upbit_api.upbit.buy_market_order(t, pay_krw_i) if upbit_api.upbit else None
-            print(
-                f"  🧾 [COIN BUY TWAP {si + 1}/{len(slices)}] {t} "
-                f"pay≈{pay_krw:,.0f}원 resp={'OK' if resp else 'None'}"
-            )
-            if not resp:
-                print(
-                    f"  ❌ [COIN TWAP] {t} 슬라이스 실패 — 거절(잔고·최소주문·수수료). "
-                    f"가용·최소주문·거래소 키를 확인하세요."
-                )
-                break
-            spent += float(pay_krw)
-            filled_base_qty += _coin_twap_filled_base_qty(resp, float(pay_krw), t, last_p)
-            after_raw = coin_broker.get_quote_balance_direct()
-            if coin_config.is_binance():
-                kpx = float(coin_broker.get_krw_per_usdt())
-                krw_bal_holder[0] = float(after_raw or 0) * kpx
-            else:
-                krw_bal_holder[0] = (
-                    float(after_raw) if after_raw is not None else float(krw_bal_holder[0]) - float(pay_krw)
-                )
-            any_fill = True
-            np = coin_broker.get_current_price(t)
-            if np:
-                last_p = float(np)
+                spend_usdt = pay_krw / kpx
 
-        if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
-            time.sleep(TWAP_SLICE_DELAY_SEC)
+                def _bn_place(cid: str):
+                    return coin_broker.buy_market_budget_krw(
+                        t, pay_krw, new_client_order_id=cid
+                    )
+
+                fill = order_idem.run_binance_buy_idempotent(
+                    state,
+                    market="COIN",
+                    ticker=t,
+                    slice_index=si,
+                    cycle_tag=cycle_tag,
+                    spend_usdt=spend_usdt,
+                    place_order=_bn_place,
+                    fallback_price=last_p,
+                    test_mode=TEST_MODE,
+                )
+            else:
+                pay_slice = float(krw_slice) if TEST_MODE else pay_krw
+
+                def _up_place():
+                    if upbit_api.upbit is None:
+                        return None
+                    return upbit_api.upbit.buy_market_order(t, int(max(0, pay_slice)))
+
+                fill = order_idem.run_upbit_buy_slice_idempotent(
+                    state,
+                    market="COIN",
+                    ticker=t,
+                    slice_index=si,
+                    pay_krw=pay_slice,
+                    cycle_tag=cycle_tag,
+                    place_order=_up_place,
+                    fallback_price=last_p,
+                    balance_qty_fn=None if TEST_MODE else _coin_qty_now,
+                    qty_before=base_before,
+                    test_mode=TEST_MODE,
+                )
+
+            tag = "♻️" if fill.reused else "🧾"
+            print(
+                f"  {tag} [COIN BUY TWAP {si + 1}/{len(slices)}] {t} "
+                f"ok={fill.ok} qty={fill.qty:.6f} note={fill.note}"
+            )
+
+            if not fill.ok:
+                if not TEST_MODE:
+                    print(
+                        f"  ❌ [COIN TWAP] {t} 슬라이스 실패 — 거절(잔고·최소주문·수수료). "
+                        f"가용·최소주문·거래소 키를 확인하세요."
+                    )
+                    order_idem.persist_idempotency(state, STATE_PATH)
+                break
+
+            slice_spent = float(krw_slice) if TEST_MODE else pay_krw
+            spent += slice_spent
+            if float(fill.qty) > 0:
+                filled_base_qty += float(fill.qty)
+            else:
+                filled_base_qty += _coin_twap_filled_base_qty(None, slice_spent, t, last_p)
+            if float(fill.price) > 0:
+                last_p = float(fill.price)
+
+            if TEST_MODE:
+                krw_bal_holder[0] = float(krw_bal_holder[0]) - slice_spent
+            else:
+                after_raw = coin_broker.get_quote_balance_direct()
+                if coin_config.is_binance():
+                    kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
+                    krw_bal_holder[0] = float(after_raw or 0) * kpx
+                else:
+                    krw_bal_holder[0] = (
+                        float(after_raw)
+                        if after_raw is not None
+                        else float(krw_bal_holder[0]) - slice_spent
+                    )
+                qn = _coin_qty_now()
+                if qn is not None:
+                    base_before = qn
+                np = coin_broker.get_current_price(t)
+                if np:
+                    last_p = float(np)
+
+            any_fill = True
+
+            if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
+                time.sleep(TWAP_SLICE_DELAY_SEC)
+    finally:
+        order_idem.release_buy_inflight(state, "COIN", t, cycle_tag)
 
     if not any_fill or spent <= 0 or last_p <= 0:
         return False
@@ -2873,8 +3232,25 @@ def _coin_snapshot_get_balance(quote: str = "KRW"):
 
 
 def build_account_snapshot_for_report(
-    *, allow_kis_fetch=None, with_backoff=None, force_kis_labels: bool = False
+    *,
+    allow_kis_fetch=None,
+    with_backoff=None,
+    force_kis_labels: bool = False,
+    fresh_balances: bool = False,
 ) -> dict:
+    """``fresh_balances=True`` — GUI 새로고침 등, TTL 없이 잔고 API 1회씩."""
+    bal_refresh = bool(fresh_balances or force_kis_labels)
+
+    def _snapshot_kr_balance():
+        return ensure_dict(bal_read.kr_balance_for_report(refresh=bal_refresh))
+
+    def _snapshot_us_balance():
+        return ensure_dict(bal_read.us_balance_for_report(refresh=bal_refresh))
+
+    def _snapshot_coin_balances():
+        raw = bal_read.coin_balances_for_report(refresh=bal_refresh)
+        return raw if isinstance(raw, list) else []
+
     deps = {
         "get_real_weather": get_real_weather,
         "broker_kr": kis_api.broker_kr,
@@ -2884,8 +3260,8 @@ def build_account_snapshot_for_report(
         "load_last_coin_display_snapshot": load_last_coin_display_snapshot,
         "save_last_coin_display_snapshot": save_last_coin_display_snapshot,
         "is_weekend_suppress": kis_equities_weekend_suppress_window_kst,
-        "get_balance_with_retry": get_balance_with_retry,
-        "get_us_positions_with_retry": get_us_positions_with_retry,
+        "get_balance_with_retry": _snapshot_kr_balance,
+        "get_us_positions_with_retry": _snapshot_us_balance,
         "get_us_cash_real": get_us_cash_real,
         "to_float": _to_float,
         "safe_num": _safe_num,
@@ -2893,7 +3269,7 @@ def build_account_snapshot_for_report(
         "calc_us_holdings_metrics": _calc_us_holdings_metrics,
         "calc_coin_holdings_metrics": _calc_coin_holdings_metrics,
         "upbit_get_balance": _coin_snapshot_get_balance,
-        "upbit_get_balances": coin_broker.get_balances,
+        "upbit_get_balances": _snapshot_coin_balances,
         "get_kr_holdings_with_roi": get_kr_holdings_with_roi,
         "get_us_holdings_with_roi": get_us_holdings_with_roi,
         "get_coin_holdings_with_roi": get_coin_holdings_with_roi,
@@ -3275,6 +3651,11 @@ def _prepare_cycle_state() -> dict:
     if normalize_positions_keys(state):
         save_state(STATE_PATH, state)
         print("  🔧 [장부 정규화] positions 키 포맷 정리 완료")
+    order_idem.ensure_idempotency_state(state)
+    pruned = order_idem.prune_order_idempotency(state)
+    if pruned > 0:
+        save_state(STATE_PATH, state)
+    bal_read.invalidate()
     refresh_brokers_if_needed()
     return state
 
@@ -4032,6 +4413,12 @@ def _persist_exit_line_sl_p(
     state: dict, ticker: str, pos_info: dict, exit_line: float
 ) -> None:
     if exit_line > 0:
+        prev = float(_to_float(pos_info.get("sl_p", 0), 0.0))
+        st = str(pos_info.get("strategy_type") or "").strip().upper()
+        tier = str(pos_info.get("tier") or "").strip().upper()
+        if st == "SWING_FIB" or tier in ("SWING_FIB", "SWING"):
+            if prev > 0:
+                exit_line = max(prev, float(exit_line))
         pos_info["sl_p"] = float(exit_line)
         state.setdefault("positions", {})[ticker] = pos_info
 
@@ -4055,13 +4442,15 @@ def _format_swing_exit_log_suffix(
 def _check_swing_trailing_exit(
     curr_p: float, pos_info: dict, ohlcv, state: dict, ticker: str
 ) -> tuple[bool, str]:
-    """스윙 수익 보존 락만 검사. 하드스탑(피보·구름)은 ``check_swing_exit`` FULL 전담."""
+    """스윙 트레일링 — 비러너 본절 락 / 러너 5MA 이탈. 하드·5MA FULL은 ``check_swing_exit`` 와 연동."""
     m = _market_from_ticker(ticker)
     exit_line = get_swing_exit_display_price(
         curr_p, pos_info, ohlcv, market=m, ticker=ticker
     )
     _persist_exit_line_sl_p(state, ticker, pos_info, exit_line)
-    return check_swing_profit_lock_trailing_exit(curr_p, pos_info, ohlcv=ohlcv)
+    return check_swing_profit_lock_trailing_exit(
+        curr_p, pos_info, ohlcv=ohlcv, market=m, ticker=ticker
+    )
 
 
 # 타임스탑 — KR/US는 **영업시간** 누적, COIN은 24/7 연속시간
@@ -4203,6 +4592,10 @@ def run_trading_bot():
     weather, macro_mult, macro_reason, macro_snap = _build_market_context(state)
     _alpha_target_vol = float(config.get("alpha_target_vol", 0.02))
     state = load_state(STATE_PATH)
+    _buy_cycle_tag = order_idem.cycle_tag_15m_kst()
+    _rec_fixes = order_idem.reconcile_positions_for_cycle(state, _buy_cycle_tag, STATE_PATH)
+    if _rec_fixes > 0:
+        print(f"  🔧 [장부 정합] 이번 사이클 filled↔positions 보정 {_rec_fixes}건")
 
     _cycle_buy_fills = 0
     _cycle_buy_zone_kr = False
@@ -4356,18 +4749,42 @@ def run_trading_bot():
                         trading_hours_held=trading_h,
                     )
                     if sw_action == "HALF":
+                        if order_idem.lane_has_filled_sell(
+                            state, "KR", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag
+                        ):
+                            order_idem.reconcile_ticker_lane(
+                                state, "KR", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag, STATE_PATH
+                            )
+                            continue
                         sq = compute_stock_scale_out_qty(int(qty))
                         if not sq:
                             print(f"  ⏭️ [SWING-SELL] {kr_name}({t}) HALF 수량 0 (패스)")
                             continue
-                        r_half = create_market_sell_order_kis(t, int(sq), is_us=False, curr_price=float(curr_p))
-                        if isinstance(r_half, dict) and r_half.get("rt_cd") == "0":
-                            state.setdefault("positions", {})[t] = post_partial_ledger(
-                                pos_info, float(sq), float(curr_p), float(qty)
+
+                        def _kr_swing_half_place():
+                            return create_market_sell_order_kis(
+                                t, int(sq), is_us=False, curr_price=float(curr_p)
                             )
-                            state["positions"][t]["strategy_type"] = "SWING_FIB"
-                            state["positions"][t]["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
-                            save_state(STATE_PATH, state)
+
+                        fill_half = _idempotent_kis_sell(
+                            state,
+                            market="KR",
+                            ticker=t,
+                            lane=order_idem.LANE_SWING_HALF,
+                            qty=int(sq),
+                            fallback_price=float(curr_p),
+                            place_order=_kr_swing_half_place,
+                            cycle_tag=_buy_cycle_tag,
+                        )
+                        if fill_half.ok:
+                            new_half = post_partial_ledger(
+                                pos_info, float(sq), float(curr_p), float(qty), set_scale_out_done=False
+                            )
+                            new_half["strategy_type"] = "SWING_FIB"
+                            new_half["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
+                            ledger_apply.persist_position_set(
+                                state, t, new_half, context="SWING HALF KR", state_path=STATE_PATH
+                            )
                             _record_trade_event(
                                 "KR",
                                 t,
@@ -4388,15 +4805,32 @@ def run_trading_bot():
                                 reason=sw_reason,
                             )
                         else:
-                            print(f"  ❌ [SWING-SELL] {kr_name}({t}) HALF 실패: {(r_half or {}).get('msg1', '응답 없음')}")
+                            print(
+                                f"  ❌ [SWING-SELL] {kr_name}({t}) HALF 실패: {fill_half.note}"
+                            )
                         continue
                     if sw_action == "FULL":
                         # 스윙 전량 청산 시그널
                         qty_full = int(_to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
                         if qty_full <= 0:
                             continue
-                        r_full = create_market_sell_order_kis(t, qty_full, is_us=False, curr_price=float(curr_p))
-                        if isinstance(r_full, dict) and r_full.get("rt_cd") == "0":
+
+                        def _kr_swing_full_place():
+                            return create_market_sell_order_kis(
+                                t, qty_full, is_us=False, curr_price=float(curr_p)
+                            )
+
+                        fill_full = _idempotent_kis_sell(
+                            state,
+                            market="KR",
+                            ticker=t,
+                            lane=order_idem.LANE_SWING_FULL,
+                            qty=qty_full,
+                            fallback_price=float(curr_p),
+                            place_order=_kr_swing_full_place,
+                            cycle_tag=_buy_cycle_tag,
+                        )
+                        if fill_full.ok:
                             p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
                             _record_trade_event("KR", t, "SELL", qty_full, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
                             print(f"  ✅ [SWING-SELL] {kr_name}({t}) FULL | {sw_reason}")
@@ -4409,20 +4843,26 @@ def run_trading_bot():
                                 profit_rate=float(p_full),
                                 reason=sw_reason,
                             )
-                            del state["positions"][t]
-                            set_cooldown(state, t)
-                            set_ticker_cooldown_after_sell(
-                                state,
-                                t,
-                                sw_reason,
-                                profit_rate=float(p_full),
-                                strategy_type="SWING_FIB",
-                                market="KR",
-                                remaining_qty=0.0,
+
+                            def _mut_swing_full(st: dict) -> None:
+                                set_cooldown(st, t)
+                                set_ticker_cooldown_after_sell(
+                                    st,
+                                    t,
+                                    sw_reason,
+                                    profit_rate=float(p_full),
+                                    strategy_type="SWING_FIB",
+                                    market="KR",
+                                    remaining_qty=0.0,
+                                )
+
+                            ledger_apply.persist_position_remove(
+                                state, t, context="SWING FULL KR", state_path=STATE_PATH, mutate_fn=_mut_swing_full
                             )
-                            save_state(STATE_PATH, state)
                         else:
-                            print(f"  ❌ [SWING-SELL] {kr_name}({t}) FULL 실패: {(r_full or {}).get('msg1', '응답 없음')}")
+                            print(
+                                f"  ❌ [SWING-SELL] {kr_name}({t}) FULL 실패: {fill_full.note}"
+                            )
                         continue
 
                 # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
@@ -4433,6 +4873,13 @@ def run_trading_bot():
                 notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), False, usdk)
                 entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
                 so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
+                if order_idem.lane_has_filled_sell(
+                    state, "KR", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag
+                ):
+                    order_idem.reconcile_ticker_lane(
+                        state, "KR", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag, STATE_PATH
+                    )
+                    pos_info = (state.get("positions") or {}).get(t) or pos_info
                 if not position_scale_out_done(pos_info) and so_hit:
                     if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
                         mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
@@ -4453,18 +4900,30 @@ def run_trading_bot():
                             sell_notion_krw = float(sq) * float(curr_p)
                             tw_krw = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
 
-                            def _kr_so_slice(qq: int) -> bool:
-                                r = create_market_sell_order_kis(t, int(qq), is_us=False, curr_price=float(curr_p))
-                                return bool(isinstance(r, dict) and r.get("rt_cd") == "0")
+                            def _kr_so_slice(qq: int):
+                                return create_market_sell_order_kis(
+                                    t, int(qq), is_us=False, curr_price=float(curr_p)
+                                )
 
-                            ok_so = run_stock_scale_out_slices(
-                                int(sq), sell_notion_krw, tw_krw, _kr_so_slice, TWAP_SLICE_DELAY_SEC
+                            ok_so = _run_kis_scale_out_slices_idempotent(
+                                state,
+                                market="KR",
+                                ticker=t,
+                                sell_qty=int(sq),
+                                notional_krw=sell_notion_krw,
+                                threshold_krw=tw_krw,
+                                curr_p=float(curr_p),
+                                place_slice=_kr_so_slice,
+                                cycle_tag=_buy_cycle_tag,
                             )
                             if ok_so:
-                                state.setdefault("positions", {})[t] = post_partial_ledger(
-                                    pos_info, float(sq), float(curr_p), float(qty)
+                                ledger_apply.persist_position_set(
+                                    state,
+                                    t,
+                                    post_partial_ledger(pos_info, float(sq), float(curr_p), float(qty)),
+                                    context="KR Scale-Out",
+                                    state_path=STATE_PATH,
                                 )
-                                save_state(STATE_PATH, state)
                                 try:
                                     _record_trade_event(
                                         "KR",
@@ -4536,21 +4995,28 @@ def run_trading_bot():
                     if qty <= 0:
                         continue
                     
-                    # 매도 주문 (최대 3회 재시도)
-                    retry_count = 0
-                    max_retries = 3
-                    resp = None
-                    
-                    while retry_count < max_retries:
-                        resp = create_market_sell_order_kis(t, qty, is_us=False, curr_price=curr_p)
-                        if resp.get('rt_cd') == '0':
-                            break
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            print(f"  ⚠️ {kr_name}({t}) 매도 실패 (#{retry_count}): {resp.get('msg1', 'API 오류')} → 재시도")
-                            time.sleep(1)
-                    
-                    if resp and resp.get('rt_cd') == '0':
+                    def _kr_exit_place():
+                        return create_market_sell_order_kis(
+                            t, qty, is_us=False, curr_price=curr_p
+                        )
+
+                    fill_exit = _idempotent_kis_sell(
+                        state,
+                        market="KR",
+                        ticker=t,
+                        lane=order_idem.LANE_EXIT,
+                        qty=qty,
+                        fallback_price=float(curr_p),
+                        place_order=_kr_exit_place,
+                        cycle_tag=_buy_cycle_tag,
+                    )
+                    tag_exit = "♻️" if fill_exit.reused else "🧾"
+                    print(
+                        f"  {tag_exit} [KR EXIT] {t} ok={fill_exit.ok} qty={int(fill_exit.qty)} "
+                        f"note={fill_exit.note}"
+                    )
+
+                    if fill_exit.ok:
                         profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                         stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                         if profit_rate > 0:
@@ -4570,18 +5036,21 @@ def run_trading_bot():
                                 f"🚨 [국장 추세종료 매도] {t}({kr_name})\n"
                                 f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
                             )
-                        del state["positions"][t]
-                        set_cooldown(state, t)
-                        set_ticker_cooldown_after_sell(
-                            state,
-                            t,
-                            reason,
-                            profit_rate=float(profit_rate),
-                            strategy_type=strategy_type,
-                            market="KR",
-                            remaining_qty=0.0,
+                        def _mut_kr_exit(st: dict) -> None:
+                            set_cooldown(st, t)
+                            set_ticker_cooldown_after_sell(
+                                st,
+                                t,
+                                reason,
+                                profit_rate=float(profit_rate),
+                                strategy_type=strategy_type,
+                                market="KR",
+                                remaining_qty=0.0,
+                            )
+
+                        ledger_apply.persist_position_remove(
+                            state, t, context="KR EXIT", state_path=STATE_PATH, mutate_fn=_mut_kr_exit
                         )
-                        save_state(STATE_PATH, state)
                     else:
                         print(f"  ❌ {kr_name}({t}) 매도 최종 실패 ({retry_count}회 시도): {resp.get('msg1', 'API 오류') if resp else '응답 없음'}")
 
@@ -4651,6 +5120,9 @@ def run_trading_bot():
                             if t in held_kr:
                                 print(f"  ⏭️ {kr_name}({t}): 이미 보유중 (패스)")
                                 continue
+                            if order_idem.is_buy_inflight(state, "KR", t, _buy_cycle_tag):
+                                print(f"  ⏭️ {kr_name}({t}): 매수 TWAP 진행 중(멱등 패스)")
+                                continue
                             sector_ok_kr, sector_msg_kr = allow_kr_sector_entry(
                                 t,
                                 state.get("positions", {}),
@@ -4694,6 +5166,7 @@ def run_trading_bot():
                                 else:
                                     sw_ok, sw_fib, sw_why = check_swing_entry(
                                         pd.DataFrame(ohlcv_200),
+                                        market="KR",
                                         reference_close=live_px_kr if live_px_kr > 0 else None,
                                     )
                                     if sw_ok:
@@ -4993,19 +5466,43 @@ def run_trading_bot():
                         trading_hours_held=trading_h,
                     )
                     if sw_action == "HALF":
+                        if order_idem.lane_has_filled_sell(
+                            state, "US", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag
+                        ):
+                            order_idem.reconcile_ticker_lane(
+                                state, "US", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag, STATE_PATH
+                            )
+                            continue
                         sq = compute_stock_scale_out_qty(int(float(qty_holding)))
                         if not sq:
                             print(f"  ⏭️ [SWING-SELL] {us_name}({t}) HALF 수량 0 (패스)")
                             continue
                         sp_half = round(float(curr_p) * 0.98, 2)
-                        r_half = execute_us_order_direct(kis_api.broker_us, "sell", t, int(sq), sp_half)
-                        if isinstance(r_half, dict) and r_half.get("rt_cd") == "0":
-                            state.setdefault("positions", {})[t] = post_partial_ledger(
-                                pos_info, float(sq), float(curr_p), float(qty_holding)
+
+                        def _us_swing_half_place():
+                            return execute_us_order_direct(
+                                kis_api.broker_us, "sell", t, int(sq), sp_half
                             )
-                            state["positions"][t]["strategy_type"] = "SWING_FIB"
-                            state["positions"][t]["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
-                            save_state(STATE_PATH, state)
+
+                        fill_half = _idempotent_kis_sell(
+                            state,
+                            market="US",
+                            ticker=t,
+                            lane=order_idem.LANE_SWING_HALF,
+                            qty=int(sq),
+                            fallback_price=float(curr_p),
+                            place_order=_us_swing_half_place,
+                            cycle_tag=_buy_cycle_tag,
+                        )
+                        if fill_half.ok:
+                            new_half = post_partial_ledger(
+                                pos_info, float(sq), float(curr_p), float(qty_holding), set_scale_out_done=False
+                            )
+                            new_half["strategy_type"] = "SWING_FIB"
+                            new_half["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
+                            ledger_apply.persist_position_set(
+                                state, t, new_half, context="SWING HALF US", state_path=STATE_PATH
+                            )
                             _record_trade_event(
                                 "US",
                                 t,
@@ -5026,15 +5523,32 @@ def run_trading_bot():
                                 reason=sw_reason,
                             )
                         else:
-                            print(f"  ❌ [SWING-SELL] {us_name}({t}) HALF 실패: {(r_half or {}).get('msg1', '응답 없음')}")
+                            print(
+                                f"  ❌ [SWING-SELL] {us_name}({t}) HALF 실패: {fill_half.note}"
+                            )
                         continue
                     if sw_action == "FULL":
                         qty_full = int(float(qty_holding))
                         if qty_full <= 0:
                             continue
                         sp_full = round(float(curr_p) * 0.98, 2)
-                        r_full = execute_us_order_direct(kis_api.broker_us, "sell", t, qty_full, sp_full)
-                        if isinstance(r_full, dict) and r_full.get("rt_cd") == "0":
+
+                        def _us_swing_full_place():
+                            return execute_us_order_direct(
+                                kis_api.broker_us, "sell", t, qty_full, sp_full
+                            )
+
+                        fill_full = _idempotent_kis_sell(
+                            state,
+                            market="US",
+                            ticker=t,
+                            lane=order_idem.LANE_SWING_FULL,
+                            qty=qty_full,
+                            fallback_price=float(curr_p),
+                            place_order=_us_swing_full_place,
+                            cycle_tag=_buy_cycle_tag,
+                        )
+                        if fill_full.ok:
                             p_full = ((float(sp_full) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
                             _record_trade_event("US", t, "SELL", qty_full, price=float(sp_full), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
                             print(f"  ✅ [SWING-SELL] {us_name}({t}) FULL | {sw_reason}")
@@ -5047,20 +5561,25 @@ def run_trading_bot():
                                 profit_rate=float(p_full),
                                 reason=sw_reason,
                             )
-                            del state["positions"][t]
-                            set_cooldown(state, t)
-                            set_ticker_cooldown_after_sell(
-                                state,
-                                t,
-                                sw_reason,
-                                profit_rate=float(p_full),
-                                strategy_type="SWING_FIB",
-                                market="US",
-                                remaining_qty=0.0,
+                            def _mut_us_swing_full(st: dict) -> None:
+                                set_cooldown(st, t)
+                                set_ticker_cooldown_after_sell(
+                                    st,
+                                    t,
+                                    sw_reason,
+                                    profit_rate=float(p_full),
+                                    strategy_type="SWING_FIB",
+                                    market="US",
+                                    remaining_qty=0.0,
+                                )
+
+                            ledger_apply.persist_position_remove(
+                                state, t, context="SWING FULL US", state_path=STATE_PATH, mutate_fn=_mut_us_swing_full
                             )
-                            save_state(STATE_PATH, state)
                         else:
-                            print(f"  ❌ [SWING-SELL] {us_name}({t}) FULL 실패: {(r_full or {}).get('msg1', '응답 없음')}")
+                            print(
+                                f"  ❌ [SWING-SELL] {us_name}({t}) FULL 실패: {fill_full.note}"
+                            )
                         continue
 
                 # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
@@ -5072,6 +5591,13 @@ def run_trading_bot():
                 notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), True, usdk)
                 entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
                 so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
+                if order_idem.lane_has_filled_sell(
+                    state, "US", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag
+                ):
+                    order_idem.reconcile_ticker_lane(
+                        state, "US", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag, STATE_PATH
+                    )
+                    pos_info = (state.get("positions") or {}).get(t) or pos_info
                 if not position_scale_out_done(pos_info) and so_hit:
                     if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
                         mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
@@ -5091,19 +5617,31 @@ def run_trading_bot():
                             sell_notion_krw = float(sq) * float(curr_p) * usdk
                             tw_krw_eff = (float(TWAP_USD_THRESHOLD) * usdk) if TWAP_ENABLED else float("inf")
 
-                            def _us_so_slice(qq: int) -> bool:
+                            def _us_so_slice(qq: int):
                                 sp = round(float(curr_p) * 0.98, 2)
-                                r = execute_us_order_direct(kis_api.broker_us, "sell", t, int(qq), sp)
-                                return bool(isinstance(r, dict) and r.get("rt_cd") == "0")
+                                return execute_us_order_direct(
+                                    kis_api.broker_us, "sell", t, int(qq), sp
+                                )
 
-                            ok_so = run_stock_scale_out_slices(
-                                int(sq), sell_notion_krw, tw_krw_eff, _us_so_slice, TWAP_SLICE_DELAY_SEC
+                            ok_so = _run_kis_scale_out_slices_idempotent(
+                                state,
+                                market="US",
+                                ticker=t,
+                                sell_qty=int(sq),
+                                notional_krw=sell_notion_krw,
+                                threshold_krw=tw_krw_eff,
+                                curr_p=float(curr_p),
+                                place_slice=_us_so_slice,
+                                cycle_tag=_buy_cycle_tag,
                             )
                             if ok_so:
-                                state.setdefault("positions", {})[t] = post_partial_ledger(
-                                    pos_info, float(sq), float(curr_p), float(qty_int)
+                                ledger_apply.persist_position_set(
+                                    state,
+                                    t,
+                                    post_partial_ledger(pos_info, float(sq), float(curr_p), float(qty_int)),
+                                    context="US Scale-Out",
+                                    state_path=STATE_PATH,
                                 )
-                                save_state(STATE_PATH, state)
                                 try:
                                     _record_trade_event(
                                         "US",
@@ -5178,25 +5716,32 @@ def run_trading_bot():
                         print(f"  ❌ {t} 매도 오류: 수량이 0으로 인식됨.")
                         continue
                     
-                    # 시장가 매도 (98% 지정가 = 즉시 체결 + 가격 보호)
                     sell_price = round(curr_p * 0.98, 2)
-                    
-                    # 최대 3회 재시도
-                    retry_count = 0
-                    max_retries = 3
-                    resp = None
-                    
-                    while retry_count < max_retries:
-                        resp = execute_us_order_direct(kis_api.broker_us, "sell", t, qty, sell_price)
-                        if resp.get('rt_cd') == '0':
-                            break
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            print(f"  ⚠️ {us_name}({t}) 매도 실패 (#{retry_count}): {resp.get('msg1', 'API 오류')} → 재시도")
-                            time.sleep(1)  # 1초 대기 후 재시도
-                    
-                    if resp and resp.get('rt_cd') == '0':
-                        profit_rate = ((sell_price - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
+
+                    def _us_exit_place():
+                        return execute_us_order_direct(
+                            kis_api.broker_us, "sell", t, qty, sell_price
+                        )
+
+                    fill_exit = _idempotent_kis_sell(
+                        state,
+                        market="US",
+                        ticker=t,
+                        lane=order_idem.LANE_EXIT,
+                        qty=int(qty),
+                        fallback_price=float(sell_price),
+                        place_order=_us_exit_place,
+                        cycle_tag=_buy_cycle_tag,
+                    )
+                    tag_exit = "♻️" if fill_exit.reused else "🧾"
+                    print(
+                        f"  {tag_exit} [US EXIT] {t} ok={fill_exit.ok} qty={int(fill_exit.qty)} "
+                        f"note={fill_exit.note}"
+                    )
+
+                    if fill_exit.ok:
+                        px = float(fill_exit.price) if fill_exit.price > 0 else float(sell_price)
+                        profit_rate = ((px - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                         stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                         if profit_rate > 0:
                             stats["wins"] = int(stats.get("wins", 0)) + 1
@@ -5215,18 +5760,21 @@ def run_trading_bot():
                                 f"🚨 [미장 추세종료 매도] {t}({us_name})\n"
                                 f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
                             )
-                        del state["positions"][t]
-                        set_cooldown(state, t)
-                        set_ticker_cooldown_after_sell(
-                            state,
-                            t,
-                            reason,
-                            profit_rate=float(profit_rate),
-                            strategy_type=strategy_type,
-                            market="US",
-                            remaining_qty=0.0,
+                        def _mut_us_exit(st: dict) -> None:
+                            set_cooldown(st, t)
+                            set_ticker_cooldown_after_sell(
+                                st,
+                                t,
+                                reason,
+                                profit_rate=float(profit_rate),
+                                strategy_type=strategy_type,
+                                market="US",
+                                remaining_qty=0.0,
+                            )
+
+                        ledger_apply.persist_position_remove(
+                            state, t, context="US EXIT", state_path=STATE_PATH, mutate_fn=_mut_us_exit
                         )
-                        save_state(STATE_PATH, state)
                     else:
                         print(f"  ❌ {us_name}({t}) 매도 최종 실패 ({retry_count}회 시도): {resp.get('msg1', 'API 오류') if resp else '응답 없음'}")
             except Exception as e:
@@ -5282,11 +5830,11 @@ def run_trading_bot():
                             print(
                                 "  📌 [US] BEAR 날씨 — V8 추세 매수만 중단, SWING_FIB 스윙 후보는 계속 분석"
                             )
-                        # 2) 미장 타겟: S&P100 시총 + Ndx100\S&P100 상위 50 (총 150, ``us_universe_cache.json``)
+                        # 2) 미장 타겟: 고베타 유니버스 NDX~90 + S&P 섹터 RR (150, ``us_universe_cache.json``)
                         night_targets = get_top_market_cap_tickers(150)
                         night_targets = _sort_buy_targets_by_rs(night_targets, "US")
                         total_us = len(night_targets)
-                        print(f"  -> 🇺🇸 미장 유니버스(S&P100+Ndx50) {total_us}개 정밀 분석 시작!")
+                        print(f"  -> 🇺🇸 미장 유니버스(고베타·섹터분산) {total_us}개 정밀 분석 시작!")
 
                         for idx, t in enumerate(night_targets, 1):
                             try:
@@ -5302,6 +5850,9 @@ def run_trading_bot():
                                     continue
                                 if t in held_us:
                                     print(f"  ⏭️ {us_name}({t}): 이미 보유중 (패스)")
+                                    continue
+                                if order_idem.is_buy_inflight(state, "US", t, _buy_cycle_tag):
+                                    print(f"  ⏭️ {us_name}({t}): 매수 TWAP 진행 중(멱등 패스)")
                                     continue
                                 sector_ok_us, sector_msg_us = allow_us_sector_entry(
                                     t,
@@ -5340,6 +5891,7 @@ def run_trading_bot():
                                 else:
                                     sw_ok, sw_fib, sw_why = check_swing_entry(
                                         pd.DataFrame(ohlcv),
+                                        market="US",
                                         reference_close=live_px_us if live_px_us > 0 else None,
                                     )
                                     if sw_ok:
@@ -5600,20 +6152,34 @@ def run_trading_bot():
                     trading_hours_held=trading_h,
                 )
                 if sw_action == "HALF":
+                    if order_idem.lane_has_filled_sell(
+                        state, "COIN", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag
+                    ):
+                        order_idem.reconcile_ticker_lane(
+                            state, "COIN", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag, STATE_PATH
+                        )
+                        continue
                     sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
                     if not sell_q:
                         print(f"  ⏭️ [SWING-SELL] {t} HALF 수량 0 (패스)")
                         continue
-                    r_half = coin_broker.sell_market(t, float(sell_q))
-                    if _coin_sell_order_ok(r_half):
-                        state.setdefault("positions", {})[t] = post_partial_ledger(
-                            pos_info, float(sell_q), float(curr_p), float(qty)
+                    fill_half = _idempotent_coin_sell(
+                        state,
+                        ticker=t,
+                        lane=order_idem.LANE_SWING_HALF,
+                        qty=float(sell_q),
+                        fallback_price=float(curr_p),
+                        cycle_tag=_buy_cycle_tag,
+                    )
+                    if fill_half.ok:
+                        new_half = post_partial_ledger(
+                            pos_info, float(sell_q), float(curr_p), float(qty), set_scale_out_done=False
                         )
-                        state["positions"][t]["strategy_type"] = "SWING_FIB"
-                        state["positions"][t]["entry_fib_level"] = float(
-                            pos_info.get("entry_fib_level", 0.0) or 0.0
+                        new_half["strategy_type"] = "SWING_FIB"
+                        new_half["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
+                        ledger_apply.persist_position_set(
+                            state, t, new_half, context="SWING HALF COIN", state_path=STATE_PATH
                         )
-                        save_state(STATE_PATH, state)
                         _record_trade_event(
                             "COIN",
                             t,
@@ -5639,11 +6205,18 @@ def run_trading_bot():
                             reason=sw_reason,
                         )
                     else:
-                        print(f"  ❌ [SWING-SELL] {t} HALF 실패: 거래소 응답 없음")
+                        print(f"  ❌ [SWING-SELL] {t} HALF 실패: {fill_half.note}")
                     continue
                 if sw_action == "FULL":
-                    r_full = coin_broker.sell_market(t, qty)
-                    if _coin_sell_order_ok(r_full):
+                    fill_full = _idempotent_coin_sell(
+                        state,
+                        ticker=t,
+                        lane=order_idem.LANE_SWING_FULL,
+                        qty=float(qty),
+                        fallback_price=float(curr_p),
+                        cycle_tag=_buy_cycle_tag,
+                    )
+                    if fill_full.ok:
                         p_full = (
                             (float(curr_p) - float(buy_p)) / float(buy_p) * 100
                             if float(buy_p) > 0
@@ -5673,20 +6246,23 @@ def run_trading_bot():
                             profit_rate=float(p_full),
                             reason=sw_reason,
                         )
-                        del state["positions"][t]
-                        set_cooldown(state, t)
-                        set_ticker_cooldown_after_sell(
-                            state,
-                            t,
-                            sw_reason,
-                            profit_rate=float(p_full),
-                            strategy_type="SWING_FIB",
-                            market="COIN",
-                            remaining_qty=0.0,
+                        def _mut_coin_swing_full(st: dict) -> None:
+                            set_cooldown(st, t)
+                            set_ticker_cooldown_after_sell(
+                                st,
+                                t,
+                                sw_reason,
+                                profit_rate=float(p_full),
+                                strategy_type="SWING_FIB",
+                                market="COIN",
+                                remaining_qty=0.0,
+                            )
+
+                        ledger_apply.persist_position_remove(
+                            state, t, context="SWING FULL COIN", state_path=STATE_PATH, mutate_fn=_mut_coin_swing_full
                         )
-                        save_state(STATE_PATH, state)
                     else:
-                        print(f"  ❌ [SWING-SELL] {t} FULL 실패: 거래소 응답 없음")
+                        print(f"  ❌ [SWING-SELL] {t} FULL 실패: {fill_full.note}")
                     continue
 
             # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
@@ -5699,6 +6275,13 @@ def run_trading_bot():
             )
             entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
             so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
+            if order_idem.lane_has_filled_sell(
+                state, "COIN", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag
+            ):
+                order_idem.reconcile_ticker_lane(
+                    state, "COIN", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag, STATE_PATH
+                )
+                pos_info = (state.get("positions") or {}).get(t) or pos_info
             if not position_scale_out_done(pos_info) and so_hit:
                 if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
                     mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
@@ -5719,15 +6302,21 @@ def run_trading_bot():
                         tw_th = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
                         chunks = plan_coin_sell_chunks(float(sell_q), float(curr_p), threshold_krw=float(tw_th))
 
-                        def _coin_so_vol(vv: float) -> bool:
-                            return _coin_sell_order_ok(coin_broker.sell_market(t, float(vv)))
-
-                        ok_so = run_coin_scale_out_chunks(chunks, _coin_so_vol, TWAP_SLICE_DELAY_SEC)
+                        ok_so = _run_coin_scale_out_slices_idempotent(
+                            state,
+                            ticker=t,
+                            chunks=chunks,
+                            curr_p=float(curr_p),
+                            cycle_tag=_buy_cycle_tag,
+                        )
                         if ok_so:
-                            state.setdefault("positions", {})[t] = post_partial_ledger(
-                                pos_info, float(sell_q), float(curr_p), float(qty)
+                            ledger_apply.persist_position_set(
+                                state,
+                                t,
+                                post_partial_ledger(pos_info, float(sell_q), float(curr_p), float(qty)),
+                                context="COIN Scale-Out",
+                                state_path=STATE_PATH,
                             )
-                            save_state(STATE_PATH, state)
                             try:
                                 _record_trade_event(
                                     "COIN",
@@ -5794,24 +6383,21 @@ def run_trading_bot():
                         reason = reason_chandelier
 
             if is_exit: # 여기서 실제 매도 주문이 나감
-                # 최대 3회 재시도
-                retry_count = 0
-                max_retries = 3
-                resp = None
+                fill_exit = _idempotent_coin_sell(
+                    state,
+                    ticker=t,
+                    lane=order_idem.LANE_EXIT,
+                    qty=float(qty),
+                    fallback_price=float(curr_p),
+                    cycle_tag=_buy_cycle_tag,
+                )
+                tag_exit = "♻️" if fill_exit.reused else "🧾"
+                print(
+                    f"  {tag_exit} [COIN EXIT] {t} ok={fill_exit.ok} qty={fill_exit.qty:.6f} "
+                    f"note={fill_exit.note}"
+                )
 
-                # 1. 매도 주문 실행 루프
-                while retry_count < max_retries:
-                    resp = coin_broker.sell_market(t, qty)
-                    if _coin_sell_order_ok(resp):
-                        break # 성공 시 while 루프 즉시 탈출 (정상)
-                    
-                    retry_count += 1
-                    if retry_count < max_retries:
-                        print(f"  ⚠️ {t} 매도 실패 (#{retry_count}): 거래소 API 오류 → 재시도")
-                        time.sleep(0.5) # API 호출 제한(Rate Limit) 방지를 위해 약간 대기
-
-                # 2. 루프 종료 후, 매도 성공 여부에 따라 장부 기록
-                if _coin_sell_order_ok(resp): # 매도가 성공적으로 체결되었다면
+                if fill_exit.ok:
                     profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                     stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                     
@@ -5836,20 +6422,22 @@ def run_trading_bot():
                             f"🚨 [코인 추세종료 매도] {t}({coin_name})\n"
                             f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
                         )
-                    # 장부 업데이트 및 저장
-                    del state["positions"][t]
-                    set_cooldown(state, t)
-                    set_ticker_cooldown_after_sell(
-                        state,
-                        t,
-                        reason,
-                        profit_rate=float(profit_rate),
-                        strategy_type=strategy_type,
-                        market="COIN",
-                        remaining_qty=0.0,
+                    def _mut_coin_exit(st: dict) -> None:
+                        set_cooldown(st, t)
+                        set_ticker_cooldown_after_sell(
+                            st,
+                            t,
+                            reason,
+                            profit_rate=float(profit_rate),
+                            strategy_type=strategy_type,
+                            market="COIN",
+                            remaining_qty=0.0,
+                        )
+
+                    ledger_apply.persist_position_remove(
+                        state, t, context="COIN EXIT", state_path=STATE_PATH, mutate_fn=_mut_coin_exit
                     )
-                    save_state(STATE_PATH, state)
-                    
+
                 else: # 3번 모두 실패했다면
                     print(f"  ❌ {t} 매도 최종 실패 ({retry_count}회 시도): 거래소 API 오류")
 
@@ -5982,6 +6570,9 @@ def run_trading_bot():
                             if t in held_coins:
                                 print(f"  ⏭️ {get_coin_name(t)}({t}): 이미 보유중 (패스)")
                                 continue
+                            if order_idem.is_buy_inflight(state, "COIN", t, _buy_cycle_tag):
+                                print(f"  ⏭️ {get_coin_name(t)}({t}): 매수 TWAP 진행 중(멱등 패스)")
+                                continue
                             ohlcv = _ohlcv_pref.get(t) if isinstance(_ohlcv_pref, dict) else None
                             if not ohlcv or len(ohlcv) < 20:
                                 ohlcv = coin_broker.fetch_ohlcv(t, "day", 250)
@@ -6005,6 +6596,7 @@ def run_trading_bot():
                                 live_px_coin = float(coin_broker.get_current_price(t) or 0.0)
                                 sw_ok, sw_fib, sw_why = check_swing_entry(
                                     pd.DataFrame(ohlcv),
+                                    market="COIN",
                                     reference_close=live_px_coin if live_px_coin > 0 else None,
                                 )
                                 if sw_ok:

@@ -38,3 +38,13 @@ gui_run_err.log
 
 # Other
 .DS_Store
+
+# Cursor 대화·수정 메모 (저장소에 포함하지 않음)
+수정내역/
+이전 수정내역/
+
+# 로컬 테스트 출력
+test_run_output.txt
+
+# OHLCV 캐시 (런타임)
+data/ohlcv_cache/

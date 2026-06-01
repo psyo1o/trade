@@ -9,7 +9,8 @@ V5 전략 코어 — OHLCV 수집, 프로 시그널, 청산 가격.
 
 스윙 요약은 README.md §8. 진입: ``check_swing_entry`` (60MA·이격·갭·양봉·윗꼬리·RSI≥35·피보).
 청산 HALF: 1.5R 스케일아웃. 하드바닥: 피보·구름 + 시간가중 손절(영업 24h 후).
-상수: ``SWING_MA60_MAX_EXTENSION_PCT``, ``SWING_GAP_UP_MAX_PCT``, ``SWING_ENTRY_RSI_MIN`` 등.
+러너(1차 익절 완료 또는 max_p≥1.5R): 5MA 트레일링 FULL·매도선 ``max(하드, 본절락, 5MA)`` — **표시·5MA 청산선은 고점 래칫**(내려가지 않음).
+상수: ``SWING_MA60_MAX_EXTENSION_PCT_{US,KR,COIN}``, ``swing_ma60_max_extension_pct``, ``SWING_GAP_UP_MAX_PCT`` 등.
 매도선: ``get_swing_exit_display_price`` (HALF 목표는 ``get_swing_scale_out_target_price`` 1.5R).
 """
 import pandas as pd
@@ -752,8 +753,22 @@ def _swing_entry_rsi_at_price(w: pd.DataFrame, price: float) -> float | None:
 
 # 스윙 진입: 당일 고가 대비 현재가 하락(%)이 이 값 이상이면 윗꼬리 설거지로 거절
 SWING_UPPER_WICK_DROP_PCT = 5.0
-# 60MA 위 추세 속 눌림목 — 판정가가 60MA 대비 이 비율(%) 초과 이격이면 고점 상투로 거절
-SWING_MA60_MAX_EXTENSION_PCT = 30.0
+# 60MA 위 추세 속 눌림목 — 시장별 60MA 이격(%) 상한 (칼날·과열 추격 차단)
+SWING_MA60_MAX_EXTENSION_PCT_US = 15.0
+SWING_MA60_MAX_EXTENSION_PCT_KR = 20.0
+SWING_MA60_MAX_EXTENSION_PCT_COIN = 30.0
+
+
+def swing_ma60_max_extension_pct(market: str | None) -> float:
+    """``check_swing_entry`` 용 60MA 대비 판정가 이격 상한(%)."""
+    m = str(market or "").strip().upper()
+    if m == "US":
+        return SWING_MA60_MAX_EXTENSION_PCT_US
+    if m == "KR":
+        return SWING_MA60_MAX_EXTENSION_PCT_KR
+    if m == "COIN":
+        return SWING_MA60_MAX_EXTENSION_PCT_COIN
+    return SWING_MA60_MAX_EXTENSION_PCT_COIN
 # 전일 종가 대비 당일 시가 갭 상승(%) 상한 — 초과 시 뇌동 추격으로 거절
 SWING_GAP_UP_MAX_PCT = 3.0
 # 진입 시 RSI(14) 하한 — 판정 종가(실시간 우선) 기준, 미만이면 칼날·모멘텀 둔화로 거절
@@ -826,13 +841,14 @@ def _swing_volume_dryup_ok(w: pd.DataFrame, today: pd.Series) -> tuple[bool, str
 def check_swing_entry(
     df: pd.DataFrame,
     *,
+    market: str | None = None,
     reference_close: float | None = None,
 ) -> tuple[bool, float, str]:
     """
     추세 속 눌림목(Pullback) 스윙 매수 — KR/US/COIN 공통 (HTS 없이 코드 단 검증).
 
     진입 조건:
-        1. 60MA 위 + 60MA 대비 이격 ≤ ``SWING_MA60_MAX_EXTENSION_PCT`` (기본 30%)
+        1. 60MA 위 + 60MA 대비 이격 ≤ 시장별 상한 (US +15% / KR +20% / COIN +30%)
         2. 당일 양봉 (시가 < 판정가) — ``reference_close`` 우선
         3. 전일 종가→당일 시가 갭 < ``SWING_GAP_UP_MAX_PCT`` (기본 3%)
         4. 거래량 Dry-up: 당일 < 5일 평균 거래량
@@ -880,11 +896,16 @@ def check_swing_entry(
                 )
 
     ma60 = float(today["ma60"]) if pd.notna(today["ma60"]) else 0.0
-    ma_cap = ma60 * (1.0 + SWING_MA60_MAX_EXTENSION_PCT / 100.0) if ma60 > 0 else 0.0
+    ext_limit_pct = swing_ma60_max_extension_pct(market)
+    max_extension_price = (
+        ma60 * (1.0 + ext_limit_pct / 100.0) if ma60 > 0 else 0.0
+    )
 
-    # 1. 60일선 위 + 이격 상한 (에베레스트 컷)
+    # 1. 60일선 위 + 시장별 이격 상한 (칼날·과열 추격 차단)
     cond_ma = ma60 > 0 and close_for_candle > ma60
-    cond_ma_ext_ok = ma_cap <= 0 or close_for_candle <= ma_cap
+    cond_ma_ext_ok = (
+        max_extension_price <= 0 or close_for_candle <= max_extension_price
+    )
     # 2. 실시간 양봉 (시가 < 판정가)
     cond_bull = close_for_candle > open_today
     # 3. 거래량 Dry-up (당일 < 5일 평균)
@@ -914,8 +935,9 @@ def check_swing_entry(
         miss.append("종가≤60MA")
     elif not cond_ma_ext_ok:
         ext_pct = (close_for_candle / ma60 - 1.0) * 100.0 if ma60 > 0 else 0.0
+        m_lbl = str(market or "COIN").strip().upper() or "COIN"
         miss.append(
-            f"60MA 이격 과다(+{ext_pct:.1f}%>{SWING_MA60_MAX_EXTENSION_PCT:.0f}%, "
+            f"60MA 이격 과다({m_lbl} +{ext_pct:.1f}%>{ext_limit_pct:.0f}%, "
             f"판정가 {close_for_candle:,.0f} / 60MA {ma60:,.0f})"
         )
     if not cond_bull:
@@ -945,6 +967,13 @@ def check_swing_entry(
 
 # 1차 익절(HALF): 초기 1R 대비 R-Multiple — ``entry_initial_risk_1r`` 기준
 SWING_SCALE_OUT_R_MULT = 1.5
+# 러너 트레일링: 5일 단순이동평균(종가) — 1차 익절·1.5R 이후 잔량 방어
+SWING_RUNNER_TRAIL_MA_DAYS = 5
+SWING_RUNNER_TRAIL_EXIT_REASON = "5MA 트레일링 이탈"
+SWING_RUNNER_TRAIL_EXIT_REASON_LOG = "[SWING-SELL] 5MA 트레일링 이탈"
+# 장부 키 — 스윙 통합 매도선·러너 5MA 트레일 고점(한 번 올라간 값은 유지)
+SWING_EXIT_HIGH_WATER_KEY = "swing_exit_high_water"
+SWING_MA5_TRAIL_HIGH_KEY = "swing_ma5_trail_high"
 # 시간 가중 손절: 영업시간 24h 경과 후 24h마다 (진입가−바닥) 갭의 이 비율만큼 바닥 상향
 SWING_TIME_DECAY_START_TRADING_HOURS = 24.0
 SWING_TIME_DECAY_GAP_CLOSE_PER_24H = 0.40
@@ -989,6 +1018,7 @@ def _append_swing_indicators(w: pd.DataFrame) -> pd.DataFrame:
     kijun = (out["h"].rolling(26).max() + out["l"].rolling(26).min()) / 2.0
     out["senkou_a"] = ((tenkan + kijun) / 2.0).shift(26)
     out["senkou_b"] = ((out["h"].rolling(52).max() + out["l"].rolling(52).min()) / 2.0).shift(26)
+    out["ma5"] = out["c"].rolling(SWING_RUNNER_TRAIL_MA_DAYS).mean()
     return out
 
 
@@ -1284,6 +1314,100 @@ def get_swing_profit_lock_floor(buy_p: float, max_p: float) -> float:
     return 0.0
 
 
+def _swing_ohlcv_df_for_ma(ohlcv, *, min_rows: int = 5) -> pd.DataFrame | None:
+    """5MA 등 단기 지표용 OHLCV (최소 ``min_rows`` 봉)."""
+    if ohlcv is None:
+        return None
+    try:
+        if isinstance(ohlcv, pd.DataFrame):
+            w = ohlcv if len(ohlcv) >= min_rows else None
+        else:
+            w = pd.DataFrame(ohlcv) if ohlcv and len(ohlcv) >= min_rows else None
+        if w is not None and len(w) >= min_rows:
+            return _normalize_ohlcv_df(w)
+    except Exception:
+        return None
+    return None
+
+
+def get_swing_ma5_price(
+    ohlcv,
+    reference_price: float | None = None,
+) -> float:
+    """당일(최근 봉) 5일 단순이동평균 — ``reference_price`` 가 있으면 마지막 종가에 반영."""
+    w = _swing_ohlcv_df_for_ma(ohlcv, min_rows=SWING_RUNNER_TRAIL_MA_DAYS)
+    if w is None or "c" not in w.columns:
+        return 0.0
+    closes = pd.to_numeric(w["c"], errors="coerce").astype(float).copy()
+    try:
+        ref = float(reference_price) if reference_price is not None else 0.0
+    except (TypeError, ValueError):
+        ref = 0.0
+    if ref > 0 and len(closes) > 0:
+        closes.iloc[-1] = ref
+    ma5_s = closes.rolling(SWING_RUNNER_TRAIL_MA_DAYS).mean()
+    if len(ma5_s) == 0:
+        return 0.0
+    last = ma5_s.iloc[-1]
+    if pd.isna(last) or not np.isfinite(last):
+        return 0.0
+    return float(last)
+
+
+def _swing_ratchet_high(pos_info: dict, key: str, candidate: float) -> float:
+    """``candidate`` 와 장부 고점 중 큰 값 — 트레일링 매도선이 하향하지 않도록."""
+    p = pos_info if isinstance(pos_info, dict) else {}
+    cand = float(candidate)
+    if cand <= 0:
+        return float(p.get(key, 0.0) or 0.0)
+    prev = float(p.get(key, 0.0) or 0.0)
+    out = max(prev, cand)
+    p[key] = out
+    return out
+
+
+def get_swing_ma5_trail_floor(
+    pos_info: dict,
+    ohlcv,
+    reference_price: float | None = None,
+) -> float:
+    """러너 5MA 트레일 — 당일 5MA를 매 사이클 갱신하되 **고점만** 유지."""
+    ma5 = get_swing_ma5_price(ohlcv, reference_price=reference_price)
+    if ma5 <= 0:
+        return float((pos_info or {}).get(SWING_MA5_TRAIL_HIGH_KEY, 0.0) or 0.0)
+    return _swing_ratchet_high(pos_info, SWING_MA5_TRAIL_HIGH_KEY, ma5)
+
+
+def is_swing_runner_state(
+    pos_info: dict,
+    *,
+    ohlcv=None,
+    market: str | None = None,
+    ticker: str | None = None,
+) -> bool:
+    """
+    러너(Runner) — 1차 익절 완료(``scale_out_done``) 또는 ``max_p`` 기준 1.5R 이상 도달.
+    """
+    p = pos_info if isinstance(pos_info, dict) else {}
+    if bool(p.get("scale_out_done", False)):
+        return True
+    buy = _swing_avg_price(p)
+    if buy <= 0:
+        return False
+    one_r = float(p.get("entry_initial_risk_1r", 0.0) or 0.0)
+    if one_r <= 0 and ohlcv is not None:
+        w = _swing_ohlcv_working_df(ohlcv)
+        if w is not None:
+            one_r, _ = resolve_swing_initial_1r(
+                p, w, market=market, ticker=ticker
+            )
+    max_p = _finite_price(p.get("max_p", buy), buy)
+    if one_r > 0 and max_p > buy:
+        if (max_p - buy) >= SWING_SCALE_OUT_R_MULT * one_r:
+            return True
+    return False
+
+
 def get_swing_scale_out_target_price(pos_info: dict) -> float | None:
     """1.5R 1차 익절 목표가. ``scale_out_done`` 이면 None."""
     if bool((pos_info or {}).get("scale_out_done", False)):
@@ -1307,9 +1431,10 @@ def get_swing_exit_display_price(
     """
     SWING_FIB **표시용 통합 매도선** (GUI·``sl_p``·로그).
 
-    - 하드스탑(피보·구름) + 본절 락(최고수익>3% 시 평단×1.005) 중 높은 값
-    - **실행:** 하드스탑 FULL은 ``check_swing_exit`` 만, 수익 락 이탈은
-      ``check_swing_profit_lock_trailing_exit`` 만 담당 (중복 방지).
+    - 기본: ``max(하드스탑, 본절 락)`` (피보·구름·시간가중 + **max_p**>3% 시 평단×1.005, 락선은 하향 없음)
+    - 러너: ``max(기본, 5MA 고점 래칫)`` — 당일 5MA가 내려가도 매도선·청산 기준은 **이전 고점 유지**
+    - 통합선: ``swing_exit_high_water`` 로 **한 번 올라간 매도선은 내려가지 않음**
+    - **실행:** 하드 FULL은 **당일** 피보·구름 바닥(구조 이탈), 5MA·표시는 래칫 · 비러너 락은 ``check_swing_profit_lock_trailing_exit``
     """
     p = pos_info if isinstance(pos_info, dict) else {}
     cp = _finite_price(curr_p, 0.0)
@@ -1319,10 +1444,19 @@ def get_swing_exit_display_price(
         p, ohlcv, market=market, ticker=ticker, trading_hours_held=trading_hours_held
     )
     profit_floor = get_swing_profit_lock_floor(buy, max_p)
+    floors: list[float] = [hard]
     if profit_floor > 0:
-        # 수익 락이 평단 위면 예전과 동일(표시·트레일링 — 평단 -3% 클램프 미적용)
-        return _finite_price(max(hard, profit_floor), hard)
-    return _finite_price(hard, 0.0)
+        floors.append(profit_floor)
+    if is_swing_runner_state(p, ohlcv=ohlcv, market=market, ticker=ticker):
+        ma5_trail = get_swing_ma5_trail_floor(
+            p, ohlcv, reference_price=cp if cp > 0 else None
+        )
+        if ma5_trail > 0:
+            floors.append(ma5_trail)
+    raw = _finite_price(max(floors), 0.0)
+    if raw <= 0:
+        return 0.0
+    return _swing_ratchet_high(p, SWING_EXIT_HIGH_WATER_KEY, raw)
 
 
 def _swing_avg_price(pos_info: dict) -> float:
@@ -1370,6 +1504,7 @@ def check_swing_exit(
     ``reference_price`` — 장중 실시간가(KIS 등). 없으면 당일 종가로 판정.
     HALF: 현재가 − 평단 ≥ ``SWING_SCALE_OUT_R_MULT`` × ``entry_initial_risk_1r`` (1.5R).
     FULL 하드스탑: 피보·구름 + 시간가중 바닥.
+    FULL 러너: 5MA 하향 이탈 (1차 익절 완료 또는 max_p≥1.5R).
     RSI FULL: 수익 +1%~+10% 구간에서만.
 
     Returns:
@@ -1427,7 +1562,20 @@ def check_swing_exit(
                     f"목표≥{tgt_lbl}, 평단 {avg_price:,.0f} 수익 {profit_pct:+.2f}%)",
                 )
 
-    # 3) RSI 데드크로스 FULL — +1% 이상 ~ +10% 미만만 (고수익은 수익 락 트레일링)
+    # 3) 러너 5MA 트레일링 FULL — 1차 익절·1.5R 이후 잔량
+    if is_swing_runner_state(
+        pos_info, ohlcv=w, market=market, ticker=ticker
+    ):
+        ma5 = get_swing_ma5_trail_floor(pos_info, w, reference_price=reference_price)
+        if ma5 > 0 and current_px < float(ma5):
+            cur_lbl = _format_swing_price_label(current_px, market=market, ticker=ticker)
+            ma5_lbl = _format_swing_price_label(ma5, market=market, ticker=ticker)
+            return (
+                "FULL",
+                f"{SWING_RUNNER_TRAIL_EXIT_REASON} (현재가: {cur_lbl} < 5MA: {ma5_lbl})",
+            )
+
+    # 4) RSI 데드크로스 FULL — +1% 이상 ~ +10% 미만만 (고수익은 수익 락·5MA 트레일링)
     profit_pct = _swing_profit_rate_pct(avg_price, current_px) if avg_price > 0 else 0.0
     if (
         avg_price > 0
@@ -1452,18 +1600,37 @@ def check_swing_profit_lock_trailing_exit(
     pos_info: dict,
     *,
     ohlcv=None,
+    market: str | None = None,
+    ticker: str | None = None,
 ) -> tuple[bool, str]:
     """
-    스윙 **수익 보존 락** 이탈만 검사 (하드스탑은 ``check_swing_exit`` 전담).
+    스윙 **트레일링 청산** (하드스탑·5MA FULL은 ``check_swing_exit`` 와 병행).
 
-    ``profit_floor = get_swing_profit_lock_floor(buy, max_p)`` 가 0보다 크고
-    현재가가 그 이하이면 전량 청산.
+    * **러너** — 5MA 하향 이탈 시 전량 (고정 본절 락 대신 5MA 바닥).
+    * **비러너** — 최고수익>3% 본절 락(평단×1.005) 이탈 시 전량.
     """
     p = pos_info if isinstance(pos_info, dict) else {}
     cp = float(curr_p)
     buy = _swing_avg_price(p)
     if buy <= 0 or cp <= 0:
         return False, ""
+
+    w = _swing_ohlcv_working_df(ohlcv) if ohlcv is not None else None
+    ohlcv_ref = w if w is not None else ohlcv
+
+    if is_swing_runner_state(
+        p, ohlcv=ohlcv_ref, market=market, ticker=ticker
+    ):
+        ma5 = get_swing_ma5_trail_floor(p, ohlcv_ref, reference_price=cp)
+        if ma5 > 0 and cp < float(ma5):
+            cur_lbl = _format_swing_price_label(cp, market=market, ticker=ticker)
+            ma5_lbl = _format_swing_price_label(ma5, market=market, ticker=ticker)
+            return (
+                True,
+                f"{SWING_RUNNER_TRAIL_EXIT_REASON_LOG} (현재가: {cur_lbl} < 5MA: {ma5_lbl})",
+            )
+        return False, ""
+
     max_p = max(_finite_price(p.get("max_p", buy), buy), cp)
     profit_floor = get_swing_profit_lock_floor(buy, max_p)
     if profit_floor <= 0:

@@ -33,6 +33,9 @@ def _empty_state_shell() -> dict:
         "positions": {},
         "cooldown": {},
         "ticker_cooldowns": {},
+        "order_idempotency": {},
+        "buy_inflight": {},
+        "sell_inflight": {},
         "last_kis_display_snapshot": {},
         "last_coin_display_snapshot": {},
     }
@@ -43,6 +46,9 @@ def _finalize_loaded_dict(data: dict) -> dict:
     data.setdefault("positions", {})
     data.setdefault("cooldown", {})
     data.setdefault("ticker_cooldowns", {})
+    data.setdefault("order_idempotency", {})
+    data.setdefault("buy_inflight", {})
+    data.setdefault("sell_inflight", {})
     data.setdefault("last_kis_display_snapshot", {})
     data.setdefault("last_coin_display_snapshot", {})
     try:
@@ -171,6 +177,10 @@ def save_state(path: Path, state):
     동시 쓰기·깨진 JSON으로 이어지므로 **항상 이 함수만** 쓸 것.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        state["state_gen"] = int(state.get("state_gen", 0) or 0) + 1
+    except (TypeError, ValueError):
+        state["state_gen"] = 1
     payload = json.dumps(state, ensure_ascii=False, indent=2)
     with _save_state_lock:
         for attempt in range(18):

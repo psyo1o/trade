@@ -76,6 +76,8 @@ class TestSwingStopAboveEntry(unittest.TestCase):
             "max_p": max_p,
             "entry_fib_level": 95.0,
             "strategy_type": "SWING_FIB",
+            "entry_initial_risk_1r": 20.0,
+            "scale_out_done": False,
         }
         ohlcv = [{"o": h, "h": h, "l": h - 2, "c": h, "v": 1e6} for h in range(100, 160)]
         line = get_swing_exit_display_price(108.0, pos, ohlcv, market="KR", ticker="005930")

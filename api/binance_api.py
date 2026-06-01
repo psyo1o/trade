@@ -216,9 +216,16 @@ def clamp_qty_and_check_min_notional(internal_ticker: str, qty: float, price: fl
     return q, None
 
 
-def market_buy_usdt(internal_ticker: str, spend_usdt: float) -> dict[str, Any]:
+def market_buy_usdt(
+    internal_ticker: str,
+    spend_usdt: float,
+    *,
+    new_client_order_id: str | None = None,
+) -> dict[str, Any]:
     """
     시장가 매수만 사용(지정가 없음). 지출 USDT — ``quoteOrderQty``.
+
+    ``new_client_order_id`` — 동일 ID 재전송 시 거래소 멱등(중복 주문 방지).
     """
     ex = ensure_exchange()
     sym = internal_to_ccxt(internal_ticker)
@@ -226,12 +233,18 @@ def market_buy_usdt(internal_ticker: str, spend_usdt: float) -> dict[str, Any]:
     if spend <= 0:
         raise ValueError("spend_usdt<=0")
     spend_adj = float(ex.cost_to_precision(sym, spend))
-    try:
-        order = _with_time_sync_retry(
-            lambda ex: ex.create_order(sym, "market", "buy", spend_adj, None, {"quoteOrderQty": spend_adj})
-        )
-    except Exception:
-        order = _with_time_sync_retry(lambda ex: ex.create_market_buy_order(sym, spend_adj))
+    params: dict[str, Any] = {"quoteOrderQty": spend_adj}
+    cid = str(new_client_order_id or "").strip()
+    if cid:
+        params["newClientOrderId"] = cid
+
+    def _place(exchange: ccxt.binance) -> dict[str, Any]:
+        try:
+            return exchange.create_order(sym, "market", "buy", spend_adj, None, params)
+        except Exception:
+            return exchange.create_market_buy_order(sym, spend_adj, params)
+
+    order = _with_time_sync_retry(_place)
     od = order if isinstance(order, dict) else {"info": order}
     avg, filled = order_avg_fill_usdt(od)
     tot = float(od.get("cost") or 0) or (avg * filled if avg > 0 and filled > 0 else spend_adj)
@@ -247,15 +260,33 @@ def market_buy_usdt(internal_ticker: str, spend_usdt: float) -> dict[str, Any]:
     return od
 
 
-def market_sell_base(internal_ticker: str, qty: float) -> dict[str, Any]:
-    """시장가 매도만 사용(지정가 없음). 수량은 ``ensure_binance_order_precision`` 경유."""
+def market_sell_base(
+    internal_ticker: str,
+    qty: float,
+    *,
+    new_client_order_id: str | None = None,
+) -> dict[str, Any]:
+    """시장가 매도만 사용(지정가 없음). 수량은 ``ensure_binance_order_precision`` 경유.
+
+    ``new_client_order_id`` — 동일 ID 재전송 시 거래소 멱등(중복 주문 방지).
+    """
     ex = ensure_exchange()
     sym = internal_to_ccxt(internal_ticker)
     q_adj, _ = ensure_binance_order_precision(internal_ticker, float(qty), None)
     q = float(q_adj) if q_adj is not None else float(ex.amount_to_precision(sym, float(qty)))
     if q <= 0:
         raise ValueError("qty<=0")
-    order = _with_time_sync_retry(lambda ex: ex.create_market_sell_order(sym, q))
+    cid = str(new_client_order_id or "").strip()
+    params: dict[str, Any] = {}
+    if cid:
+        params["newClientOrderId"] = cid
+
+    def _place(exchange):
+        if params:
+            return exchange.create_market_sell_order(sym, q, params)
+        return exchange.create_market_sell_order(sym, q)
+
+    order = _with_time_sync_retry(_place)
     od = order if isinstance(order, dict) else {"info": order}
     avg, filled = order_avg_fill_usdt(od)
     tot = float(od.get("cost") or 0) or (avg * filled if avg > 0 and filled > 0 else 0.0)

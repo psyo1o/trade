@@ -213,14 +213,24 @@ def orderbook_summary(internal_ticker: str) -> dict[str, float]:
         return {"bid_size_total": 0.0, "ask_size_total": 0.0}
 
 
-def sell_market(internal_ticker: str, qty: float):
+def sell_market(
+    internal_ticker: str,
+    qty: float,
+    *,
+    new_client_order_id: str | None = None,
+):
+    """시장가 매도. 바이낸스만 ``new_client_order_id`` 멱등 키 전달."""
     if coin_config.is_binance():
         cp = float(get_current_price(internal_ticker) or 0.0)
         q2, err = binance_api.clamp_qty_and_check_min_notional(internal_ticker, float(qty), cp)
         if err:
             log.warning("[BINANCE SELL] %s 스킵: %s", internal_ticker, err)
             return None
-        order = binance_api.market_sell_base(internal_ticker, q2)
+        order = binance_api.market_sell_base(
+            internal_ticker,
+            q2,
+            new_client_order_id=new_client_order_id,
+        )
         avg, filled = binance_api.order_avg_fill_usdt(order)
         tot = avg * filled if avg > 0 and filled > 0 else 0.0
         print(
@@ -232,9 +242,16 @@ def sell_market(internal_ticker: str, qty: float):
     return upbit_api.upbit.sell_market_order(internal_ticker, qty)
 
 
-def buy_market_budget_krw(internal_ticker: str, budget_krw: float) -> Any:
+def buy_market_budget_krw(
+    internal_ticker: str,
+    budget_krw: float,
+    *,
+    new_client_order_id: str | None = None,
+) -> Any:
     """
     시장가 매수. 업비트: KRW 금액. 바이낸스: ``budget_krw / krw_per_usdt`` 만큼 USDT 매수.
+
+    바이낸스만 ``new_client_order_id`` 멱등 키 전달.
     """
     if not coin_config.is_binance():
         if upbit_api.upbit is None:
@@ -251,7 +268,11 @@ def buy_market_budget_krw(internal_ticker: str, budget_krw: float) -> Any:
             binance_api.min_cost_usdt(),
         )
         return None
-    order = binance_api.market_buy_usdt(internal_ticker, spend_usdt)
+    order = binance_api.market_buy_usdt(
+        internal_ticker,
+        spend_usdt,
+        new_client_order_id=new_client_order_id,
+    )
     return order
 
 
