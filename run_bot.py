@@ -57,38 +57,59 @@ import yfinance as yf
 import pandas as pd
 import pandas_market_calendars as mcal
 import concurrent.futures
-from api.kis_parsers import parse_kr_cash_total, parse_us_cash_fallback
+from api.kis_parsers import (
+    compute_us_stock_value_from_output,
+    extract_held_kr_codes,
+    extract_held_us_codes,
+    parse_kr_cash_total,
+    parse_kr_holdings_metrics,
+    parse_us_cash_fallback,
+    parse_us_holdings_metrics,
+)
 from execution.guard import (
     ACCOUNT_CIRCUIT_COOLDOWN_KEY,
     ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY,
     LAST_RESET_WEEK_KEY,
     PEAK_TOTAL_EQUITY_KEY,
+    PHASE5_PENDING_LIQUIDATION_MARKETS_KEY,
+    apply_phase5_share_anchor,
     apply_phase5_trailing_week_and_cooldown,
     can_open_new,
     check_mdd_break,
     get_phase5_peak_total_equity,
+    get_phase5_share_anchor,
     in_account_circuit_cooldown,
     in_cooldown,
+    in_market_circuit_cooldown,
     in_ticker_cooldown,
     load_state,
     save_state,
     set_account_circuit_cooldown,
     set_cooldown,
+    set_market_circuit_cooldown,
     set_ticker_cooldown_after_sell,
     ticker_cooldown_human,
 )
-from execution.circuit_break import evaluate_total_account_circuit, estimate_usdkrw
+from execution.circuit_break import (
+    evaluate_per_market_share_circuits,
+    evaluate_total_account_circuit,
+    estimate_usdkrw,
+)
 from execution.scale_out import (
+    SCALE_OUT_ENTRY_ATR_MULT,
     SCALE_OUT_MIN_NOTIONAL_KRW,
     SCALE_OUT_PROFIT_PCT,
-    scale_out_price_target_hit,
+    SCALE_OUT_SECOND_ENTRY_ATR_MULT,
     compute_coin_scale_out_qty,
     compute_stock_scale_out_qty,
     coin_scale_out_min_notional_ok,
     notional_krw_kr_us,
     plan_coin_sell_chunks,
     position_scale_out_done,
+    position_second_scale_out_done,
     post_partial_ledger,
+    scale_out_price_target_hit,
+    scale_out_second_trigger_ok,
     scale_out_trigger_ok,
     stock_scale_out_min_notional_ok,
     truncate_coin_qty,
@@ -102,6 +123,8 @@ from strategy.ai_filter import (
     evaluate_false_breakout_filter,
     summarize_ai_rationale,
 )
+from strategy.entry_router import decide_entry_signals
+from strategy.exit_router import decide_swing_exit, decide_v8_exit
 from strategy.rules import (
     calculate_pro_signals,
     check_swing_entry,
@@ -384,10 +407,31 @@ AI_FALSE_BREAKOUT_PROVIDER = str(config.get("ai_false_breakout_provider", "gemin
 
 # Phase 5 / Dry-run: config.json — test_mode=true 시 주문 대신 로그·텔레그램만
 TEST_MODE = bool(config.get("test_mode", False))
-# 합산 자산 서킷(기본 ON). 끄려면 config.json 에 "account_circuit_enabled": false
+# Phase5 계좌 서킷 — 기본: 시장별 포트폴리오 비중 하한(합산 MDD는 레거시, 기본 OFF)
 ACCOUNT_CIRCUIT_ENABLED = bool(config.get("account_circuit_enabled", True))
+ACCOUNT_CIRCUIT_USE_TOTAL = bool(config.get("account_circuit_use_total", False))
 ACCOUNT_CIRCUIT_MDD_PCT = float(config.get("account_circuit_mdd_pct", 15.0))
 ACCOUNT_CIRCUIT_COOLDOWN_H = float(config.get("account_circuit_cooldown_hours", 24.0))
+ACCOUNT_CIRCUIT_ANCHOR_MIN_RATIO = float(config.get("account_circuit_share_anchor_min_ratio", 0.5))
+# KIS 잔고: ``on_trade``(기본)=매매·강제새로고침·입출금 시만 API / ``always``=기존처럼 자주 조회
+KIS_BALANCE_SYNC_MODE = str(config.get("kis_balance_sync_mode", "on_trade")).strip().lower()
+
+
+def _account_circuit_min_share_pct(market: str) -> float:
+    """시장별 최소 포트폴리오 비중(%). 0 이하면 해당 시장 서킷 비활성."""
+    mk = str(market or "").strip().upper()
+    nested = config.get("account_circuit_min_share_pct")
+    if isinstance(nested, dict) and mk in nested:
+        try:
+            return float(nested.get(mk, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pass
+    defaults = {"KR": 8.0, "US": 8.0, "COIN": 5.0}
+    key = f"account_circuit_min_share_{mk.lower()}_pct"
+    try:
+        return float(config.get(key, defaults.get(mk, 0.0)))
+    except (TypeError, ValueError):
+        return float(defaults.get(mk, 0.0))
 
 # Phase 2: 대액 시장가 매수 TWAP (원화 500만 / USD 5000 초과 시 분할)
 TWAP_ENABLED = bool(config.get("twap_enabled", True))
@@ -503,85 +547,173 @@ def prefetch_ohlcv(tickers, market="KR", broker=None):
 
 def _store_ohlcv_cache(ticker: str, ohlcv: list) -> list:
     """메모리·디스크 캐시에 저장 후 동일 리스트 반환."""
+    try:
+        from utils.ohlcv_store import normalize_ohlcv_series, ohlcv_series_valid, save_disk_ohlcv
+
+        series = normalize_ohlcv_series(ohlcv)
+        if series and len(series) >= 14 and ohlcv_series_valid(series):
+            _ohlcv_cache[ticker] = series
+            save_disk_ohlcv(ticker, series)
+            return series
+    except Exception:
+        pass
     if ohlcv and len(ohlcv) >= 14:
         _ohlcv_cache[ticker] = ohlcv
-        try:
-            from utils.ohlcv_store import save_disk_ohlcv
-
-            save_disk_ohlcv(ticker, ohlcv)
-        except Exception:
-            pass
     return ohlcv
 
 
-def get_cached_ohlcv(ticker, broker=None):
+def _ohlcv_candidate_rank(rows: list) -> tuple[int, int]:
+    """(유효 여부 우선, 봉 수) — ``get_cached_ohlcv`` 소스 선택."""
+    try:
+        from utils.ohlcv_store import ohlcv_series_valid
+
+        ok = 1 if ohlcv_series_valid(rows) else 0
+    except Exception:
+        ok = 1 if rows and len(rows) >= 14 else 0
+    return (ok, len(rows or []))
+
+
+def get_cached_ohlcv(ticker, broker=None, force_refresh: bool = False):
     """OHLCV 확보(200봉). 메모리·디스크 → 국장 KIS→pykrx → 미장 KIS→Stooq(키)→yfinance."""
     try:
-        from utils.ohlcv_store import load_disk_ohlcv
+        from utils.ohlcv_store import (
+            invalidate_disk_ohlcv,
+            load_disk_ohlcv,
+            normalize_ohlcv_series,
+            ohlcv_series_valid,
+        )
     except Exception:
         load_disk_ohlcv = lambda _t, **kw: None  # type: ignore
+        invalidate_disk_ohlcv = lambda _t: None  # type: ignore
+        normalize_ohlcv_series = lambda r: r or []  # type: ignore
+        ohlcv_series_valid = lambda r, **kw: bool(r)  # type: ignore
 
-    if ticker in _ohlcv_cache and _ohlcv_cache[ticker] and len(_ohlcv_cache[ticker]) >= 200:
-        return _ohlcv_cache[ticker]
+    t = str(ticker or "").strip()
+    if force_refresh:
+        _ohlcv_cache.pop(t, None)
+        try:
+            invalidate_disk_ohlcv(t)
+        except Exception:
+            pass
 
-    disk = load_disk_ohlcv(ticker)
-    if disk and len(disk) >= 200:
-        _ohlcv_cache[ticker] = disk
+    mem = _ohlcv_cache.get(t) or []
+    if (
+        not force_refresh
+        and mem
+        and len(mem) >= 200
+        and ohlcv_series_valid(mem)
+    ):
+        return mem
+
+    disk = None if force_refresh else load_disk_ohlcv(t)
+    if disk and len(disk) >= 200 and ohlcv_series_valid(disk):
+        _ohlcv_cache[t] = disk
         return disk
+    if disk and not ohlcv_series_valid(disk):
+        try:
+            invalidate_disk_ohlcv(t)
+        except Exception:
+            pass
 
     kr_digit = broker is not None and str(ticker).isdigit()
-    best: list = (_ohlcv_cache.get(ticker) or disk or [])[:]
+    best: list = []
 
     def _take(candidate: list) -> None:
         nonlocal best
         if not candidate:
             return
-        if len(candidate) > len(best):
-            best = candidate
+        series = normalize_ohlcv_series(candidate)
+        if not series:
+            return
+        if _ohlcv_candidate_rank(series) > _ohlcv_candidate_rank(best):
+            best = series
 
-    # 국장: KIS → Stooq → yfinance
+    # 국장: KIS + pykrx(기준) 교차검증 — 미장과 동일(날짜·정렬·꼬리 검증)
     if kr_digit:
         _throttle_kis_ohlcv()
+        kis_kr: list = []
         try:
-            ohlcv_kis = get_ohlcv_kis_domestic_daily(broker, ticker) or []
+            kis_kr = get_ohlcv_kis_domestic_daily(broker, ticker) or []
         except Exception as e:
             print(f"     ⚠️ [{ticker}] KIS 일봉 조회 예외: {e}")
-            ohlcv_kis = []
-        _take(ohlcv_kis)
-        if len(best) >= 200:
-            return _store_ohlcv_cache(ticker, best)
-        if len(best) < 200:
-            _take(get_ohlcv_pykrx(ticker) or [])
-        if len(best) >= 200:
-            return _store_ohlcv_cache(ticker, best)
-        if ohlcv_kis and len(ohlcv_kis) < 200:
-            print(f"     ⚠️ [{ticker}] KIS {len(ohlcv_kis)}봉 — pykrx/yfinance 보강")
-
-    # 미장: KIS 해외(장중) → Stooq(키) → yfinance
-    if not kr_digit and not kis_equities_weekend_suppress_window_kst():
+        ref_kr = get_ohlcv_pykrx(ticker) or []
+        ref_label = "pykrx"
+        if not ref_kr:
+            try:
+                ref_kr = get_ohlcv_yfinance(ticker) or []
+                ref_label = "yfinance"
+            except Exception as e:
+                print(f"     ⚠️ [{ticker}] yfinance(국장검증) 조회 실패: {e}")
         try:
-            from api import kis_api
-            from api.kis_api import get_ohlcv_kis_us_daily
+            from utils.ohlcv_store import select_validated_kr_ohlcv
 
-            bus = kis_api.broker_us
-            if bus:
-                _take(get_ohlcv_kis_us_daily(bus, ticker) or [])
+            picked = select_validated_kr_ohlcv(
+                kis_kr, ref_kr, ticker=ticker, reference_name=ref_label
+            )
+            if picked:
+                best = picked
+        except Exception:
+            if ref_kr:
+                best = normalize_ohlcv_series(ref_kr)
+            elif kis_kr:
+                best = normalize_ohlcv_series(kis_kr)
+        if len(best) >= 200:
+            return _store_ohlcv_cache(ticker, best)
+        if len(best) < 200 and ref_kr:
+            _take(ref_kr)
+        if len(best) >= 200:
+            return _store_ohlcv_cache(ticker, best)
+        if kis_kr and len(kis_kr) < 200:
+            print(f"     ⚠️ [{ticker}] KIS {len(kis_kr)}봉 — pykrx/yfinance 보강")
+
+    # 미장: KIS + yfinance 교차검증 → Stooq 보강 (맹목 KIS 단일 사용 금지)
+    yf_ref: list = []
+    if not kr_digit:
+        try:
+            yf_ref = get_ohlcv_yfinance(ticker) or []
         except Exception as e:
-            print(f"     ⚠️ [{ticker}] KIS 해외 일봉 예외: {e}")
+            print(f"     ⚠️ [{ticker}] yfinance 조회 실패: {e}")
+        kis_us: list = []
+        if not kis_equities_weekend_suppress_window_kst():
+            try:
+                from api import kis_api
+                from api.kis_api import get_ohlcv_kis_us_daily
+
+                bus = kis_api.broker_us
+                if bus:
+                    kis_us = get_ohlcv_kis_us_daily(bus, ticker) or []
+            except Exception as e:
+                print(f"     ⚠️ [{ticker}] KIS 해외 일봉 예외: {e}")
+        try:
+            from utils.ohlcv_store import select_validated_equity_ohlcv
+
+            picked = select_validated_equity_ohlcv(kis_us, yf_ref, ticker=ticker)
+            if picked:
+                best = picked
+        except Exception:
+            if yf_ref:
+                best = normalize_ohlcv_series(yf_ref)
+            elif kis_us:
+                best = normalize_ohlcv_series(kis_us)
 
     stooq_key = str(config.get("stooq_apikey", "") or "").strip()
-    if stooq_key:
+    if stooq_key and len(best) < 200:
         _take(get_ohlcv_stooq(ticker, apikey=stooq_key) or [])
     if len(best) >= 200:
         return _store_ohlcv_cache(ticker, best)
 
-    try:
-        ohlcv_yf = get_ohlcv_yfinance(ticker) or []
-        _take(ohlcv_yf)
-        if ohlcv_yf and len(ohlcv_yf) < 200:
-            print(f"     ⚠️ [{ticker}] yfinance {len(ohlcv_yf)}봉 (<200)")
-    except Exception as e:
-        print(f"     ⚠️ [{ticker}] yfinance 조회 실패: {e}")
+    if not kr_digit and yf_ref and len(best) < 200:
+        _take(yf_ref)
+        if yf_ref and len(yf_ref) < 200:
+            print(f"     ⚠️ [{ticker}] yfinance {len(yf_ref)}봉 (<200)")
+    elif kr_digit:
+        try:
+            ohlcv_yf = get_ohlcv_yfinance(ticker) or []
+            _take(ohlcv_yf)
+            if ohlcv_yf and len(ohlcv_yf) < 200:
+                print(f"     ⚠️ [{ticker}] yfinance {len(ohlcv_yf)}봉 (<200)")
+        except Exception as e:
+            print(f"     ⚠️ [{ticker}] yfinance 조회 실패: {e}")
 
     if len(best) >= 200:
         return _store_ohlcv_cache(ticker, best)
@@ -736,7 +868,17 @@ def is_market_open(market="KR"):
             return _fallback_is_market_open_kr(now_local)
         return _fallback_is_market_open_us(now_local)
 
-def _record_trade_event(market, ticker, side, qty, price=None, profit_rate=None, reason="", name=""):
+def _record_trade_event(
+    market,
+    ticker,
+    side,
+    qty,
+    price=None,
+    profit_rate=None,
+    reason="",
+    name="",
+    ledger=None,
+):
     """매매 이벤트를 누적 저장용 JSON에 append"""
     symbol_name = str(name or "").strip()
     try:
@@ -757,7 +899,7 @@ def _record_trade_event(market, ticker, side, qty, price=None, profit_rate=None,
     except Exception:
         sector = ""
 
-    record_trade({
+    record = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "market": market,
         "ticker": ticker,
@@ -768,7 +910,12 @@ def _record_trade_event(market, ticker, side, qty, price=None, profit_rate=None,
         "price": price,
         "profit_rate": profit_rate,
         "reason": reason,
-    })
+    }
+    if str(side or "").upper() == "BUY" and isinstance(ledger, dict):
+        from services.trade_history_ledger import ledger_extra_from_buy_payload
+
+        record.update(ledger_extra_from_buy_payload(ledger))
+    record_trade(record)
 
 
 def _coin_sell_order_ok(resp) -> bool:
@@ -918,6 +1065,32 @@ def get_held_coins():
     except Exception as e:
         print(f"❌ [코인 조회 실패] {type(e).__name__}: {e}")
         return None
+
+
+def kis_equities_ready_for_trading_cycle() -> bool:
+    """
+    개장 중인 KIS 시장(국·미)은 실보유 조회가 성공해야 매매 사이클을 돌린다.
+
+    주말·점검 창은 장부·스냅샷 경로만 쓰므로 True.
+    ``kis_balance_sync_mode=on_trade``(봇 전용)이면 KIS 잔고 없이도 True.
+    """
+    if kis_equities_weekend_suppress_window_kst():
+        return True
+    from execution.balance_policy import is_on_trade_balance_mode
+
+    if is_on_trade_balance_mode(config):
+        return True
+    if is_market_open("KR"):
+        held_kr = get_held_stocks_kr()
+        if held_kr is None:
+            print("  ⏸️ [시스템] 국장 KIS 보유 조회 실패 — 이번 매매 사이클 보류")
+            return False
+    if is_market_open("US"):
+        held_us = get_held_stocks_us()
+        if held_us is None:
+            print("  ⏸️ [시스템] 미장 KIS 보유 조회 실패 — 이번 매매 사이클 보류")
+            return False
+    return True
 
 
 def fetch_equity_held_lists_for_position_sync():
@@ -1185,6 +1358,7 @@ def _apply_manual_sell_state_update(
     sold_qty: float,
     *,
     state: dict | None = None,
+    idem_lane: str | None = None,
 ) -> dict:
     """수동 매도 체결 후 장부 반영. 전량 청산 시에만 승패·total_profit·티커 쿨다운(Layer2) 종결."""
     if state is None:
@@ -1234,10 +1408,15 @@ def _apply_manual_sell_state_update(
 
     def _mut_manual_sell(st: dict) -> None:
         set_cooldown(st, ticker)
+        cd_reason = (
+            "Phase5 서킷 청산"
+            if str(idem_lane or "").strip() == order_idem.LANE_PHASE5
+            else "수동 매도"
+        )
         set_ticker_cooldown_after_sell(
             st,
             ticker,
-            "수동 매도",
+            cd_reason,
             profit_rate=profit_rate,
             strategy_type=strategy_st,
             market=market,
@@ -1322,7 +1501,7 @@ def manual_sell(market, code, quantity, *, idem_lane: str | None = None):
                 )
                 exec_price = curr_p
                 meta = _apply_manual_sell_state_update(
-                    code, exec_price, "KR", float(int(qty)), state=st
+                    code, exec_price, "KR", float(int(qty)), state=st, idem_lane=lane
                 )
                 profit_rate = meta.get("profit_rate")
                 full_exit = bool(meta.get("full_exit", True))
@@ -1390,7 +1569,7 @@ def manual_sell(market, code, quantity, *, idem_lane: str | None = None):
                     pos0 if isinstance(pos0, dict) else {}, "US"
                 )
                 meta = _apply_manual_sell_state_update(
-                    code, current_price, "US", float(int(qty)), state=st
+                    code, current_price, "US", float(int(qty)), state=st, idem_lane=lane
                 )
                 profit_rate = meta.get("profit_rate")
                 full_exit = bool(meta.get("full_exit", True))
@@ -1432,7 +1611,7 @@ def manual_sell(market, code, quantity, *, idem_lane: str | None = None):
                     pos0 if isinstance(pos0, dict) else {}, "COIN"
                 )
                 meta = _apply_manual_sell_state_update(
-                    code, current_p, "COIN", float(qty), state=st
+                    code, current_p, "COIN", float(qty), state=st, idem_lane=lane
                 )
                 profit_rate = meta.get("profit_rate")
                 full_exit = bool(meta.get("full_exit", True))
@@ -1493,9 +1672,12 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
         pass
 
     path = Path(path)
-    total_kr_equity = float(state.get("circuit_aux_last_kr_krw", 0) or 0)
-    total_us_equity = float(state.get("circuit_aux_last_usd_total", 0) or 0)
-    total_coin_equity = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
+    prev_kr_equity = float(state.get("circuit_aux_last_kr_krw", 0) or 0)
+    prev_us_equity = float(state.get("circuit_aux_last_usd_total", 0) or 0)
+    prev_coin_equity = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
+    total_kr_equity = prev_kr_equity
+    total_us_equity = prev_us_equity
+    total_coin_equity = prev_coin_equity
 
     suppress = kis_equities_weekend_suppress_window_kst()
     if suppress:
@@ -1512,10 +1694,31 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
     else:
         try:
             if is_market_open("KR"):
-                bal = ensure_dict(get_balance_with_retry())
-                kr_balance_data = bal.get("output2", [])
-                _, total_kr_equity = parse_kr_cash_total(kr_balance_data, _to_float)
-                result["kr_ok"] = True
+                from api.kis_parsers import kis_response_ok
+
+                bal = ensure_dict(bal_read.kr_balance_raw(refresh=False))
+                ok, why = kis_response_ok(bal, require_output2=True)
+                if ok:
+                    kr_balance_data = bal.get("output2", [])
+                    _, parsed_kr = parse_kr_cash_total(kr_balance_data, _to_float)
+                    suspicious_kr = (
+                        prev_kr_equity > 500_000.0
+                        and float(parsed_kr) > 0.0
+                        and float(parsed_kr) < prev_kr_equity * 0.35
+                    )
+                    suspicious_zero = prev_kr_equity > 500_000.0 and float(parsed_kr) <= 0.0
+                    if suspicious_kr or suspicious_zero:
+                        print(
+                            "  ⚠️ [circuit_aux 갱신] 국장 총평가 급락/0원(일시 API 이상 추정) — "
+                            f"직전 {prev_kr_equity:,.0f}원 유지, kr_ok=False ({why})"
+                        )
+                    else:
+                        total_kr_equity = float(parsed_kr)
+                        result["kr_ok"] = True
+                else:
+                    print(
+                        f"  ⚠️ [circuit_aux 갱신] 국장 잔고 응답 비정상 — 직전 값 유지, kr_ok=False ({why})"
+                    )
             else:
                 snap = load_last_kis_display_snapshot()
                 kr_d = snap.get("kr") or {}
@@ -1528,52 +1731,58 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
 
         try:
             if is_market_open("US"):
+                from api.kis_parsers import kis_response_ok
+
                 us_cash = float(get_us_cash_real(kis_api.broker_us) or 0.0)
-                us_bal = ensure_dict(get_us_positions_with_retry())
-                out2 = safe_get(us_bal, "output2", {})
-                if us_cash <= 0.0 and out2:
-                    try:
-                        us_cash = float(parse_us_cash_fallback(out2, _to_float))
-                    except Exception:
-                        pass
-                us_output1 = ensure_list(us_bal.get("output1", []))
-                if isinstance(out2, list) and out2:
-                    us_stock_value = _to_float(out2[0].get("ovrs_stck_evlu_amt", 0))
-                elif isinstance(out2, dict):
-                    us_stock_value = _to_float(out2.get("ovrs_stck_evlu_amt", 0))
-                else:
-                    us_stock_value = 0.0
-                if us_stock_value <= 0 and us_output1:
-                    manual_stock_eval = 0.0
-                    for s in us_output1:
-                        val = _to_float(s.get("frcr_evlu_amt2", 0))
-                        if val <= 0:
-                            price = _to_float(s.get("ovrs_now_prc2", 0))
-                            qty = _to_float(s.get("ovrs_cblc_qty", s.get("hldg_qty", 0)))
-                            val = price * qty
-                        manual_stock_eval += val
-                    if manual_stock_eval > 0:
-                        us_stock_value = manual_stock_eval
-                total_us_equity = us_cash + us_stock_value
-                # KIS 해외 잔고 API가 간헐적으로 0/누락을 돌려줄 수 있어 비정상 하락은 실패로 간주.
-                prev_us_equity = float(state.get("circuit_aux_last_usd_total", 0) or 0)
-                suspicious_zero = (total_us_equity <= 0.0) and (
-                    prev_us_equity > 0.0 or bool(us_output1)
-                )
-                suspicious_drop = (
-                    prev_us_equity > 0.0
-                    and total_us_equity > 0.0
-                    and total_us_equity < prev_us_equity * 0.35
-                )
-                if suspicious_zero or suspicious_drop:
-                    result["us_ok"] = False
-                    total_us_equity = prev_us_equity
+                us_bal = ensure_dict(bal_read.us_balance_raw(refresh=False))
+                ok_us, why_us = kis_response_ok(us_bal, require_output2=True)
+                if not ok_us:
                     print(
-                        "  ⚠️ [circuit_aux 갱신] 미장 값 비정상(미수금/총평가 누락 추정) — "
-                        "이번 루프는 직전 US 스냅샷 유지, Phase5 판정에서 제외"
+                        f"  ⚠️ [circuit_aux 갱신] 미장 잔고 응답 비정상 — 직전 값 유지, us_ok=False ({why_us})"
                     )
                 else:
-                    result["us_ok"] = True
+                    out2 = safe_get(us_bal, "output2", {})
+                    if us_cash <= 0.0 and out2:
+                        try:
+                            us_cash = float(parse_us_cash_fallback(out2, _to_float))
+                        except Exception:
+                            pass
+                    us_output1 = ensure_list(us_bal.get("output1", []))
+                    if isinstance(out2, list) and out2:
+                        us_stock_value = _to_float(out2[0].get("ovrs_stck_evlu_amt", 0))
+                    elif isinstance(out2, dict):
+                        us_stock_value = _to_float(out2.get("ovrs_stck_evlu_amt", 0))
+                    else:
+                        us_stock_value = 0.0
+                    if us_stock_value <= 0 and us_output1:
+                        manual_stock_eval = 0.0
+                        for s in us_output1:
+                            val = _to_float(s.get("frcr_evlu_amt2", 0))
+                            if val <= 0:
+                                price = _to_float(s.get("ovrs_now_prc2", 0))
+                                qty = _to_float(s.get("ovrs_cblc_qty", s.get("hldg_qty", 0)))
+                                val = price * qty
+                            manual_stock_eval += val
+                        if manual_stock_eval > 0:
+                            us_stock_value = manual_stock_eval
+                    parsed_us = us_cash + us_stock_value
+                    suspicious_zero = (parsed_us <= 0.0) and (
+                        prev_us_equity > 0.0 or bool(us_output1)
+                    )
+                    suspicious_drop = (
+                        prev_us_equity > 0.0
+                        and parsed_us > 0.0
+                        and parsed_us < prev_us_equity * 0.35
+                    )
+                    if suspicious_zero or suspicious_drop:
+                        result["us_ok"] = False
+                        print(
+                            "  ⚠️ [circuit_aux 갱신] 미장 값 비정상(미수금/총평가 누락 추정) — "
+                            "직전 US 유지, Phase5 판정에서 제외"
+                        )
+                    else:
+                        total_us_equity = float(parsed_us)
+                        result["us_ok"] = True
             else:
                 snap = load_last_kis_display_snapshot()
                 us_d = snap.get("us") or {}
@@ -1633,9 +1842,12 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
     except Exception:
         pass
 
-    state["circuit_aux_last_kr_krw"] = float(total_kr_equity)
-    state["circuit_aux_last_usd_total"] = float(total_us_equity)
-    state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
+    if result["kr_ok"]:
+        state["circuit_aux_last_kr_krw"] = float(total_kr_equity)
+    if result["us_ok"]:
+        state["circuit_aux_last_usd_total"] = float(total_us_equity)
+    if result["coin_ok"]:
+        state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
     save_state(path, state)
     result["totals"] = {
         "kr_krw": float(total_kr_equity),
@@ -1645,91 +1857,17 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
     return result
 
 
-def _phase5_emergency_liquidate_all(state: dict) -> None:
-    """
-    합산 서킷 발동 시 비코어 전량 시장가 매도(단발).
-    부분 TWAP는 장부/부분체결 정합 이슈로 Phase2에서 정식화 예정.
-    """
-    if TEST_MODE:
-        msg = "🧪 [TEST_MODE] Phase5 전량 청산 — 실주문 생략 (수동 매도 경로 미호출)"
-        print(f"  {msg}")
-        try:
-            lines = []
-            if not kis_equities_weekend_suppress_window_kst():
-                bal = ensure_dict(get_balance_with_retry())
-                for stock in ensure_list(bal.get("output1")):
-                    code = normalize_ticker(stock.get("pdno", ""))
-                    qty = int(_to_float(stock.get("hldg_qty", 0)))
-                    if qty > 0 and code:
-                        lines.append(f"KR {code} x{qty}")
-                us_bal = ensure_dict(get_us_positions_with_retry())
-                for item in ensure_list(us_bal.get("output1")):
-                    c = normalize_ticker(item.get("ovrs_pdno", item.get("pdno", "")))
-                    q = int(_to_float(item.get("ovrs_cblc_qty", item.get("hldg_qty", 0))))
-                    if q > 0 and c:
-                        lines.append(f"US {c} x{q}")
-            for b in coin_broker.get_balances() or []:
-                if b.get("currency") in ("KRW", "VTHO"):
-                    continue
-                if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
-                    continue
-                t = coin_broker.held_ticker_row(b)
-                if not t:
-                    continue
-                qf = float(_to_float(b.get("balance", 0)))
-                if coin_broker.should_include_coin_balance_row(b):
-                    lines.append(f"COIN {t} x{qf}")
-            send_telegram(f"{msg}\n대상:\n" + "\n".join(lines[:40]))
-        except Exception as e:
-            print(f"  ⚠️ [TEST_MODE] 청산 시뮬 요약 실패: {e}")
-        return
+from execution import phase5_ops as _phase5_ops
 
-    # KR (정규장일 때만 실주문)
-    if not kis_equities_weekend_suppress_window_kst() and is_market_open("KR"):
-        try:
-            bal = ensure_dict(get_balance_with_retry())
-            for stock in ensure_list(bal.get("output1")):
-                code = normalize_ticker(stock.get("pdno", ""))
-                qty = int(_to_float(stock.get("hldg_qty", 0)))
-                if qty <= 0 or not code:
-                    continue
-                manual_sell("KR", code, qty, idem_lane=order_idem.LANE_PHASE5)
-        except Exception as e:
-            print(f"  ⚠️ [Phase5] 국장 전량 청산 루프 예외: {e}")
-    else:
-        print("  ⏸️ [Phase5] 국장 비장중/점검 구간 — KR 청산은 장 개시 후 재시도")
-
-    # US (정규장일 때만 실주문)
-    if not kis_equities_weekend_suppress_window_kst() and is_market_open("US"):
-        try:
-            us_bal = ensure_dict(get_us_positions_with_retry())
-            for item in ensure_list(us_bal.get("output1")):
-                c = normalize_ticker(item.get("ovrs_pdno", item.get("pdno", "")))
-                q = int(_to_float(item.get("ovrs_cblc_qty", item.get("hldg_qty", 0))))
-                if q <= 0 or not c:
-                    continue
-                manual_sell("US", c, q, idem_lane=order_idem.LANE_PHASE5)
-        except Exception as e:
-            print(f"  ⚠️ [Phase5] 미장 전량 청산 루프 예외: {e}")
-    else:
-        print("  ⏸️ [Phase5] 미장 비장중/점검 구간 — US 청산은 장 개시 후 재시도")
-
-    # COIN
-    try:
-        for b in coin_broker.get_balances() or []:
-            if b.get("currency") in ("KRW", "VTHO"):
-                continue
-            if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
-                continue
-            t = coin_broker.held_ticker_row(b)
-            if not t:
-                continue
-            qf = float(_to_float(b.get("balance", 0)))
-            if not coin_broker.should_include_coin_balance_row(b):
-                continue
-            manual_sell("COIN", t, qf, idem_lane=order_idem.LANE_PHASE5)
-    except Exception as e:
-        print(f"  ⚠️ [Phase5] 코인 전량 청산 루프 예외: {e}")
+_phase5_liquidate_market = _phase5_ops.liquidate_market
+_phase5_emergency_liquidate_all = _phase5_ops.emergency_liquidate_all
+_phase5_market_has_ledger_positions = _phase5_ops.market_has_ledger_positions
+_phase5_pending_markets = _phase5_ops.pending_markets
+_phase5_migrate_legacy_pending_flag = _phase5_ops.migrate_legacy_pending_flag
+_phase5_prune_stale_pending = _phase5_ops.prune_stale_pending
+_phase5_set_pending_markets = _phase5_ops.set_pending_markets
+_phase5_try_pending_liquidation = _phase5_ops.try_pending_liquidation
+_maybe_run_account_circuit = _phase5_ops.maybe_run_account_circuit
 
 
 def _phase5_pending_positions_exist(state: dict) -> bool:
@@ -1738,136 +1876,14 @@ def _phase5_pending_positions_exist(state: dict) -> bool:
     return isinstance(pos, dict) and len(pos) > 0
 
 
-def _phase5_try_pending_liquidation() -> None:
-    """
-    서킷 발동 후 비장중으로 미체결된 시장을 장 개시 시점에 재시도.
-    cooldown 중에도 실행하여 '나중에라도 전량 청산'을 보장한다.
-    """
-    st = load_state(STATE_PATH)
-    if not bool(st.get("phase5_pending_liquidation")):
-        return
-    if not _phase5_pending_positions_exist(st):
-        st["phase5_pending_liquidation"] = False
-        save_state(STATE_PATH, st)
-        return
-
-    print("  🔁 [Phase5] 대기 청산 재시도 — 장 개시 시장부터 전량 청산 시도")
-    _phase5_emergency_liquidate_all(st)
-    st2 = load_state(STATE_PATH)
-    if not _phase5_pending_positions_exist(st2):
-        st2["phase5_pending_liquidation"] = False
-        save_state(STATE_PATH, st2)
-        print("  ✅ [Phase5] 대기 청산 완료 — 모든 포지션 정리됨")
-        try:
-            send_telegram("✅ [Phase5] 대기 청산 완료 — 시장 재개 후 미체결 포지션까지 정리되었습니다.")
-        except Exception:
-            pass
-
-
-def _maybe_run_account_circuit(state: dict) -> None:
-    """매 루프 시작부: 월요일 주차 고점·쿨다운 후 리셋 → 합산 MDD 서킷 → (옵션) 전량 청산 + 쿨다운."""
-    if not ACCOUNT_CIRCUIT_ENABLED:
-        return
-    aux_meta = state.get("_phase5_aux_sync") if isinstance(state.get("_phase5_aux_sync"), dict) else {}
-    if aux_meta:
-        kr_ok = bool(aux_meta.get("kr_ok"))
-        us_ok = bool(aux_meta.get("us_ok"))
-        coin_ok = bool(aux_meta.get("coin_ok"))
-        if not (kr_ok and us_ok and coin_ok):
-            print(
-                "  ⚠️ [Phase5 서킷] circuit_aux 동기화 불완전("
-                f"KR={kr_ok}, US={us_ok}, COIN={coin_ok}) — 이번 루프 서킷 판정은 건너뜀(오발동 방지)"
-            )
-            return
-    total = _portfolio_total_krw_from_aux(state)
-    if total <= 0:
-        return
-
-    st = load_state(STATE_PATH)
-    apply_phase5_trailing_week_and_cooldown(st, float(total), STATE_PATH)
-    peak = get_phase5_peak_total_equity(st)
-    for _k in (
-        PEAK_TOTAL_EQUITY_KEY,
-        LAST_RESET_WEEK_KEY,
-        ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY,
-        ACCOUNT_CIRCUIT_COOLDOWN_KEY,
-    ):
-        if _k in st:
-            state[_k] = st[_k]
-
-    if in_account_circuit_cooldown(st):
-        _phase5_try_pending_liquidation()
-        print(
-            f"  🛡️ [Phase5 서킷] 계좌 단위 쿨다운 중 — 신규 매수는 쿨다운 종료까지 차단 "
-            f"(until={st.get('account_circuit_cooldown_until', '')})"
-        )
-        return
-
-    ev = evaluate_total_account_circuit(peak, total, trigger_drawdown_pct=ACCOUNT_CIRCUIT_MDD_PCT)
-    print(
-        f"  🛡️ [Phase5 서킷] 합산 {total:,.0f}원 (주차 고점 {peak:,.0f}) "
-        f"DD={ev['drawdown_pct']:.2f}% / 임계 {ACCOUNT_CIRCUIT_MDD_PCT:g}% → "
-        f"{'발동' if ev['triggered'] else '정상'} | {ev['reason']}"
-    )
-    if not ev["triggered"]:
-        return
-
-    send_telegram(
-        f"🚨 [Phase5 계좌 서킷 발동]\n{ev['reason']}\n전량 청산을 시도합니다. "
-        f"(TEST_MODE={TEST_MODE})"
-    )
-    state["phase5_pending_liquidation"] = True
-    save_state(STATE_PATH, state)
-    _phase5_emergency_liquidate_all(state)
-    st2 = load_state(STATE_PATH)
-    if not _phase5_pending_positions_exist(st2):
-        st2["phase5_pending_liquidation"] = False
-    set_account_circuit_cooldown(st2, STATE_PATH, ACCOUNT_CIRCUIT_COOLDOWN_H)
-
-
 def _calc_kr_holdings_metrics(balance_data):
-    """국내 포지션 지표"""
-    if not balance_data or 'output1' not in balance_data:
-        return {"invested": 0.0, "current": 0.0, "profit": 0.0, "roi": 0.0}
-    try:
-        total_invested = 0.0
-        total_current = 0.0
-        for stock in balance_data['output1']:
-            qty = _to_float(stock.get('hldg_qty', stock.get('ccld_qty_smtl1', 0)))
-            if qty > 0:
-                avg_price = _to_float(stock.get('pchs_avg_prc', stock.get('pchs_avg_pric', 0)))
-                invested = avg_price * qty
-                current_price = _to_float(stock.get('prpr', stock.get('stck_prpr', 0)))
-                current = current_price * qty
-                total_invested += invested
-                total_current += current
-        profit = total_current - total_invested
-        roi = (profit / total_invested * 100) if total_invested > 0 else 0.0
-        return {"invested": total_invested, "current": total_current, "profit": profit, "roi": roi}
-    except: return {"invested": 0.0, "current": 0.0, "profit": 0.0, "roi": 0.0}
+    """국내 포지션 지표 — ``api.kis_parsers.parse_kr_holdings_metrics`` 위임."""
+    return parse_kr_holdings_metrics(balance_data, _to_float)
+
 
 def _calc_us_holdings_metrics(balance_data):
-    """미국 포지션 지표"""
-    if not balance_data or 'output1' not in balance_data:
-        return {"invested": 0.0, "current": 0.0, "profit": 0.0, "roi": 0.0}
-    try:
-        total_invested = 0.0
-        total_current = 0.0
-        for stock in balance_data['output1']:
-            qty = _to_float(stock.get('ovrs_cblc_qty', stock.get('hldg_qty', 0)))
-            if qty <= 0:
-                qty = _to_float(stock.get('ccld_qty_smtl1', 0))
-            if qty > 0:
-                avg_price = _to_float(stock.get('ovrs_avg_unpr', stock.get('ovrs_avg_pric', stock.get('avg_unpr3', 0))))
-                invested = avg_price * qty
-                current_price = _to_float(stock.get('ovrs_now_prc2', stock.get('ovrs_nmix_prpr', stock.get('ovrs_now_pric1', 0))))
-                current = current_price * qty
-                total_invested += invested
-                total_current += current
-        profit = total_current - total_invested
-        roi = (profit / total_invested * 100) if total_invested > 0 else 0.0
-        return {"invested": total_invested, "current": total_current, "profit": profit, "roi": roi}
-    except: return {"invested": 0.0, "current": 0.0, "profit": 0.0, "roi": 0.0}
+    """미국 포지션 지표 — ``api.kis_parsers.parse_us_holdings_metrics`` 위임."""
+    return parse_us_holdings_metrics(balance_data, _to_float)
 
 def _calc_coin_holdings_metrics(balances, positions=None):
     """코인 포지션 지표. 바이낸스는 avg_buy_price가 없어 장부·매매내역 평단을 쓴다."""
@@ -1933,6 +1949,7 @@ def persist_position_registration(state, ticker, position_payload, context="", s
         return False
     position_payload = dict(position_payload)
     position_payload.setdefault("scale_out_done", False)
+    position_payload.setdefault("second_scale_out_done", False)
     if "entry_atr" not in position_payload:
         position_payload["entry_atr"] = float(_to_float(position_payload.get("current_atr", 0), 0.0))
     existing = state.get("positions", {}).get(ticker)
@@ -2047,6 +2064,9 @@ def _idempotent_kis_sell(
             bal_read.invalidate(market)
         elif fill.ok and not TEST_MODE:
             bal_read.invalidate(market)
+            from execution.balance_policy import mark_balance_live_sync
+
+            mark_balance_live_sync(state, STATE_PATH)
         return fill
     finally:
         if use_inflight and acquired:
@@ -2064,8 +2084,11 @@ def _run_kis_scale_out_slices_idempotent(
     curr_p: float,
     place_slice,
     cycle_tag: str | None = None,
+    lane: str | None = None,
+    log_label: str = "Scale-Out",
 ) -> bool:
     """V8 Scale-Out — 슬라이스별 멱등 매도( sell_inflight 없음 )."""
+    sell_lane = lane or order_idem.LANE_SCALE_OUT
     chunks = plan_sell_qty_twap(int(sell_qty), float(notional_krw), threshold_krw=float(threshold_krw))
     ct = cycle_tag or order_idem.cycle_tag_15m_kst()
     for si, qq in enumerate(chunks):
@@ -2079,7 +2102,7 @@ def _run_kis_scale_out_slices_idempotent(
             state,
             market=market,
             ticker=ticker,
-            lane=order_idem.LANE_SCALE_OUT,
+            lane=sell_lane,
             qty=int(qq),
             fallback_price=float(curr_p),
             place_order=_place,
@@ -2089,7 +2112,7 @@ def _run_kis_scale_out_slices_idempotent(
         )
         tag = "♻️" if fill.reused else "🧾"
         print(
-            f"  {tag} [{market} Scale-Out {si + 1}/{len(chunks)}] {ticker} "
+            f"  {tag} [{market} {log_label} {si + 1}/{len(chunks)}] {ticker} "
             f"ok={fill.ok} qty={int(fill.qty)} note={fill.note}"
         )
         if not fill.ok:
@@ -2190,8 +2213,11 @@ def _run_coin_scale_out_slices_idempotent(
     chunks: list[float],
     curr_p: float,
     cycle_tag: str | None = None,
+    lane: str | None = None,
+    log_label: str = "Scale-Out",
 ) -> bool:
     """코인 Scale-Out — 덩어리별 멱등 매도."""
+    sell_lane = lane or order_idem.LANE_SCALE_OUT
     ct = cycle_tag or order_idem.cycle_tag_15m_kst()
     flist = [truncate_coin_qty(float(c)) for c in chunks]
     flist = [x for x in flist if x > 0]
@@ -2201,7 +2227,7 @@ def _run_coin_scale_out_slices_idempotent(
         fill = _idempotent_coin_sell(
             state,
             ticker=ticker,
-            lane=order_idem.LANE_SCALE_OUT,
+            lane=sell_lane,
             qty=float(vv),
             fallback_price=float(curr_p),
             slice_index=si,
@@ -2210,7 +2236,7 @@ def _run_coin_scale_out_slices_idempotent(
         )
         tag = "♻️" if fill.reused else "🧾"
         print(
-            f"  {tag} [COIN Scale-Out {si + 1}/{len(flist)}] {ticker} "
+            f"  {tag} [COIN {log_label} {si + 1}/{len(flist)}] {ticker} "
             f"ok={fill.ok} qty={fill.qty:.6f} note={fill.note}"
         )
         if not fill.ok:
@@ -2218,6 +2244,368 @@ def _run_coin_scale_out_slices_idempotent(
         if TWAP_SLICE_DELAY_SEC > 0 and si < len(flist) - 1:
             time.sleep(TWAP_SLICE_DELAY_SEC)
     return True
+
+
+def _try_v8_scale_out_kr_us(
+    state: dict,
+    *,
+    market: str,
+    ticker: str,
+    pos_info: dict,
+    qty: int,
+    buy_p: float,
+    curr_p: float,
+    profit_rate_now: float,
+    cycle_tag: str,
+    is_us: bool,
+    place_slice,
+    display_name: str,
+) -> tuple[bool, dict]:
+    """
+    V8(TREND_V8) 분할 익절 — 1차 ``entry_atr×3`` · 2차 ``entry_atr×6`` (1차 후 잔량 50%).
+
+    Returns:
+        (handled_continue, pos_info) — True면 매도 루프 ``continue``.
+    """
+    mkt = str(market or "").strip().upper()
+    pos = dict(pos_info) if isinstance(pos_info, dict) else {}
+    usdk = float(estimate_usdkrw())
+    qty_int = int(qty)
+    q_led = int(round(_to_float(pos.get("qty"), qty_int)))
+    if q_led <= 0:
+        q_led = qty_int
+    notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), is_us, usdk)
+    entry_atr = _to_float(pos.get("entry_atr", 0), 0.0)
+
+    # --- 1차 Scale-Out (3×ATR) ---
+    so_hit, so_mode, so_target = scale_out_price_target_hit(
+        float(buy_p), float(curr_p), entry_atr, atr_mult=SCALE_OUT_ENTRY_ATR_MULT
+    )
+    if order_idem.lane_has_filled_sell(state, mkt, ticker, order_idem.LANE_SCALE_OUT, cycle_tag):
+        order_idem.reconcile_ticker_lane(
+            state, mkt, ticker, order_idem.LANE_SCALE_OUT, cycle_tag, STATE_PATH
+        )
+        pos = (state.get("positions") or {}).get(ticker) or pos
+    if not position_scale_out_done(pos) and so_hit:
+        if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
+            mode_txt = (
+                f"entry_atr*{SCALE_OUT_ENTRY_ATR_MULT:.1f}"
+                if so_mode == "entry_atr"
+                else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
+            )
+            print(
+                f"  ℹ️ [{mkt} Scale-Out 1차 스킵] {ticker}: 트리거({mode_txt}, 목표 {so_target:,.0f})는 충족했지만 "
+                f"명목={notion_krw_so:,.0f}원 < {SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원"
+            )
+        elif scale_out_trigger_ok(pos, SCALE_OUT_PROFIT_PCT, notion_krw_so):
+            sq = compute_stock_scale_out_qty(qty_int)
+            if not sq:
+                print(
+                    f"  ℹ️ [{mkt} Scale-Out 1차 스킵] {ticker}: 보유 {qty_int}주 → 50% 몫 0주"
+                )
+            elif not stock_scale_out_min_notional_ok(int(sq), float(curr_p)):
+                print(f"  ℹ️ [{mkt} Scale-Out 1차 스킵] {ticker}: 최소 매도 명목 미만")
+            else:
+                sell_notion_krw = float(sq) * float(curr_p) * (usdk if is_us else 1.0)
+                tw_krw = (
+                    (float(TWAP_USD_THRESHOLD) * usdk)
+                    if is_us and TWAP_ENABLED
+                    else (TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf"))
+                )
+                ok_so = _run_kis_scale_out_slices_idempotent(
+                    state,
+                    market=mkt,
+                    ticker=ticker,
+                    sell_qty=int(sq),
+                    notional_krw=sell_notion_krw,
+                    threshold_krw=tw_krw,
+                    curr_p=float(curr_p),
+                    place_slice=place_slice,
+                    cycle_tag=cycle_tag,
+                    lane=order_idem.LANE_SCALE_OUT,
+                    log_label="Scale-Out 1차",
+                )
+                if ok_so:
+                    ledger_apply.persist_position_set(
+                        state,
+                        ticker,
+                        post_partial_ledger(pos, float(sq), float(curr_p), float(qty_int)),
+                        context=f"{mkt} Scale-Out 1차",
+                        state_path=STATE_PATH,
+                    )
+                    try:
+                        _record_trade_event(
+                            mkt,
+                            ticker,
+                            "SELL",
+                            int(sq),
+                            price=float(curr_p),
+                            profit_rate=float(profit_rate_now),
+                            reason="V7.1 조건부 50% 분할 익절(Scale-Out 1차)",
+                        )
+                    except Exception as _e_so:
+                        print(f"  ⚠️ [{mkt} Scale-Out 1차] 매매내역 기록 실패: {_e_so}")
+                    print(
+                        f"  ✅ [{mkt} Scale-Out 1차] {display_name}({ticker}) {sq}주 분할 익절 · 장부 보정 완료"
+                    )
+                    send_telegram(
+                        f"💎 [{mkt} Scale-Out 1차] {ticker}({display_name})\n"
+                        f"{sq}주 분할 익절 체결, 남은 물량은 샹들리에 추적 유지"
+                    )
+                    return True, (state.get("positions") or {}).get(ticker) or pos
+                print(f"  ⚠️ [{mkt} Scale-Out 1차] {ticker} 주문 실패 — 다음 사이클에 재시도")
+
+    pos = (state.get("positions") or {}).get(ticker) or pos
+    qty_rem = int(round(_to_float(pos.get("qty"), 0)))
+    if qty_rem <= 0:
+        return False, pos
+    notion_rem = notional_krw_kr_us(float(buy_p), float(curr_p), float(qty_rem), is_us, usdk)
+
+    # --- 2차 Scale-Out (6×ATR, 1차 완료 후) ---
+    so2_ok, so2_mode, so2_target = scale_out_second_trigger_ok(
+        pos, float(buy_p), float(curr_p), entry_atr, notion_rem
+    )
+    if order_idem.lane_has_filled_sell(
+        state, mkt, ticker, order_idem.LANE_SCALE_OUT_2, cycle_tag
+    ):
+        order_idem.reconcile_ticker_lane(
+            state, mkt, ticker, order_idem.LANE_SCALE_OUT_2, cycle_tag, STATE_PATH
+        )
+        pos = (state.get("positions") or {}).get(ticker) or pos
+    if so2_ok:
+        sq2 = compute_stock_scale_out_qty(qty_rem)
+        if not sq2:
+            print(f"  ℹ️ [{mkt} Scale-Out 2차 스킵] {ticker}: 잔량 {qty_rem}주 → 50% 몫 0주")
+        elif not stock_scale_out_min_notional_ok(int(sq2), float(curr_p)):
+            print(f"  ℹ️ [{mkt} Scale-Out 2차 스킵] {ticker}: 최소 매도 명목 미만")
+        else:
+            sell_notion_krw = float(sq2) * float(curr_p) * (usdk if is_us else 1.0)
+            tw_krw = (
+                (float(TWAP_USD_THRESHOLD) * usdk)
+                if is_us and TWAP_ENABLED
+                else (TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf"))
+            )
+            mode_txt = (
+                f"entry_atr*{SCALE_OUT_SECOND_ENTRY_ATR_MULT:.1f}"
+                if so2_mode == "entry_atr"
+                else f"fallback"
+            )
+
+            def _place2():
+                return place_slice(int(sq2))
+
+            ok_so2 = _run_kis_scale_out_slices_idempotent(
+                state,
+                market=mkt,
+                ticker=ticker,
+                sell_qty=int(sq2),
+                notional_krw=sell_notion_krw,
+                threshold_krw=tw_krw,
+                curr_p=float(curr_p),
+                place_slice=_place2,
+                cycle_tag=cycle_tag,
+                lane=order_idem.LANE_SCALE_OUT_2,
+                log_label="Scale-Out 2차",
+            )
+            if ok_so2:
+                ledger_apply.persist_position_set(
+                    state,
+                    ticker,
+                    post_partial_ledger(
+                        pos,
+                        float(sq2),
+                        float(curr_p),
+                        float(qty_rem),
+                        set_scale_out_done=False,
+                        set_second_scale_out_done=True,
+                    ),
+                    context=f"{mkt} Scale-Out 2차",
+                    state_path=STATE_PATH,
+                )
+                try:
+                    _record_trade_event(
+                        mkt,
+                        ticker,
+                        "SELL",
+                        int(sq2),
+                        price=float(curr_p),
+                        profit_rate=float(profit_rate_now),
+                        reason=f"V8 2차 분할 익절(Scale-Out, {mode_txt}, 목표 {so2_target:,.2f})",
+                    )
+                except Exception as _e_so2:
+                    print(f"  ⚠️ [{mkt} Scale-Out 2차] 매매내역 기록 실패: {_e_so2}")
+                print(
+                    f"  ✅ [{mkt} Scale-Out 2차] {display_name}({ticker}) {sq2}주 분할 익절 · 장부 보정 완료"
+                )
+                send_telegram(
+                    f"💎 [{mkt} Scale-Out 2차] {ticker}({display_name})\n"
+                    f"{sq2}주 2차 분할 익절({mode_txt})"
+                )
+                return True, (state.get("positions") or {}).get(ticker) or pos
+            print(f"  ⚠️ [{mkt} Scale-Out 2차] {ticker} 주문 실패 — 다음 사이클에 재시도")
+    elif position_scale_out_done(pos) and not position_second_scale_out_done(pos):
+        if float(notion_rem) < SCALE_OUT_MIN_NOTIONAL_KRW and so2_target > 0:
+            print(
+                f"  ℹ️ [{mkt} Scale-Out 2차 스킵] {ticker}: 6×ATR 목표 {so2_target:,.0f} 충족 전 명목 부족"
+            )
+
+    return False, pos
+
+
+def _try_v8_scale_out_coin(
+    state: dict,
+    *,
+    ticker: str,
+    pos_info: dict,
+    qty: float,
+    buy_p: float,
+    curr_p: float,
+    profit_rate_now: float,
+    cycle_tag: str,
+) -> tuple[bool, dict]:
+    """V8 코인 분할 익절 1차·2차. (handled_continue, pos_info)."""
+    pos = dict(pos_info) if isinstance(pos_info, dict) else {}
+    usdk = float(estimate_usdkrw())
+    q_led = float(_to_float(pos.get("qty"), qty))
+    if q_led <= 0:
+        q_led = float(qty)
+    notion_krw_so = notional_krw_kr_us(
+        float(buy_p), float(curr_p), float(q_led), bool(coin_config.is_binance()), usdk
+    )
+    entry_atr = _to_float(pos.get("entry_atr", 0), 0.0)
+
+    so_hit, so_mode, so_target = scale_out_price_target_hit(
+        float(buy_p), float(curr_p), entry_atr, atr_mult=SCALE_OUT_ENTRY_ATR_MULT
+    )
+    if order_idem.lane_has_filled_sell(state, "COIN", ticker, order_idem.LANE_SCALE_OUT, cycle_tag):
+        order_idem.reconcile_ticker_lane(
+            state, "COIN", ticker, order_idem.LANE_SCALE_OUT, cycle_tag, STATE_PATH
+        )
+        pos = (state.get("positions") or {}).get(ticker) or pos
+    if not position_scale_out_done(pos) and so_hit:
+        if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
+            mode_txt = (
+                f"entry_atr*{SCALE_OUT_ENTRY_ATR_MULT:.1f}"
+                if so_mode == "entry_atr"
+                else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
+            )
+            print(
+                f"  ℹ️ [COIN Scale-Out 1차 스킵] {ticker}: 트리거({mode_txt}, 목표 {so_target:,.0f}) "
+                f"명목={notion_krw_so:,.0f}원 < {SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원"
+            )
+        elif scale_out_trigger_ok(pos, SCALE_OUT_PROFIT_PCT, notion_krw_so):
+            sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
+            if not sell_q:
+                print(f"  ℹ️ [COIN Scale-Out 1차 스킵] {ticker}: 50% 절삼 후 수량 0")
+            elif not coin_broker.scale_out_min_notional_ok(float(sell_q), float(curr_p)):
+                print(f"  ℹ️ [COIN Scale-Out 1차 스킵] {ticker}: 거래소 최소 명목 미만")
+            else:
+                tw_th = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
+                chunks = plan_coin_sell_chunks(float(sell_q), float(curr_p), threshold_krw=float(tw_th))
+                ok_so = _run_coin_scale_out_slices_idempotent(
+                    state,
+                    ticker=ticker,
+                    chunks=chunks,
+                    curr_p=float(curr_p),
+                    cycle_tag=cycle_tag,
+                    lane=order_idem.LANE_SCALE_OUT,
+                    log_label="Scale-Out 1차",
+                )
+                if ok_so:
+                    ledger_apply.persist_position_set(
+                        state,
+                        ticker,
+                        post_partial_ledger(pos, float(sell_q), float(curr_p), float(qty)),
+                        context="COIN Scale-Out 1차",
+                        state_path=STATE_PATH,
+                    )
+                    try:
+                        _record_trade_event(
+                            "COIN",
+                            ticker,
+                            "SELL",
+                            float(sell_q),
+                            price=float(curr_p),
+                            profit_rate=float(profit_rate_now),
+                            reason="V7.1 조건부 50% 분할 익절(Scale-Out 1차)",
+                        )
+                    except Exception as _e_so:
+                        print(f"  ⚠️ [COIN Scale-Out 1차] 매매내역 기록 실패: {_e_so}")
+                    cn = get_coin_name(ticker)
+                    print(f"  ✅ [COIN Scale-Out 1차] {ticker}({cn}) 분할 익절 {sell_q} · 장부 보정 완료")
+                    send_telegram(
+                        f"💎 [COIN Scale-Out 1차] {ticker}({cn})\n분할 익절 체결, 남은 물량은 샹들리에 추적 유지"
+                    )
+                    return True, (state.get("positions") or {}).get(ticker) or pos
+                print(f"  ⚠️ [COIN Scale-Out 1차] {ticker} 주문 실패 — 다음 사이클에 재시도")
+
+    pos = (state.get("positions") or {}).get(ticker) or pos
+    qty_rem = float(_to_float(pos.get("qty"), 0))
+    if qty_rem <= 0:
+        return False, pos
+    notion_rem = notional_krw_kr_us(
+        float(buy_p), float(curr_p), qty_rem, bool(coin_config.is_binance()), usdk
+    )
+    so2_ok, so2_mode, so2_target = scale_out_second_trigger_ok(
+        pos, float(buy_p), float(curr_p), entry_atr, notion_rem
+    )
+    if order_idem.lane_has_filled_sell(state, "COIN", ticker, order_idem.LANE_SCALE_OUT_2, cycle_tag):
+        order_idem.reconcile_ticker_lane(
+            state, "COIN", ticker, order_idem.LANE_SCALE_OUT_2, cycle_tag, STATE_PATH
+        )
+        pos = (state.get("positions") or {}).get(ticker) or pos
+    if so2_ok:
+        sell_q2 = compute_coin_scale_out_qty(qty_rem, float(curr_p))
+        if not sell_q2:
+            print(f"  ℹ️ [COIN Scale-Out 2차 스킵] {ticker}: 50% 절삼 후 수량 0")
+        elif not coin_broker.scale_out_min_notional_ok(float(sell_q2), float(curr_p)):
+            print(f"  ℹ️ [COIN Scale-Out 2차 스킵] {ticker}: 거래소 최소 명목 미만")
+        else:
+            tw_th = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
+            chunks2 = plan_coin_sell_chunks(float(sell_q2), float(curr_p), threshold_krw=float(tw_th))
+            ok_so2 = _run_coin_scale_out_slices_idempotent(
+                state,
+                ticker=ticker,
+                chunks=chunks2,
+                curr_p=float(curr_p),
+                cycle_tag=cycle_tag,
+                lane=order_idem.LANE_SCALE_OUT_2,
+                log_label="Scale-Out 2차",
+            )
+            if ok_so2:
+                ledger_apply.persist_position_set(
+                    state,
+                    ticker,
+                    post_partial_ledger(
+                        pos,
+                        float(sell_q2),
+                        float(curr_p),
+                        qty_rem,
+                        set_scale_out_done=False,
+                        set_second_scale_out_done=True,
+                    ),
+                    context="COIN Scale-Out 2차",
+                    state_path=STATE_PATH,
+                )
+                try:
+                    _record_trade_event(
+                        "COIN",
+                        ticker,
+                        "SELL",
+                        float(sell_q2),
+                        price=float(curr_p),
+                        profit_rate=float(profit_rate_now),
+                        reason=f"V8 2차 분할 익절(Scale-Out, entry_atr×{SCALE_OUT_SECOND_ENTRY_ATR_MULT:.1f})",
+                    )
+                except Exception as _e_so2:
+                    print(f"  ⚠️ [COIN Scale-Out 2차] 매매내역 기록 실패: {_e_so2}")
+                cn = get_coin_name(ticker)
+                print(f"  ✅ [COIN Scale-Out 2차] {ticker}({cn}) 2차 분할 익절 {sell_q2}")
+                send_telegram(f"💎 [COIN Scale-Out 2차] {ticker}({cn})\n2차 분할 익절 체결")
+                return True, (state.get("positions") or {}).get(ticker) or pos
+            print(f"  ⚠️ [COIN Scale-Out 2차] {ticker} 주문 실패 — 다음 사이클에 재시도")
+
+    return False, pos
 
 
 def _twap_krw_budget_slices(total_krw: float) -> list:
@@ -2384,7 +2772,9 @@ def _execute_kr_market_buy_twap(
     }
     persist_position_registration(state, t, payload, context="KR BUY TWAP")
     try:
-        _record_trade_event("KR", t, "BUY", total_qty, price=wavg, profit_rate=None, reason=s_name)
+        _record_trade_event(
+            "KR", t, "BUY", total_qty, price=wavg, profit_rate=None, reason=s_name, ledger=payload
+        )
     except Exception as log_err:
         print(f"  ⚠️ [KR BUY TWAP] 매매내역 기록 실패: {log_err}")
     ensure_position_registered(t, state.get("positions", {}).get(t, {}), context="KR BUY TWAP")
@@ -2541,7 +2931,9 @@ def _execute_us_market_buy_twap(
     }
     persist_position_registration(state, t, payload, context="US BUY TWAP")
     try:
-        _record_trade_event("US", t, "BUY", total_qty, price=wavg, profit_rate=None, reason=s_name)
+        _record_trade_event(
+            "US", t, "BUY", total_qty, price=wavg, profit_rate=None, reason=s_name, ledger=payload
+        )
     except Exception as log_err:
         print(f"  ⚠️ [US BUY TWAP] 매매내역 기록 실패: {log_err}")
     ensure_position_registered(t, state.get("positions", {}).get(t, {}), context="US BUY TWAP")
@@ -2793,7 +3185,9 @@ def _execute_coin_market_buy_twap(
     }
     persist_position_registration(state, t, payload, context="COIN BUY TWAP")
     try:
-        _record_trade_event("COIN", t, "BUY", coin_qty, price=last_p, profit_rate=None, reason=s_name)
+        _record_trade_event(
+            "COIN", t, "BUY", coin_qty, price=last_p, profit_rate=None, reason=s_name, ledger=payload
+        )
     except Exception as log_err:
         print(f"  ⚠️ [COIN BUY TWAP] 매매내역 기록 실패: {log_err}")
     ensure_position_registered(t, state.get("positions", {}).get(t, {}), context="COIN BUY TWAP")
@@ -2893,16 +3287,31 @@ def _strategy_from_trade_history_buy(ticker: str, market: str) -> str | None:
         return None
 
 
+def _resolve_sell_loop_strategy_type(pos_info: dict) -> str:
+    """
+    매도 루프용 ``strategy_type`` — ``tier``·``strategy_type`` 동시 판별.
+
+    ``strategy_type`` 미기록·기본 ``TREND_V8`` 인 SWING_FIB 보유가
+    V8 분할 익절(Scale-Out, ``entry_atr×3.0``) 블록에 들어가는 침범을 막습니다.
+    """
+    p = pos_info if isinstance(pos_info, dict) else {}
+    st = str(p.get("strategy_type") or "").strip().upper()
+    tier = str(p.get("tier") or "").strip().upper()
+    if st == "SWING_FIB" or tier in ("SWING_FIB", "SWING") or "SWING" in tier:
+        return "SWING_FIB"
+    if st:
+        return st
+    return "TREND_V8"
+
+
 def _heartbeat_strategy_label(
     pos: dict, *, ticker: str = "", market: str = ""
 ) -> str:
     """생존신고 보유 한 줄 — 매수 전략 표시."""
     p = pos if isinstance(pos, dict) else {}
-    st = str(p.get("strategy_type") or "").strip().upper()
-    tier = str(p.get("tier") or "").strip().upper()
-    if st == "SWING_FIB" or tier in ("SWING_FIB", "SWING") or "SWING" in tier:
+    if _resolve_sell_loop_strategy_type(p) == "SWING_FIB":
         return "스윙"
-    if st == "TREND_V8":
+    if str(p.get("strategy_type") or "").strip().upper() == "TREND_V8":
         return "V8"
     th = _strategy_from_trade_history_buy(ticker, market)
     if th:
@@ -2911,18 +3320,30 @@ def _heartbeat_strategy_label(
 
 
 def _heartbeat_fetch_ohlcv_for_holding(market: str, ticker: str) -> list:
-    """생존신고용 일봉(매도선 재계산)."""
+    """생존신고·GUI — ``get_cached_ohlcv``(KIS·yfinance 교차검증, 매도 루프와 동일)."""
     m = str(market or "").strip().upper()
     t = str(ticker or "").strip()
     if not t:
         return []
     try:
+        from utils.ohlcv_store import invalidate_disk_ohlcv, ohlcv_series_valid
+
         if m == "COIN":
             return coin_broker.fetch_ohlcv(t, "day", 250) or []
         if m == "KR":
-            return get_ohlcv_yfinance(t) or []
+            ohlcv = get_cached_ohlcv(t, broker=kis_api.broker_kr) or []
+        elif m == "US":
+            ohlcv = get_cached_ohlcv(t) or []
+        else:
+            return []
+        if ohlcv and ohlcv_series_valid(ohlcv):
+            return ohlcv
+        invalidate_disk_ohlcv(t)
+        _ohlcv_cache.pop(t, None)
+        if m == "KR":
+            return get_cached_ohlcv(t, broker=kis_api.broker_kr, force_refresh=True) or []
         if m == "US":
-            return get_ohlcv_yfinance(t) or []
+            return get_cached_ohlcv(t, force_refresh=True) or []
     except Exception:
         return []
     return []
@@ -3237,49 +3658,17 @@ def build_account_snapshot_for_report(
     with_backoff=None,
     force_kis_labels: bool = False,
     fresh_balances: bool = False,
+    ledger_only: bool = False,
 ) -> dict:
-    """``fresh_balances=True`` — GUI 새로고침 등, TTL 없이 잔고 API 1회씩."""
-    bal_refresh = bool(fresh_balances or force_kis_labels)
+    """GUI·heartbeat 스냅샷 — ``services.account_display`` 위임."""
+    from services.account_display import build_account_snapshot_for_report as _impl
 
-    def _snapshot_kr_balance():
-        return ensure_dict(bal_read.kr_balance_for_report(refresh=bal_refresh))
-
-    def _snapshot_us_balance():
-        return ensure_dict(bal_read.us_balance_for_report(refresh=bal_refresh))
-
-    def _snapshot_coin_balances():
-        raw = bal_read.coin_balances_for_report(refresh=bal_refresh)
-        return raw if isinstance(raw, list) else []
-
-    deps = {
-        "get_real_weather": get_real_weather,
-        "broker_kr": kis_api.broker_kr,
-        "broker_us": kis_api.broker_us,
-        "load_last_kis_display_snapshot": load_last_kis_display_snapshot,
-        "save_last_kis_display_snapshot": save_last_kis_display_snapshot,
-        "load_last_coin_display_snapshot": load_last_coin_display_snapshot,
-        "save_last_coin_display_snapshot": save_last_coin_display_snapshot,
-        "is_weekend_suppress": kis_equities_weekend_suppress_window_kst,
-        "get_balance_with_retry": _snapshot_kr_balance,
-        "get_us_positions_with_retry": _snapshot_us_balance,
-        "get_us_cash_real": get_us_cash_real,
-        "to_float": _to_float,
-        "safe_num": _safe_num,
-        "calc_kr_holdings_metrics": _calc_kr_holdings_metrics,
-        "calc_us_holdings_metrics": _calc_us_holdings_metrics,
-        "calc_coin_holdings_metrics": _calc_coin_holdings_metrics,
-        "upbit_get_balance": _coin_snapshot_get_balance,
-        "upbit_get_balances": _snapshot_coin_balances,
-        "get_kr_holdings_with_roi": get_kr_holdings_with_roi,
-        "get_us_holdings_with_roi": get_us_holdings_with_roi,
-        "get_coin_holdings_with_roi": get_coin_holdings_with_roi,
-        "is_market_open": is_market_open,
-    }
-    return _build_account_snapshot_for_report(
-        deps=deps,
+    return _impl(
         allow_kis_fetch=allow_kis_fetch,
         with_backoff=with_backoff,
         force_kis_labels=force_kis_labels,
+        fresh_balances=fresh_balances,
+        ledger_only=ledger_only,
     )
 
 
@@ -3382,8 +3771,14 @@ def get_kr_holdings_with_roi():
     """🇰🇷 국장 보유 종목 + 현재 수익률 (balance API 현재가 사용)"""
     try:
         state = load_state(STATE_PATH)
-        if kis_equities_weekend_suppress_window_kst():
-            return _kr_holdings_lines_from_ledger(state, weekend_tag=True)
+        from execution.balance_policy import should_use_ledger_only
+
+        if kis_equities_weekend_suppress_window_kst() or should_use_ledger_only(
+            state, config, force=False
+        ):
+            return _kr_holdings_lines_from_ledger(
+                state, weekend_tag=bool(kis_equities_weekend_suppress_window_kst())
+            )
         bal = ensure_dict(get_balance_with_retry())
         kr_output1 = bal.get('output1', []) if isinstance(bal.get('output1'), list) else []
         
@@ -3440,7 +3835,11 @@ def get_us_holdings_with_roi():
     """🇺🇸 미장 보유 종목 + 현재 수익률"""
     try:
         state = load_state(STATE_PATH)
-        if kis_equities_weekend_suppress_window_kst():
+        from execution.balance_policy import should_use_ledger_only
+
+        if kis_equities_weekend_suppress_window_kst() or should_use_ledger_only(
+            state, config, force=False
+        ):
             return _us_holdings_lines_from_ledger(state)
         # GUI와 동일한 함수 사용
         us_data = get_held_stocks_us_detail()
@@ -3544,91 +3943,11 @@ def get_coin_holdings_with_roi():
         return []
 
 def heartbeat_report():
-    """모든 자산 현황을 종합하여 텔레그램으로 보고.
+    """텔레그램 생존신고 — ``services.heartbeat_report`` 위임."""
+    from services.heartbeat_report import run_heartbeat_report
 
-    코인 한 줄: 업비트는 스냅샷 원화. 바이낸스는 조회 성공 시 ``binance_display_cash_and_total_usdt()``,
-    ``labels["coin"].display_fallback`` 이면 스냅샷 원화 라벨을 환율로 USDT만 표시(API 실패 시 0 덮어쓰기 방지).
-    """
-    print("💓 생존 신고 보고서 생성 중...")
-    try:
-        snap = build_account_snapshot_for_report()
-        weather = snap["weather"]
-        kr_cash = int(snap["labels"]["kr"]["cash"])
-        kr_total = int(snap["labels"]["kr"]["total"])
-        kr_roi = snap["labels"]["kr"]["roi"]
-        us_cash = float(snap["labels"]["us"]["cash"])
-        us_total = float(snap["labels"]["us"]["total"])
-        us_roi = snap["labels"]["us"]["roi"]
-        krw_bal = int(snap["labels"]["coin"]["cash"])
-        coin_total = int(snap["labels"]["coin"]["total"])
-        coin_roi = snap["labels"]["coin"]["roi"]
-        coin_disp_fb = bool((snap["labels"].get("coin") or {}).get("display_fallback"))
+    run_heartbeat_report()
 
-        # 수익률 텍스트 포맷팅
-        kr_roi_str = f"{kr_roi:+.2f}%" if kr_roi is not None else "보유없음"
-        us_roi_str = f"{us_roi:+.2f}%" if us_roi is not None else "보유없음"
-        coin_roi_str = f"{coin_roi:+.2f}%" if coin_roi is not None else "보유없음"
-        
-        # 보유 종목 및 수익률
-        kr_holdings = snap["holdings"]["kr"]
-        us_holdings = snap["holdings"]["us"]
-        coin_holdings = snap["holdings"]["coin"]
-        
-        kr_holdings_str = "\n".join(kr_holdings) if kr_holdings else "  (보유 없음)"
-        us_holdings_str = "\n".join(us_holdings) if us_holdings else "  (보유 없음)"
-        coin_holdings_str = "\n".join(coin_holdings) if coin_holdings else "  (보유 없음)"
-
-        # GUI 작동 로그: 30분 생존신고와 동일 시각·동일 한 줄 (잔고 갱신마다 출력하지 않음)
-        print("📊 [생존신고] 보유 (텔레그램 동일)")
-        for _hb_line in kr_holdings + us_holdings + coin_holdings:
-            print(_hb_line)
-
-        if coin_config.is_binance():
-            if coin_disp_fb:
-                kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
-                cash_u = float(krw_bal) / kpx
-                tot_u = float(coin_total) / kpx
-            else:
-                try:
-                    cash_u, tot_u = coin_broker.binance_display_cash_and_total_usdt()
-                except Exception:
-                    kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
-                    cash_u = float(krw_bal) / kpx
-                    tot_u = float(coin_total) / kpx
-            coin_summary_line = (
-                f"{weather['COIN']} 🪙 코인 | 예수금: {cash_u:,.2f} USDT | "
-                f"총평가: {tot_u:,.2f} USDT | 수익률: {coin_roi_str}"
-            )
-        else:
-            coin_summary_line = (
-                f"{weather['COIN']} 🪙 코인 | 예수금: {krw_bal:,}원 | "
-                f"총평가: {coin_total:,}원 | 수익률: {coin_roi_str}"
-            )
-
-        msg = f"""💓 [3콤보 생존신고]
-{weather['KR']} 🇰🇷 국장 | 예수금: {kr_cash:,}원 | 총평가: {kr_total:,}원 | 수익률: {kr_roi_str}
-[국장 보유]
-{kr_holdings_str}
-
-{weather['US']} 🇺🇸 미장 | 예수금: ${us_cash:,.2f} | 총평가: ${us_total:,.2f} | 수익률: {us_roi_str}
-[미장 보유]
-{us_holdings_str}
-
-{coin_summary_line}
-[코인 보유]
-{coin_holdings_str}"""
-        if kis_equities_weekend_suppress_window_kst():
-            sat = snap.get("snapshot_saved_at", "").strip()
-            if sat:
-                msg += f"\n📌 국·미 평가는 저장된 직전 조회({sat}) 기준입니다."
-        if send_telegram(msg):
-            print("  ✅ 텔레그램 보고 완료")
-        else:
-            print("  ⚠️ 텔레그램 생존신고 미전송 — 네트워크·텔레 API 확인 후 필요 시 재실행")
-    except Exception as e:
-        print(f"⚠️ 보고 에러: {e}")
-        import traceback
-        traceback.print_exc()
 
 # =====================================================================
 # 6. 메인 매매 엔진 — ``run_trading_bot()`` 한 번이 곧 한 사이클(매도→매수 파이프라인)
@@ -3655,7 +3974,10 @@ def _prepare_cycle_state() -> dict:
     pruned = order_idem.prune_order_idempotency(state)
     if pruned > 0:
         save_state(STATE_PATH, state)
-    bal_read.invalidate()
+    from execution.balance_policy import wants_live_kis_balance
+
+    if wants_live_kis_balance(state, config, force=False):
+        bal_read.invalidate()
     refresh_brokers_if_needed()
     return state
 
@@ -3777,9 +4099,42 @@ def _build_market_context(state: dict) -> tuple[dict, float, str, dict]:
     else:
         print(f"  🛡️ [Phase4 거시] 비활성 | {macro_reason}")
 
-    # Phase5 합산 DD는 직전 캐시(circuit_aux_*)가 아니라, 가능하면 이번 루프 시작 시점 값으로 재동기화
+    from execution.balance_policy import should_use_ledger_only, clear_balance_live_sync
+    from services import ledger_valuation as lv
+
     try:
-        aux_info = refresh_circuit_aux_from_brokers(state, STATE_PATH)
+        if should_use_ledger_only(state, config, force=False):
+            coin_eq = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
+            try:
+                balances = coin_broker.get_balances() or []
+                if balances:
+                    _, coin_eq = _compute_total_coin_equity_from_balances(
+                        balances, float(_compute_coin_krw_balances(balances)[0])
+                    )
+            except Exception:
+                pass
+
+            def _kr_p(c, p, b):
+                return float(resolve_holding_display_price("KR", c, b, None, p))
+
+            def _us_p(t, p, b):
+                return float(resolve_holding_display_price("US", t, b, None, p))
+
+            aux_info = lv.update_circuit_aux_from_ledger(
+                state,
+                resolve_kr_price=_kr_p,
+                resolve_us_price=_us_p,
+                estimate_usdkrw=estimate_usdkrw,
+                coin_equity_krw=coin_eq,
+            )
+            save_state(STATE_PATH, state)
+            print(
+                "  [Phase5 보조] 장부+시세 추정 — KIS 잔고 API 생략 "
+                f"(합계 약 {aux_info.get('totals', {}).get('total_krw_est', 0):,.0f}원)"
+            )
+        else:
+            aux_info = refresh_circuit_aux_from_brokers(state, STATE_PATH)
+            clear_balance_live_sync(state, STATE_PATH)
         if isinstance(aux_info, dict):
             state["_phase5_aux_sync"] = {
                 "kr_ok": bool(aux_info.get("kr_ok")),
@@ -3815,55 +4170,18 @@ def _build_kr_targets(scanned_targets: list[str], market_cap_200: list[str], top
 
 
 def _extract_held_kr_codes_from_output1(kr_output1: list[dict]) -> list[str]:
-    """KR output1에서 실제 보유 종목 코드만 추출(기존 로직 동일)."""
-    held_kr = []
-    for s in kr_output1:
-        qty = _to_float(s.get("hldg_qty", s.get("t01", s.get("q", 0))))
-        if qty > 0.0001:
-            code = normalize_ticker(s.get("pdno", ""))
-            if code:
-                held_kr.append(code)
-    return held_kr
+    """KR output1에서 실제 보유 종목 코드만 추출."""
+    return extract_held_kr_codes(kr_output1, _to_float, normalize_ticker)
 
 
 def _extract_held_us_codes_from_output1(us_output1: list[dict]) -> list[str]:
-    """US output1에서 실제 보유 종목 코드만 추출(기존 로직 동일)."""
-    held_us = []
-    for s in us_output1:
-        qty = _to_float(s.get("ovrs_cblc_qty", s.get("ccld_qty_smtl1", s.get("hldg_qty", 0))))
-        if qty > 0.0001:
-            code = normalize_ticker(s.get("ovrs_pdno", s.get("pdno", "")))
-            if code:
-                held_us.append(code)
-    return held_us
+    """US output1에서 실제 보유 종목 코드만 추출."""
+    return extract_held_us_codes(us_output1, _to_float, normalize_ticker)
 
 
 def _compute_us_stock_value_from_output(us_bal: dict, out2) -> float:
-    """US 주식 평가금 계산(기존 output2 우선 + output1 합산 보정 로직 동일)."""
-    us_output1 = ensure_list(us_bal.get("output1", []))
-
-    if isinstance(out2, list) and out2:
-        us_stock_value = _to_float(out2[0].get("ovrs_stck_evlu_amt", 0))
-    elif isinstance(out2, dict):
-        us_stock_value = _to_float(out2.get("ovrs_stck_evlu_amt", 0))
-    else:
-        us_stock_value = 0.0
-
-    if us_stock_value <= 0 and us_output1:
-        manual_stock_eval = 0.0
-        for s in us_output1:
-            val = _to_float(s.get("frcr_evlu_amt2", 0))
-            if val <= 0:
-                price = _to_float(s.get("ovrs_now_prc2", 0))
-                qty = _to_float(s.get("ovrs_cblc_qty", s.get("hldg_qty", 0)))
-                val = price * qty
-            manual_stock_eval += val
-
-        if manual_stock_eval > 0:
-            print(f"  🔍 [잔고 보정] output2에 평가금 누락 감지 -> 보유종목 직접 합산: ${manual_stock_eval:.2f}")
-            us_stock_value = manual_stock_eval
-
-    return float(us_stock_value)
+    """US 주식 평가금 — ``api.kis_parsers`` 위임."""
+    return compute_us_stock_value_from_output(us_bal, out2, _to_float)
 
 
 def _recover_us_cash_from_output2_if_needed(us_cash: float, out2) -> float:
@@ -3938,17 +4256,17 @@ def _prepare_kr_market_cycle_inputs(state: dict) -> tuple[dict, int, int, list[d
 
 
 def _refresh_kr_cash_equity_after_sells() -> tuple[int, int]:
-    """매도 루프 직후 호출: 동일 사이클 매수에서 직전 스냅샷 예수금이 아닌 **현재** 예수·총평가 사용."""
-    bal = ensure_dict(get_balance_with_retry())
+    """매도 루프 직후·매수 직전: **실 KIS 잔고**로 예수·총평가 갱신(``refresh=True``)."""
+    bal = ensure_dict(bal_read.kr_balance_raw(refresh=True))
     kr_balance_data = bal.get("output2", [])
     kr_cash, total_kr_equity = parse_kr_cash_total(kr_balance_data, _to_float)
     return int(kr_cash), int(total_kr_equity)
 
 
 def _refresh_us_cash_equity_after_sells() -> tuple[float, float]:
-    """미장 매도 루프 직후: 예수금·주식평가 재합산으로 ``total_us_equity`` 를 최신화."""
+    """미장 매도 루프 직후·매수 직전: **실 KIS 잔고**로 예수·총자산 갱신."""
     us_cash = float(get_us_cash_real(kis_api.broker_us) or 0.0)
-    us_bal = ensure_dict(get_us_positions_with_retry())
+    us_bal = ensure_dict(bal_read.us_balance_raw(refresh=True))
     out2 = _get_us_output2(us_bal)
     us_cash = _recover_us_cash_from_output2_if_needed(us_cash, out2)
     us_stock_value = _compute_us_stock_value_from_output(us_bal, out2)
@@ -4621,2087 +4939,27 @@ def run_trading_bot():
     final_targets = _sort_buy_targets_by_rs(final_targets, "KR")
 
     # -------------------------------------------------------------------------
-    # 국장(KR) 엔진 — 장중·주말점검 아님일 때만 KIS 호출. 매도는 항상(손절 방어),
-    # 매수는 MDD/거시/서킷 통과 후 **마감 N분 창** 안에서만. 스킵 사유는 ``[KR …]`` 태그로 grep.
+    # 시장별 엔진 — execution/market_cycles (B-1 분리, 로직·순서 동일)
     # -------------------------------------------------------------------------
-    if is_market_open("KR") and not kis_equities_weekend_suppress_window_kst():
-        print("▶️ [🇰🇷 국장] 매매 엔진 시작...")
-        _, kr_cash, total_kr_equity, kr_output1, held_kr = _prepare_kr_market_cycle_inputs(state)
-        kr_cash_snap, total_kr_equity_snap = kr_cash, total_kr_equity
-        # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
-        positions_count = _count_positions_in_state(held_kr, state.get("positions", {}))
-        _prefetch_kr_sell_ohlcv_if_needed(kr_output1, held_kr, positions_count)
-        for stock in kr_output1:
-            t = normalize_ticker(stock.get('pdno', ''))
-            if not t:
-                continue
-            qty = int(_to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
-            if qty <= 0 or t not in held_kr:
-                continue
-            if t not in state.get("positions", {}):
-                avg_p = _to_float(stock.get('pchs_avg_prc', stock.get('pchs_avg_pric', stock.get('prpr', 0))), 0.0)
-                if avg_p <= 0:
-                    avg_p = _to_float(stock.get('prpr', 0), 0.0)
-                if avg_p > 0:
-                    payload = {
-                        'buy_p': float(avg_p),
-                        'sl_p': float(avg_p * 0.9),
-                        'max_p': float(avg_p),
-                        'tier': '자동등록(보유종목)',
-                        'buy_time': time.time(),
-                        'buy_date': datetime.now().isoformat(),
-                        'scale_out_done': False,
-                        'entry_atr': float(0.0),
-                    }
-                    state.setdefault("positions", {})[t] = payload
-                    save_state(STATE_PATH, state)
-                    print(f"  🚨 [{t}] positions 미조회 → 즉시 자동등록 (buy_p={avg_p:,.2f}, sl_p={avg_p*0.9:,.2f})")
-                else:
-                    print(f"  ⏭️  [{t}] positions 미조회 + 평단/현재가 없음 - 스킵")
-                    continue
-            try:
-                ohlcv = get_cached_ohlcv(t, broker=kis_api.broker_kr)
-                
-                if not ohlcv or not isinstance(ohlcv, list) or not ohlcv[-1] or 'c' not in ohlcv[-1]:
-                    print(f"  ❌ [KR 매도 루프 예외] {t}: OHLCV 데이터 또는 종가(c) 정보 부족. 건너뜁니다.")
-                    continue
+    from execution.market_cycles import TradingCycleContext, run_coin_cycle, run_kr_cycle, run_us_cycle
+
+    _cycle_ctx = TradingCycleContext(
+        state=state,
+        weather=weather,
+        macro_mult=macro_mult,
+        macro_reason=macro_reason,
+        macro_snap=macro_snap,
+        buy_cycle_tag=_buy_cycle_tag,
+        final_targets_kr=final_targets,
+    )
+    run_kr_cycle(_cycle_ctx)
+    run_us_cycle(_cycle_ctx)
+    run_coin_cycle(_cycle_ctx)
+    _cycle_buy_fills = _cycle_ctx.buy_fills
+    _cycle_buy_zone_kr = _cycle_ctx.buy_zone_kr
+    _cycle_buy_zone_us = _cycle_ctx.buy_zone_us
+    _cycle_buy_zone_coin = _cycle_ctx.buy_zone_coin
 
-                pos_info = state.get("positions", {}).get(t, {})
-                atr_val = get_safe_atr(t, ohlcv)
-                _update_position_current_atr_if_changed(state, t, pos_info, atr_val)
-                
-                # GUI 가격이 없을 때 직접 조회한 값을 쓰고, 있으면 GUI 공유값을 우선 적용
-                curr_p = float(ohlcv[-1]['c'])
-                try:
-                    _price_resp = kis_api.broker_kr.fetch_price(t)
-                    if _price_resp and _price_resp.get('rt_cd') == '0':
-                        _realtime_p = float(_price_resp.get('output', {}).get('stck_prpr', 0))
-                        if _realtime_p > 0:
-                            curr_p = _realtime_p
-                except Exception:
-                    pass
-                curr_p = _resolve_curr_price_with_gui_override(pos_info, float(curr_p))
-
-                strategy_type = str(pos_info.get("strategy_type", "TREND_V8") or "TREND_V8").upper()
-                _update_position_max_p(state, t, pos_info, float(curr_p))
-                pos_info = state.get("positions", {}).get(t, pos_info)
-                buy_p = pos_info.get('buy_p', curr_p)
-                max_p = pos_info.get('max_p', curr_p)
-                now_str, hours_held, trading_h, buy_time_log = _compute_holding_time_info(
-                    pos_info, "KR"
-                )
-                exit_line = _resolve_exit_display_price(
-                    t,
-                    curr_p,
-                    pos_info,
-                    ohlcv,
-                    strategy_type,
-                    state=state,
-                    trading_hours_held=trading_h,
-                )
-                _persist_exit_line_sl_p(state, t, pos_info, exit_line)
-                hard_stop = _calc_hard_stop(
-                    pos_info,
-                    float(buy_p),
-                    ohlcv=ohlcv,
-                    strategy_type=strategy_type,
-                    ticker=t,
-                    trading_hours_held=trading_h,
-                )
-                profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
-
-                # 📊 [상태 로그] 한눈에 보기
-                kr_name = get_kr_company_name(t)
-                _exit_tag = "스윙" if strategy_type == "SWING_FIB" else "V8"
-                _sw_suffix = (
-                    _format_swing_exit_log_suffix("KR", pos_info, ohlcv, float(curr_p), float(buy_p))
-                    if strategy_type == "SWING_FIB"
-                    else ""
-                )
-                print(
-                    f"  📊 [KR 보유] {kr_name}({t}) | 현재가: {int(curr_p):,}원 | 매수가: {int(buy_p):,}원 | "
-                    f"최고가: {int(max_p):,}원 | 매도선({_exit_tag}): {int(exit_line):,}원 | "
-                    f"수익률: {profit_rate_now:+.2f}%{_sw_suffix}"
-                )
-
-                # 손절가 체크 로그
-                if profit_rate_now < 0:
-                    print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: {curr_p:,.0f} / 손절가: {hard_stop:,.0f})")
-                    if curr_p <= hard_stop:
-                        print(f"     ➜ 손절 체크: 현재가 {curr_p:,.0f} ≤ 손절가 {hard_stop:,.0f} = 🔴 매도 신호!")
-
-                # 수익률 +1% 미만·매수 후 15분: 매도 보류 (손실 구간 포함)
-                buy_time = pos_info.get('buy_time', time.time() - 900)
-                if _new_buy_sell_protection_blocks(profit_rate_now, buy_time):
-                    print(
-                        f"  ⏭️ {t}: 신규 매수 보호 구간 "
-                        f"({_new_buy_protection_remaining_sec(buy_time)}초 남음, 수익률 {profit_rate_now:+.2f}%)"
-                    )
-                    continue
-
-                if strategy_type == "SWING_FIB":
-                    sw_action, sw_reason = check_swing_exit(
-                        pos_info,
-                        pd.DataFrame(ohlcv),
-                        reference_price=float(curr_p),
-                        market="KR",
-                        ticker=t,
-                        trading_hours_held=trading_h,
-                    )
-                    if sw_action == "HALF":
-                        if order_idem.lane_has_filled_sell(
-                            state, "KR", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag
-                        ):
-                            order_idem.reconcile_ticker_lane(
-                                state, "KR", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag, STATE_PATH
-                            )
-                            continue
-                        sq = compute_stock_scale_out_qty(int(qty))
-                        if not sq:
-                            print(f"  ⏭️ [SWING-SELL] {kr_name}({t}) HALF 수량 0 (패스)")
-                            continue
-
-                        def _kr_swing_half_place():
-                            return create_market_sell_order_kis(
-                                t, int(sq), is_us=False, curr_price=float(curr_p)
-                            )
-
-                        fill_half = _idempotent_kis_sell(
-                            state,
-                            market="KR",
-                            ticker=t,
-                            lane=order_idem.LANE_SWING_HALF,
-                            qty=int(sq),
-                            fallback_price=float(curr_p),
-                            place_order=_kr_swing_half_place,
-                            cycle_tag=_buy_cycle_tag,
-                        )
-                        if fill_half.ok:
-                            new_half = post_partial_ledger(
-                                pos_info, float(sq), float(curr_p), float(qty), set_scale_out_done=False
-                            )
-                            new_half["strategy_type"] = "SWING_FIB"
-                            new_half["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
-                            ledger_apply.persist_position_set(
-                                state, t, new_half, context="SWING HALF KR", state_path=STATE_PATH
-                            )
-                            _record_trade_event(
-                                "KR",
-                                t,
-                                "SELL",
-                                int(sq),
-                                price=float(curr_p),
-                                profit_rate=float(profit_rate_now),
-                                reason=f"[SWING-SELL] {sw_reason}",
-                            )
-                            print(f"  ✅ [SWING-SELL] {kr_name}({t}) HALF | {sw_reason}")
-                            _telegram_swing_sell(
-                                "KR",
-                                t,
-                                name=kr_name,
-                                half=True,
-                                qty_label=f"{int(sq)}주",
-                                profit_rate=float(profit_rate_now),
-                                reason=sw_reason,
-                            )
-                        else:
-                            print(
-                                f"  ❌ [SWING-SELL] {kr_name}({t}) HALF 실패: {fill_half.note}"
-                            )
-                        continue
-                    if sw_action == "FULL":
-                        # 스윙 전량 청산 시그널
-                        qty_full = int(_to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
-                        if qty_full <= 0:
-                            continue
-
-                        def _kr_swing_full_place():
-                            return create_market_sell_order_kis(
-                                t, qty_full, is_us=False, curr_price=float(curr_p)
-                            )
-
-                        fill_full = _idempotent_kis_sell(
-                            state,
-                            market="KR",
-                            ticker=t,
-                            lane=order_idem.LANE_SWING_FULL,
-                            qty=qty_full,
-                            fallback_price=float(curr_p),
-                            place_order=_kr_swing_full_place,
-                            cycle_tag=_buy_cycle_tag,
-                        )
-                        if fill_full.ok:
-                            p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
-                            _record_trade_event("KR", t, "SELL", qty_full, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
-                            print(f"  ✅ [SWING-SELL] {kr_name}({t}) FULL | {sw_reason}")
-                            _telegram_swing_sell(
-                                "KR",
-                                t,
-                                name=kr_name,
-                                half=False,
-                                qty_label=f"{qty_full}주",
-                                profit_rate=float(p_full),
-                                reason=sw_reason,
-                            )
-
-                            def _mut_swing_full(st: dict) -> None:
-                                set_cooldown(st, t)
-                                set_ticker_cooldown_after_sell(
-                                    st,
-                                    t,
-                                    sw_reason,
-                                    profit_rate=float(p_full),
-                                    strategy_type="SWING_FIB",
-                                    market="KR",
-                                    remaining_qty=0.0,
-                                )
-
-                            ledger_apply.persist_position_remove(
-                                state, t, context="SWING FULL KR", state_path=STATE_PATH, mutate_fn=_mut_swing_full
-                            )
-                        else:
-                            print(
-                                f"  ❌ [SWING-SELL] {kr_name}({t}) FULL 실패: {fill_full.note}"
-                            )
-                        continue
-
-                # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
-                usdk = float(estimate_usdkrw())
-                q_led = int(round(_to_float(pos_info.get("qty"), qty)))
-                if q_led <= 0:
-                    q_led = int(qty)
-                notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), False, usdk)
-                entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
-                so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
-                if order_idem.lane_has_filled_sell(
-                    state, "KR", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag
-                ):
-                    order_idem.reconcile_ticker_lane(
-                        state, "KR", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag, STATE_PATH
-                    )
-                    pos_info = (state.get("positions") or {}).get(t) or pos_info
-                if not position_scale_out_done(pos_info) and so_hit:
-                    if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
-                        mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
-                        print(
-                            f"  ℹ️ [KR Scale-Out 스킵] {t}: 트리거({mode_txt}, 목표 {so_target:,.0f})는 충족했지만 "
-                            f"명목 max(매수가×수량, 현재가×수량)={notion_krw_so:,.0f}원 < "
-                            f"{SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원 (수량 {q_led}주)"
-                        )
-                    elif scale_out_trigger_ok(pos_info, SCALE_OUT_PROFIT_PCT, notion_krw_so):
-                        sq = compute_stock_scale_out_qty(int(qty))
-                        if not sq:
-                            print(
-                                f"  ℹ️ [KR Scale-Out 스킵] {t}: 보유 {int(qty)}주 → 50% 몫 0주(1주만 있을 때 규칙상 생략)"
-                            )
-                        elif not stock_scale_out_min_notional_ok(int(sq), float(curr_p)):
-                            print(f"  ℹ️ [KR Scale-Out 스킵] {t}: 최소 매도 명목(1주 가치) 미만")
-                        else:
-                            sell_notion_krw = float(sq) * float(curr_p)
-                            tw_krw = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
-
-                            def _kr_so_slice(qq: int):
-                                return create_market_sell_order_kis(
-                                    t, int(qq), is_us=False, curr_price=float(curr_p)
-                                )
-
-                            ok_so = _run_kis_scale_out_slices_idempotent(
-                                state,
-                                market="KR",
-                                ticker=t,
-                                sell_qty=int(sq),
-                                notional_krw=sell_notion_krw,
-                                threshold_krw=tw_krw,
-                                curr_p=float(curr_p),
-                                place_slice=_kr_so_slice,
-                                cycle_tag=_buy_cycle_tag,
-                            )
-                            if ok_so:
-                                ledger_apply.persist_position_set(
-                                    state,
-                                    t,
-                                    post_partial_ledger(pos_info, float(sq), float(curr_p), float(qty)),
-                                    context="KR Scale-Out",
-                                    state_path=STATE_PATH,
-                                )
-                                try:
-                                    _record_trade_event(
-                                        "KR",
-                                        t,
-                                        "SELL",
-                                        int(sq),
-                                        price=float(curr_p),
-                                        profit_rate=float(profit_rate_now),
-                                        reason="V7.1 조건부 50% 분할 익절(Scale-Out)",
-                                    )
-                                except Exception as _e_so:
-                                    print(f"  ⚠️ [KR Scale-Out] 매매내역 기록 실패: {_e_so}")
-                                kr_nm = get_kr_company_name(t)
-                                print(f"  ✅ [KR Scale-Out] {kr_nm}({t}) {sq}주 분할 익절 · 장부 보정 완료")
-                                send_telegram(f"💎 [KR Scale-Out] {t}({kr_nm})\n{sq}주 분할 익절 체결, 남은 물량은 샹들리에 추적 유지")
-                                continue
-                            print(f"  ⚠️ [KR Scale-Out] {t} 주문 실패 — 다음 사이클에 재시도")
-
-                # 매도 결정 로직 (우선순위: 타임스탑 > 하드스탑 > 샹들리에)
-                reason = ""
-                is_exit = False
-                _print_position_hold_status(
-                    now_str,
-                    t,
-                    buy_time_log,
-                    hours_held,
-                    trading_hours=trading_h,
-                    market="KR",
-                )
-
-                ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
-                    market="KR",
-                    strategy_type=strategy_type,
-                    hours_held=float(trading_h),
-                    profit_rate_now=float(profit_rate_now),
-                )
-                if ts_exit:
-                    is_exit = True
-                    reason = ts_reason
-                    print(f"  ⏰ {reason}")
-                elif ts_exempt:
-                    _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("KR", strategy_type)
-                    print(
-                        f"   ✅ 타임스탑 유예 {_ts_tag} — 보유 {trading_h:.1f}h (≥{_ts_min_h:.0f}h), "
-                        f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
-                    )
-
-                # 2. 하드스탑 (SWING_FIB는 check_swing_exit 피보·구름 FULL이 전담)
-                if not is_exit and profit_rate_now < 0 and strategy_type != "SWING_FIB":
-                    if curr_p <= hard_stop:
-                        is_exit = True
-                        reason = "하드스탑 이탈 (손실구간 방어)"
-                        print(f"🔴 [하드스탑 발동] {t} - 현재가: {curr_p:,.0f}원 <= 손절가: {hard_stop:,.0f}원. 강제 청산! (is_exit={is_exit})")
-
-                # 3. 수익 구간 트레일링 (스윙: 수익 락만 / V8: 샹들리에)
-                if not is_exit and profit_rate_now >= 0:
-                    if strategy_type == "SWING_FIB":
-                        is_exit, reason = _check_swing_trailing_exit(
-                            float(curr_p), pos_info, ohlcv, state, t
-                        )
-                    else:
-                        is_exit, reason_chandelier = check_pro_exit(t, curr_p, pos_info, ohlcv)
-                        if is_exit:
-                            reason = reason_chandelier
-
-                if is_exit: # 여기서 실제 매도 주문이 나감
-                    kr_name = get_kr_company_name(t)  # 종목명 미리 조회
-                    qty = int(_to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
-                    if qty <= 0:
-                        continue
-                    
-                    def _kr_exit_place():
-                        return create_market_sell_order_kis(
-                            t, qty, is_us=False, curr_price=curr_p
-                        )
-
-                    fill_exit = _idempotent_kis_sell(
-                        state,
-                        market="KR",
-                        ticker=t,
-                        lane=order_idem.LANE_EXIT,
-                        qty=qty,
-                        fallback_price=float(curr_p),
-                        place_order=_kr_exit_place,
-                        cycle_tag=_buy_cycle_tag,
-                    )
-                    tag_exit = "♻️" if fill_exit.reused else "🧾"
-                    print(
-                        f"  {tag_exit} [KR EXIT] {t} ok={fill_exit.ok} qty={int(fill_exit.qty)} "
-                        f"note={fill_exit.note}"
-                    )
-
-                    if fill_exit.ok:
-                        profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
-                        stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
-                        if profit_rate > 0:
-                            stats["wins"] = int(stats.get("wins", 0) or 0) + 1
-                        else:
-                            stats["losses"] = int(stats.get("losses", 0) or 0) + 1
-                        stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
-                        _record_trade_event("KR", t, "SELL", qty, price=curr_p, profit_rate=profit_rate, reason=reason)
-                        print(f"  ✅ [국장 매도 체결] {kr_name}({t}) | 수익률: {profit_rate:+.2f}% | 사유: {reason}")
-                        if strategy_type == "SWING_FIB":
-                            send_telegram(
-                                f"🚨 [국장 스윙 청산] {t}({kr_name})\n"
-                                f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
-                            )
-                        else:
-                            send_telegram(
-                                f"🚨 [국장 추세종료 매도] {t}({kr_name})\n"
-                                f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
-                            )
-                        def _mut_kr_exit(st: dict) -> None:
-                            set_cooldown(st, t)
-                            set_ticker_cooldown_after_sell(
-                                st,
-                                t,
-                                reason,
-                                profit_rate=float(profit_rate),
-                                strategy_type=strategy_type,
-                                market="KR",
-                                remaining_qty=0.0,
-                            )
-
-                        ledger_apply.persist_position_remove(
-                            state, t, context="KR EXIT", state_path=STATE_PATH, mutate_fn=_mut_kr_exit
-                        )
-                    else:
-                        print(f"  ❌ {kr_name}({t}) 매도 최종 실패 ({retry_count}회 시도): {resp.get('msg1', 'API 오류') if resp else '응답 없음'}")
-
-            except Exception as e:
-                print(f"  ❌ [KR 매도 루프 예외] {t}: {e}")
-                traceback.print_exc()
-                continue
-
-        kr_cash, total_kr_equity = _refresh_kr_cash_equity_after_sells()
-        state["circuit_aux_last_kr_krw"] = float(total_kr_equity)
-        save_state(STATE_PATH, state)
-        if abs(kr_cash - kr_cash_snap) >= 1 or abs(total_kr_equity - total_kr_equity_snap) >= 1000:
-            print(
-                f"  📌 [KR] 매도 후 예수·총평가 갱신 → 가용 {kr_cash:,}원 · 총평가 {total_kr_equity:,}원 "
-                f"(매도단계 전 스냅샷 대비 반영)"
-            )
-
-        # 매수는 MDD → Phase4 거시 체크 후에만 실행
-        if not check_mdd_break("KR", total_kr_equity, state, STATE_PATH):
-            print("  -> 🚨 국장 MDD 브레이크 작동 중. 신규 매수 중단.")
-        elif macro_mult <= 0:
-            print(f"  -> 🚨 국장 Phase4 거시 방어막: 신규 매수 중단. ({macro_reason})")
-        elif in_account_circuit_cooldown(state):
-            print("  -> 🚨 국장 Phase5 계좌 서킷 쿨다운 — 신규 매수 중단.")
-        else:
-            # ⏳ [핵심] 국장 매수: KRX 정규장 마감(15:30 KST) 직전 N분만 (기본 30분 → 15:00~15:29)
-            now_kr = datetime.now(pytz.timezone("Asia/Seoul"))
-            is_kr_buy_time, _kr_buy_start, _kr_close = _is_kr_buy_window_now(now_kr)
-
-            if not is_kr_buy_time:
-                print(
-                    f"  ⏳ [KR 매수 대기] 장 마감 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분 전 구간만 매수 "
-                    f"({_kr_buy_start.strftime('%H:%M')}~{_kr_close.strftime('%H:%M')} KST, "
-                    f"현재 {now_kr.strftime('%H:%M')})"
-                )
-            else:
-                _cycle_buy_zone_kr = True
-                if not _macro_market_buy_allowed(macro_snap, "KR"):
-                    print(
-                        f"  -> 🚨 국장 Phase4 글로벌 방어막: 신규 매수 중단. "
-                        f"({(macro_snap.get('market_buy_block_reason') or {}).get('KR', '')})"
-                    )
-                else:
-                    # 지수 급락 체크
-                    kr_index_change = get_market_index_change("KR")
-                    print(f"  📊 [KOSPI 지수] 변화율: {kr_index_change:+.2f}% 날씨는 {weather['KR']}")
-                    if kr_index_change <= INDEX_CRASH_KR:
-                        print(f"  🚫 [KR 매수 중단] KOSPI {kr_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_KR}%)")
-                    else:
-                        if weather["KR"] == WEATHER_LABEL_BEAR:
-                            print(
-                                "  📌 [KR] BEAR 날씨 — V8 추세 매수만 중단, SWING_FIB 스윙 후보는 계속 분석"
-                            )
-                        total_kr = len(final_targets)
-                        print(f"  -> 🇰🇷 국장 사냥감 {total_kr}개 정밀 분석 시작!")
-                        for idx, t in enumerate(final_targets, 1):
-                            kr_name = get_kr_company_name(t)  # 종목명 미리 조회
-                            if in_ticker_cooldown(state, t):
-                                print(
-                                    f"  ⏭️ {kr_name}({t}): 매도 후 쿨다운(톱날 방지) 만료 "
-                                    f"{ticker_cooldown_human(state, t)} 이전 (패스)"
-                                )
-                                continue
-                            if in_cooldown(state, t):
-                                print(f"  ⏭️ {kr_name}({t}): 쿨다운 중 (패스)")
-                                continue
-                            if t in held_kr:
-                                print(f"  ⏭️ {kr_name}({t}): 이미 보유중 (패스)")
-                                continue
-                            if order_idem.is_buy_inflight(state, "KR", t, _buy_cycle_tag):
-                                print(f"  ⏭️ {kr_name}({t}): 매수 TWAP 진행 중(멱등 패스)")
-                                continue
-                            sector_ok_kr, sector_msg_kr = allow_kr_sector_entry(
-                                t,
-                                state.get("positions", {}),
-                                MAX_POSITIONS_KR,
-                                normalize_ticker,
-                            )
-                            if not sector_ok_kr:
-                                print(f"  ⏭️ {kr_name}({t}): {sector_msg_kr} (패스)")
-                                continue
-
-                            try:
-                                # 국장 매수: KIS 일봉 우선(매도 루프와 동일). yfinance만 쓰면 전일 봉·지연 종가로 양봉 오판 가능.
-                                ohlcv_200 = get_cached_ohlcv(t, broker=kis_api.broker_kr)
-                                if not ohlcv_200 or len(ohlcv_200) < 60:
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): OHLCV 부족 "
-                                        f"({len(ohlcv_200) if ohlcv_200 else 0}봉, 스윙 60봉 필요) (패스)"
-                                    )
-                                    continue
-
-                                live_px_kr = 0.0
-                                try:
-                                    _pr = kis_api.broker_kr.fetch_price(t)
-                                    if _pr and _pr.get("rt_cd") == "0":
-                                        live_px_kr = float(
-                                            (_pr.get("output") or {}).get("stck_prpr", 0) or 0
-                                        )
-                                except Exception:
-                                    pass
-
-                                strategy_type = "TREND_V8"
-                                entry_fib_level = 0.0
-                                is_buy, sl_p, s_name = calculate_pro_signals(ohlcv_200, weather['KR'], t, kr_name, idx, total_kr)
-                                v8_ok = bool(is_buy) and _v8_trend_buy_allowed_in_weather(weather["KR"])
-                                if bool(is_buy) and not v8_ok:
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): BEAR 시장 — V8 신호 통과했으나 추세 매수 차단 (스윙만 허용)"
-                                    )
-                                if v8_ok:
-                                    print(f"  ✅ [V8-BUY] {kr_name}({t}) 진입")
-                                else:
-                                    sw_ok, sw_fib, sw_why = check_swing_entry(
-                                        pd.DataFrame(ohlcv_200),
-                                        market="KR",
-                                        reference_close=live_px_kr if live_px_kr > 0 else None,
-                                    )
-                                    if sw_ok:
-                                        strategy_type = "SWING_FIB"
-                                        entry_fib_level = float(sw_fib)
-                                        _sw_o = float(ohlcv_200[-1].get("o", 0) or 0)
-                                        _sw_c = (
-                                            float(live_px_kr)
-                                            if live_px_kr > 0
-                                            else float(ohlcv_200[-1].get("c", 0) or 0)
-                                        )
-                                        sl_p = swing_entry_sl_p(_sw_c, sw_fib)
-                                        s_name = "SWING_FIB"
-                                        _sw_src = "KIS실시간" if live_px_kr > 0 else "일봉종가"
-                                        print(
-                                            f"  ✅ [SWING-BUY] {kr_name}({t}) entry_fib={entry_fib_level:,.2f} "
-                                            f"| 양봉({_sw_src} 시가 {_sw_o:,.0f} < 종가 {_sw_c:,.0f})"
-                                            f"{' | BEAR 시장 스윙 예외' if weather['KR'] == WEATHER_LABEL_BEAR else ''}"
-                                        )
-                                    else:
-                                        _prog = f"[{idx}/{total_kr}]" if total_kr > 0 else ""
-                                        _disp = f"{kr_name}({t})" if kr_name and kr_name != t else t
-                                        print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
-                                        continue
-
-                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_KR))
-                                ratio, t_name = _position_ratio_with_vol_target(
-                                    base_ratio,
-                                    ohlcv_200,
-                                    target_vol=_alpha_target_vol,
-                                    ticker=t,
-                                )
-
-                                _prospect_atr = atr_pct_from_ohlcv(ohlcv_200, t)
-                                _mkt_heat, _heat_blocked = _portfolio_heat_snapshot(
-                                    state,
-                                    "KR",
-                                    total_kr_equity,
-                                    lambda tk, _b=kis_api.broker_kr: get_cached_ohlcv(
-                                        tk, broker=_b
-                                    ),
-                                    extra_weight=float(ratio),
-                                    extra_atr_pct=float(_prospect_atr or 0.0),
-                                )
-                                if _heat_blocked:
-                                    _log_portfolio_heat_block("KR", _mkt_heat, prospective=True)
-                                    continue
-
-                                target_budget = total_kr_equity * ratio * macro_mult
-                                kr_min_budget = 50000.0
-
-                                if target_budget < kr_min_budget:
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [KR 예산 부족] 배정예산 {int(target_budget):,}원 < "
-                                        f"최소 {int(kr_min_budget):,}원 (총자산 {int(total_kr_equity):,}원×비중·macro, 예수금 {int(kr_cash):,}원)"
-                                    )
-                                    continue
-                                if kr_cash < kr_min_budget:
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [KR 예수금 부족] 가용 {int(kr_cash):,}원 < 최소 {int(kr_min_budget):,}원 — 매수 불가"
-                                    )
-                                    continue
-                                if kr_cash < target_budget:
-                                    print(f"  🧹 [예수금 영끌 발동] {kr_name}({t}): 예산({int(target_budget):,}원) 부족. 지갑에 남은 전액({int(kr_cash):,}원) 풀매수 장전!")
-                                    target_budget = kr_cash
-                            
-                                if not can_open_new(t, state, max_positions=MAX_POSITIONS_KR):
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [MAX_POSITIONS:KR] "
-                                        f"국장 한도 {MAX_POSITIONS_KR}개 도달 (패스)"
-                                    )
-                                    continue
-
-                                # 🚨 [추가 수술] 국장 전용 시가 갭(Gap) 과다 상승 필터 (5%)
-                                try:
-                                    if ohlcv_200 and len(ohlcv_200) >= 2:
-                                        last_close = float(ohlcv_200[-2]['c']) # 어제 종가
-                                        today_open = float(ohlcv_200[-1]['o']) # 오늘 시가
-                                        if last_close > 0:
-                                            gap_ratio = ((today_open - last_close) / last_close) * 100
-                                            if gap_ratio >= 5.0:
-                                                print(f"  ⏭️ {kr_name}({t}): 갭상승 과다 ({gap_ratio:.2f}%) - 필터링 (패스)")
-                                                continue
-                                except Exception as gap_err:
-                                    print(f"  ⚠️ 갭상승 체크 중 오류: {gap_err}")
-
-                                # 현재가: KIS 실시간 우선, 없으면 일봉 종가
-                                curr_p = float(live_px_kr) if live_px_kr > 0 else 0.0
-                                if curr_p <= 0 and ohlcv_200 and len(ohlcv_200) > 0:
-                                    curr_p = float(ohlcv_200[-1]['c'])
-                        
-                                if curr_p <= 0:
-                                    print(f"  ⏭️ {kr_name}({t}): 현재가 조회 실패 (패스)")
-                                    continue
-                                qty = int(target_budget / curr_p)
-                                if qty <= 0:
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [KR 매수 스킵] 시그널 통과했으나 수량 0 — "
-                                        f"배정예산 {int(target_budget):,}원 < 1주 기준(~{int(curr_p):,}원) "
-                                        f"(총자산 {int(total_kr_equity):,}원, ratio={ratio:.4f}, macro×{macro_mult:.2f}, 예수금 {int(kr_cash):,}원)"
-                                    )
-                                    continue
-
-                                # Phase 3: 매수 직전 뉴스 악재 필터
-                                if not _ai_false_breakout_buy_gate(
-                                    t,
-                                    "KR",
-                                    strategy_type,
-                                    AI_FALSE_BREAKOUT_THRESHOLD,
-                                    f"{kr_name}({t})",
-                                ):
-                                    continue
-                            
-                                # 매수 주문 (Phase2 TWAP: 대액 시 분할)
-                                kr_box = [float(kr_cash)]
-                                entry_atr = float(get_safe_atr(t, ohlcv_200) or 0.0)
-                                ok_kr_buy = _execute_kr_market_buy_twap(
-                                    t,
-                                    kr_name,
-                                    float(target_budget),
-                                    curr_p,
-                                    sl_p,
-                                    entry_atr,
-                                    t_name,
-                                    s_name,
-                                    state,
-                                    kr_box,
-                                    strategy_type=strategy_type,
-                                    entry_fib_level=entry_fib_level,
-                                )
-                                if not ok_kr_buy:
-                                    print(
-                                        f"  ⏭️ {kr_name}({t}): [KR 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
-                                        f"예산 {int(target_budget):,}원, 현재가 {int(curr_p):,}원 (TWAP 슬라이스·KIS·예수 확인)"
-                                    )
-                                else:
-                                    _cycle_buy_fills += 1
-                                    _register_swing_risk_after_buy(state, t, ohlcv_200, "KR")
-                                kr_cash = int(kr_box[0])
-                            except Exception as e:
-                                print(f"  ❌ [KR BUY 예외] {t}: {type(e).__name__}: {e}")
-                                traceback.print_exc()
-                                continue        
-    else:
-        _log_kr_market_closed_or_suppressed()
-
-    # -------------------------------------------------------------------------
-    # 미장(US) 엔진 — 주말 점검 창에서는 KIS 억제. 매수는 **ET 마감 직전 창**·지수·날씨·
-    # 배정예산(총자산×비중, 정수주)·AI·TWAP 순. 스킵은 ``[US …]`` / ``[US TWAP]`` 로 grep.
-    # -------------------------------------------------------------------------
-    if is_market_open("US") and not kis_equities_weekend_suppress_window_kst():
-        print("▶️ [🇺🇸 미장] 매매 엔진 시작...")
-        us_cash = float(get_us_cash_real(kis_api.broker_us) or 0.0)
-        us_bal = ensure_dict(get_us_positions_with_retry())
-        out2 = _get_us_output2(us_bal)
-        # =====================================================================
-        # 🔥 [핵심 수술] KIS 야간 API 예수금 0원 증발 버그 치료 (GUI 로직 이식)
-        # =====================================================================
-        us_cash = _recover_us_cash_from_output2_if_needed(us_cash, out2)
-
-        # 진짜 예수금 + 주식 평가금 = 진짜 총평가금 완료!
-        us_output1 = _get_us_output1(us_bal)
-        us_stock_value = _compute_us_stock_value_from_output(us_bal, out2)
-
-        total_us_equity = us_cash + us_stock_value
-        us_cash_snap, total_us_equity_snap = us_cash, total_us_equity
-        print(f"  💰 [미장 자산 최종] 총자산: ${total_us_equity:.2f} (현금: ${us_cash:.2f} + 주식: ${us_stock_value:.2f})")
-
-        state["circuit_aux_last_usd_total"] = float(total_us_equity)
-        save_state(STATE_PATH, state)
-        
-        # ✅ [버그 수정] us_output1 정의 및 수량이 0보다 큰 종목만 held_us에 포함시킵니다.
-        held_us = _extract_held_us_codes_from_output1(us_output1)
-
-        # 디버깅: 보유 종목이 인식되었는지 확인
-        _log_us_holdings_debug(held_us, us_bal)
-
-        # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
-        sell_candidates = _collect_us_sell_candidates(held_us, state.get("positions", {}))
-        positions_count = len(sell_candidates)
-        
-        print(f"  🔍 [미장 매도 루프] 매도 대상 포지션 {positions_count}개 손익 체크 시작...")
-        _prefetch_us_sell_ohlcv_if_needed(sell_candidates)
-            
-        for stock in us_output1:
-            t_raw = stock.get('ovrs_pdno', stock.get('pdno', ''))
-            t = normalize_ticker(t_raw)
-            if not t:
-                continue
-            qty_holding = _to_float(stock.get('ovrs_cblc_qty', stock.get('ccld_qty_smtl1', stock.get('hldg_qty', 0))), 0.0)
-            if qty_holding <= 0:
-                 continue
-
-            if t not in state.get("positions", {}):
-                avg_p = _to_float(stock.get('ovrs_avg_unpr', stock.get('ovrs_avg_pric', stock.get('ovrs_now_prc2', 0))), 0.0)
-                if avg_p <= 0:
-                    avg_p = _to_float(stock.get('ovrs_now_prc2', 0), 0.0)
-                if avg_p > 0:
-                    payload = {
-                        'buy_p': float(avg_p),
-                        'sl_p': float(avg_p * 0.9),
-                        'max_p': float(avg_p),
-                        'tier': '자동등록(보유종목)',
-                        'buy_time': time.time(),
-                        'buy_date': datetime.now().isoformat(),
-                        'scale_out_done': False,
-                        'entry_atr': float(0.0),
-                    }
-                    state.setdefault("positions", {})[t] = payload
-                    save_state(STATE_PATH, state)
-                    print(f"  🚨 [{t}] positions 미조회 → 즉시 자동등록 (buy_p=${avg_p:,.2f}, sl_p=${avg_p*0.9:,.2f})")
-                else:
-                    print(f"  ⏭️  [{t}] positions 미조회 + 평단/현재가 없음 - 스킵")
-                    continue
-            print(f"  🔍 [{t}] 매도 루프 진입 (장부 확인 완료, max_p 갱신 체크)")
-            try:
-                ohlcv = get_cached_ohlcv(t)
-                
-                if not ohlcv or not isinstance(ohlcv, list) or not ohlcv[-1] or 'c' not in ohlcv[-1]:
-                    print(f"  ❌ [US 매도 루프 예외] {t}: OHLCV 데이터 또는 종가(c) 정보 부족. 건너뜁니다.")
-                    continue
-
-                pos_info = state.get("positions", {}).get(t, {})
-                atr_val = get_safe_atr(t, ohlcv)
-                _update_position_current_atr_if_changed(state, t, pos_info, atr_val)
-                
-                curr_p = float(ohlcv[-1]['c'])
-                try:
-                    _price_resp = kis_api.broker_us.fetch_price(t)
-                    if _price_resp and _price_resp.get('rt_cd') == '0':
-                        _realtime_p = float(_price_resp.get('output', {}).get('last', 0))
-                        if _realtime_p > 0:
-                            curr_p = _realtime_p
-                except Exception:
-                    pass
-                curr_p = _resolve_curr_price_with_gui_override(pos_info, float(curr_p))
-
-                strategy_type = str(pos_info.get("strategy_type", "TREND_V8") or "TREND_V8").upper()
-                _update_position_max_p(state, t, pos_info, float(curr_p))
-                pos_info = state.get("positions", {}).get(t, pos_info)
-                buy_p = pos_info.get('buy_p', curr_p)
-                max_p = pos_info.get('max_p', curr_p)
-                now_str, hours_held, trading_h, buy_time_log = _compute_holding_time_info(
-                    pos_info, "US"
-                )
-                exit_line = _resolve_exit_display_price(
-                    t,
-                    curr_p,
-                    pos_info,
-                    ohlcv,
-                    strategy_type,
-                    state=state,
-                    trading_hours_held=trading_h,
-                )
-                _persist_exit_line_sl_p(state, t, pos_info, exit_line)
-                hard_stop = _calc_hard_stop(
-                    pos_info,
-                    float(buy_p),
-                    ohlcv=ohlcv,
-                    strategy_type=strategy_type,
-                    ticker=t,
-                    trading_hours_held=trading_h,
-                )
-                profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
-
-                # 📊 [상태 로그] 한눈에 보기
-                us_name = get_us_company_name(t)
-                _exit_tag = "스윙" if strategy_type == "SWING_FIB" else "V8"
-                _sw_suffix = (
-                    _format_swing_exit_log_suffix("US", pos_info, ohlcv, float(curr_p), float(buy_p))
-                    if strategy_type == "SWING_FIB"
-                    else ""
-                )
-                print(
-                    f"  📊 [US 보유] {us_name}({t}) | 현재가: ${curr_p:.2f} | 매수가: ${buy_p:.2f} | "
-                    f"최고가: ${max_p:.2f} | 매도선({_exit_tag}): ${exit_line:.2f} | "
-                    f"수익률: {profit_rate_now:+.2f}%{_sw_suffix}"
-                )
-
-                # 수익률 +1% 미만·매수 후 15분: 매도 보류 (손실 구간 포함)
-                buy_time = pos_info.get('buy_time', 0)
-                if _new_buy_sell_protection_blocks(profit_rate_now, buy_time):
-                    remain_sec = _new_buy_protection_remaining_sec(buy_time)
-                    print(
-                        f"  ⏭️ {t}: 신규 매수 보호 구간 "
-                        f"({remain_sec}초 남음, 수익률 {profit_rate_now:+.2f}%)"
-                    )
-                    continue
-
-                if strategy_type == "SWING_FIB":
-                    sw_action, sw_reason = check_swing_exit(
-                        pos_info,
-                        pd.DataFrame(ohlcv),
-                        reference_price=float(curr_p),
-                        market="US",
-                        ticker=t,
-                        trading_hours_held=trading_h,
-                    )
-                    if sw_action == "HALF":
-                        if order_idem.lane_has_filled_sell(
-                            state, "US", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag
-                        ):
-                            order_idem.reconcile_ticker_lane(
-                                state, "US", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag, STATE_PATH
-                            )
-                            continue
-                        sq = compute_stock_scale_out_qty(int(float(qty_holding)))
-                        if not sq:
-                            print(f"  ⏭️ [SWING-SELL] {us_name}({t}) HALF 수량 0 (패스)")
-                            continue
-                        sp_half = round(float(curr_p) * 0.98, 2)
-
-                        def _us_swing_half_place():
-                            return execute_us_order_direct(
-                                kis_api.broker_us, "sell", t, int(sq), sp_half
-                            )
-
-                        fill_half = _idempotent_kis_sell(
-                            state,
-                            market="US",
-                            ticker=t,
-                            lane=order_idem.LANE_SWING_HALF,
-                            qty=int(sq),
-                            fallback_price=float(curr_p),
-                            place_order=_us_swing_half_place,
-                            cycle_tag=_buy_cycle_tag,
-                        )
-                        if fill_half.ok:
-                            new_half = post_partial_ledger(
-                                pos_info, float(sq), float(curr_p), float(qty_holding), set_scale_out_done=False
-                            )
-                            new_half["strategy_type"] = "SWING_FIB"
-                            new_half["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
-                            ledger_apply.persist_position_set(
-                                state, t, new_half, context="SWING HALF US", state_path=STATE_PATH
-                            )
-                            _record_trade_event(
-                                "US",
-                                t,
-                                "SELL",
-                                int(sq),
-                                price=float(curr_p),
-                                profit_rate=float(profit_rate_now),
-                                reason=f"[SWING-SELL] {sw_reason}",
-                            )
-                            print(f"  ✅ [SWING-SELL] {us_name}({t}) HALF | {sw_reason}")
-                            _telegram_swing_sell(
-                                "US",
-                                t,
-                                name=us_name,
-                                half=True,
-                                qty_label=f"{int(sq)}주",
-                                profit_rate=float(profit_rate_now),
-                                reason=sw_reason,
-                            )
-                        else:
-                            print(
-                                f"  ❌ [SWING-SELL] {us_name}({t}) HALF 실패: {fill_half.note}"
-                            )
-                        continue
-                    if sw_action == "FULL":
-                        qty_full = int(float(qty_holding))
-                        if qty_full <= 0:
-                            continue
-                        sp_full = round(float(curr_p) * 0.98, 2)
-
-                        def _us_swing_full_place():
-                            return execute_us_order_direct(
-                                kis_api.broker_us, "sell", t, qty_full, sp_full
-                            )
-
-                        fill_full = _idempotent_kis_sell(
-                            state,
-                            market="US",
-                            ticker=t,
-                            lane=order_idem.LANE_SWING_FULL,
-                            qty=qty_full,
-                            fallback_price=float(curr_p),
-                            place_order=_us_swing_full_place,
-                            cycle_tag=_buy_cycle_tag,
-                        )
-                        if fill_full.ok:
-                            p_full = ((float(sp_full) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
-                            _record_trade_event("US", t, "SELL", qty_full, price=float(sp_full), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
-                            print(f"  ✅ [SWING-SELL] {us_name}({t}) FULL | {sw_reason}")
-                            _telegram_swing_sell(
-                                "US",
-                                t,
-                                name=us_name,
-                                half=False,
-                                qty_label=f"{qty_full}주",
-                                profit_rate=float(p_full),
-                                reason=sw_reason,
-                            )
-                            def _mut_us_swing_full(st: dict) -> None:
-                                set_cooldown(st, t)
-                                set_ticker_cooldown_after_sell(
-                                    st,
-                                    t,
-                                    sw_reason,
-                                    profit_rate=float(p_full),
-                                    strategy_type="SWING_FIB",
-                                    market="US",
-                                    remaining_qty=0.0,
-                                )
-
-                            ledger_apply.persist_position_remove(
-                                state, t, context="SWING FULL US", state_path=STATE_PATH, mutate_fn=_mut_us_swing_full
-                            )
-                        else:
-                            print(
-                                f"  ❌ [SWING-SELL] {us_name}({t}) FULL 실패: {fill_full.note}"
-                            )
-                        continue
-
-                # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
-                usdk = float(estimate_usdkrw())
-                qty_int = int(float(qty_holding))
-                q_led = int(round(_to_float(pos_info.get("qty"), qty_int)))
-                if q_led <= 0:
-                    q_led = qty_int
-                notion_krw_so = notional_krw_kr_us(float(buy_p), float(curr_p), float(q_led), True, usdk)
-                entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
-                so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
-                if order_idem.lane_has_filled_sell(
-                    state, "US", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag
-                ):
-                    order_idem.reconcile_ticker_lane(
-                        state, "US", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag, STATE_PATH
-                    )
-                    pos_info = (state.get("positions") or {}).get(t) or pos_info
-                if not position_scale_out_done(pos_info) and so_hit:
-                    if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
-                        mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
-                        print(
-                            f"  ℹ️ [US Scale-Out 스킵] {t}: 트리거({mode_txt}, 목표 {so_target:,.2f})는 충족했지만 "
-                            f"명목(원화 환산)={notion_krw_so:,.0f}원 < {SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원 (수량 {qty_int}주)"
-                        )
-                    elif scale_out_trigger_ok(pos_info, SCALE_OUT_PROFIT_PCT, notion_krw_so):
-                        sq = compute_stock_scale_out_qty(qty_int)
-                        if not sq:
-                            print(
-                                f"  ℹ️ [US Scale-Out 스킵] {t}: 보유 {qty_int}주 → 50% 몫 0주(1주만 있을 때 규칙상 생략)"
-                            )
-                        elif not stock_scale_out_min_notional_ok(int(sq), float(curr_p)):
-                            print(f"  ℹ️ [US Scale-Out 스킵] {t}: 최소 매도 명목(1주 가치) 미만")
-                        else:
-                            sell_notion_krw = float(sq) * float(curr_p) * usdk
-                            tw_krw_eff = (float(TWAP_USD_THRESHOLD) * usdk) if TWAP_ENABLED else float("inf")
-
-                            def _us_so_slice(qq: int):
-                                sp = round(float(curr_p) * 0.98, 2)
-                                return execute_us_order_direct(
-                                    kis_api.broker_us, "sell", t, int(qq), sp
-                                )
-
-                            ok_so = _run_kis_scale_out_slices_idempotent(
-                                state,
-                                market="US",
-                                ticker=t,
-                                sell_qty=int(sq),
-                                notional_krw=sell_notion_krw,
-                                threshold_krw=tw_krw_eff,
-                                curr_p=float(curr_p),
-                                place_slice=_us_so_slice,
-                                cycle_tag=_buy_cycle_tag,
-                            )
-                            if ok_so:
-                                ledger_apply.persist_position_set(
-                                    state,
-                                    t,
-                                    post_partial_ledger(pos_info, float(sq), float(curr_p), float(qty_int)),
-                                    context="US Scale-Out",
-                                    state_path=STATE_PATH,
-                                )
-                                try:
-                                    _record_trade_event(
-                                        "US",
-                                        t,
-                                        "SELL",
-                                        int(sq),
-                                        price=float(curr_p),
-                                        profit_rate=float(profit_rate_now),
-                                        reason="V7.1 조건부 50% 분할 익절(Scale-Out)",
-                                    )
-                                except Exception as _e_so:
-                                    print(f"  ⚠️ [US Scale-Out] 매매내역 기록 실패: {_e_so}")
-                                print(f"  ✅ [US Scale-Out] {us_name}({t}) {sq}주 분할 익절 · 장부 보정 완료")
-                                send_telegram(f"💎 [US Scale-Out] {t}({us_name})\n{sq}주 분할 익절 체결, 남은 물량은 샹들리에 추적 유지")
-                                continue
-                            print(f"  ⚠️ [US Scale-Out] {t} 주문 실패 — 다음 사이클에 재시도")
-
-                reason = ""
-                is_exit = False
-
-                _print_position_hold_status(
-                    now_str,
-                    t,
-                    buy_time_log,
-                    hours_held,
-                    line_prefix="  ",
-                    trading_hours=trading_h,
-                    market="US",
-                )
-
-                ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
-                    market="US",
-                    strategy_type=strategy_type,
-                    hours_held=float(trading_h),
-                    profit_rate_now=float(profit_rate_now),
-                )
-                if ts_exit:
-                    is_exit = True
-                    reason = ts_reason
-                    print(f"  ⏰ {reason}")
-                elif ts_exempt:
-                    _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("US", strategy_type)
-                    print(
-                        f"     ✅ 타임스탑 유예 {_ts_tag} — 보유 {trading_h:.1f}h (≥{_ts_min_h:.0f}h), "
-                        f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
-                    )
-
-                # 🛑 [매도 로직 2] 하드스탑 (SWING_FIB는 check_swing_exit 피보·구름 FULL 전담)
-                if not is_exit and profit_rate_now < 0 and strategy_type != "SWING_FIB":
-                    print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: ${curr_p:.2f} / 손절가: ${hard_stop:.2f})")
-                    if curr_p <= hard_stop:
-                        is_exit = True
-                        reason = "하드스탑 이탈 (손실구간 방어)"
-                        print(f"  🔴 [하드스탑 발동] {t} - 현재가: ${curr_p:.2f} <= 손절가: ${hard_stop:.2f}. 강제 청산!")
-
-                # 🛑 [매도 로직 3] 수익 구간 트레일링 (스윙: 수익 락만 / V8: 샹들리에)
-                if not is_exit and profit_rate_now >= 0:
-                    if strategy_type == "SWING_FIB":
-                        is_exit, reason = _check_swing_trailing_exit(
-                            float(curr_p), pos_info, ohlcv, state, t
-                        )
-                    else:
-                        is_exit, reason_chandelier = check_pro_exit(t, curr_p, pos_info, ohlcv)
-                        if is_exit:
-                            reason = reason_chandelier
-
-                # 🎯 실제 매도 주문 실행
-                if is_exit:
-                    # ✅ [핵심 버그 수정] 엉뚱하게 다시 구하지 말고 맨 위에서 구한 정확한 수량 재사용!
-                    qty = qty_holding 
-                    if qty <= 0:
-                        print(f"  ❌ {t} 매도 오류: 수량이 0으로 인식됨.")
-                        continue
-                    
-                    sell_price = round(curr_p * 0.98, 2)
-
-                    def _us_exit_place():
-                        return execute_us_order_direct(
-                            kis_api.broker_us, "sell", t, qty, sell_price
-                        )
-
-                    fill_exit = _idempotent_kis_sell(
-                        state,
-                        market="US",
-                        ticker=t,
-                        lane=order_idem.LANE_EXIT,
-                        qty=int(qty),
-                        fallback_price=float(sell_price),
-                        place_order=_us_exit_place,
-                        cycle_tag=_buy_cycle_tag,
-                    )
-                    tag_exit = "♻️" if fill_exit.reused else "🧾"
-                    print(
-                        f"  {tag_exit} [US EXIT] {t} ok={fill_exit.ok} qty={int(fill_exit.qty)} "
-                        f"note={fill_exit.note}"
-                    )
-
-                    if fill_exit.ok:
-                        px = float(fill_exit.price) if fill_exit.price > 0 else float(sell_price)
-                        profit_rate = ((px - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
-                        stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
-                        if profit_rate > 0:
-                            stats["wins"] = int(stats.get("wins", 0)) + 1
-                        else:
-                            stats["losses"] += 1
-                        stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
-                        _record_trade_event("US", t, "SELL", qty, price=sell_price, profit_rate=profit_rate, reason=reason)
-                        print(f"  ✅ [미장 매도 체결] {us_name}({t}) | 수익률: {profit_rate:+.2f}% | 사유: {reason}")
-                        if strategy_type == "SWING_FIB":
-                            send_telegram(
-                                f"🚨 [미장 스윙 청산] {t}({us_name})\n"
-                                f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
-                            )
-                        else:
-                            send_telegram(
-                                f"🚨 [미장 추세종료 매도] {t}({us_name})\n"
-                                f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
-                            )
-                        def _mut_us_exit(st: dict) -> None:
-                            set_cooldown(st, t)
-                            set_ticker_cooldown_after_sell(
-                                st,
-                                t,
-                                reason,
-                                profit_rate=float(profit_rate),
-                                strategy_type=strategy_type,
-                                market="US",
-                                remaining_qty=0.0,
-                            )
-
-                        ledger_apply.persist_position_remove(
-                            state, t, context="US EXIT", state_path=STATE_PATH, mutate_fn=_mut_us_exit
-                        )
-                    else:
-                        print(f"  ❌ {us_name}({t}) 매도 최종 실패 ({retry_count}회 시도): {resp.get('msg1', 'API 오류') if resp else '응답 없음'}")
-            except Exception as e:
-                print(f"  ❌ [US 매도 루프 예외] {t}: {e}")
-                traceback.print_exc()
-                continue
-
-        us_cash, total_us_equity = _refresh_us_cash_equity_after_sells()
-        state["circuit_aux_last_usd_total"] = float(total_us_equity)
-        save_state(STATE_PATH, state)
-        if (
-            abs(us_cash - us_cash_snap) >= 0.01
-            or abs(total_us_equity - total_us_equity_snap) >= 1.0
-        ):
-            print(
-                f"  📌 [US] 매도 후 예수·총평가 갱신 → 가용 ${us_cash:.2f} · 총자산 ${total_us_equity:.2f} "
-                f"(매도단계 전 스냅샷 대비 반영)"
-            )
-
-        # 매수는 MDD → Phase4 거시 체크 후에만 실행
-        if not check_mdd_break("US", total_us_equity, state, STATE_PATH):
-            print("  -> 🚨 미장 MDD 브레이크 작동 중. 신규 매수 중단.")
-        elif macro_mult <= 0:
-            print(f"  -> 🚨 미장 Phase4 거시 방어막: 신규 매수 중단. ({macro_reason})")
-        elif in_account_circuit_cooldown(state):
-            print("  -> 🚨 미장 Phase5 계좌 서킷 쿨다운 — 신규 매수 중단.")
-        else:
-            # ⏳ [핵심] 미장 매수: NYSE 정규장 마감(16:00 ET) 직전 N분만 (기본 30분 → 15:30~15:59)
-            now_ny = datetime.now(pytz.timezone("US/Eastern"))
-            is_us_buy_time, _us_buy_start, _us_close = _is_us_buy_window_now(now_ny)
-
-            if not is_us_buy_time:
-                print(
-                    f"  ⏳ [US 매수 대기] 장 마감 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분 전 구간만 매수 "
-                    f"({_us_buy_start.strftime('%H:%M')}~{_us_close.strftime('%H:%M')} ET, "
-                    f"현재 {now_ny.strftime('%H:%M')})"
-                )
-            else:
-                _cycle_buy_zone_us = True
-                if not _macro_market_buy_allowed(macro_snap, "US"):
-                    print(
-                        f"  -> 🚨 미장 Phase4 글로벌 방어막: 신규 매수 중단. "
-                        f"({(macro_snap.get('market_buy_block_reason') or {}).get('US', '')})"
-                    )
-                else:
-                    # 지수 급락 체크
-                    us_index_change = get_market_index_change("US")
-                    print(f"  📊 [S&P500 지수] 변화율: {us_index_change:+.2f}% 날씨는 {weather['US']}")
-                    if us_index_change <= INDEX_CRASH_US:
-                        print(f"  🚫 [US 매수 중단] S&P500 {us_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_US}%)")
-                    else:
-                        if weather["US"] == WEATHER_LABEL_BEAR:
-                            print(
-                                "  📌 [US] BEAR 날씨 — V8 추세 매수만 중단, SWING_FIB 스윙 후보는 계속 분석"
-                            )
-                        # 2) 미장 타겟: 고베타 유니버스 NDX~90 + S&P 섹터 RR (150, ``us_universe_cache.json``)
-                        night_targets = get_top_market_cap_tickers(150)
-                        night_targets = _sort_buy_targets_by_rs(night_targets, "US")
-                        total_us = len(night_targets)
-                        print(f"  -> 🇺🇸 미장 유니버스(고베타·섹터분산) {total_us}개 정밀 분석 시작!")
-
-                        for idx, t in enumerate(night_targets, 1):
-                            try:
-                                us_name = get_us_company_name(t)  # 종목명 미리 조회
-                                if in_ticker_cooldown(state, t):
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): 매도 후 쿨다운(톱날 방지) 만료 "
-                                        f"{ticker_cooldown_human(state, t)} 이전 (패스)"
-                                    )
-                                    continue
-                                if in_cooldown(state, t):
-                                    print(f"  ⏭️ {us_name}({t}): 쿨다운 중 (패스)")
-                                    continue
-                                if t in held_us:
-                                    print(f"  ⏭️ {us_name}({t}): 이미 보유중 (패스)")
-                                    continue
-                                if order_idem.is_buy_inflight(state, "US", t, _buy_cycle_tag):
-                                    print(f"  ⏭️ {us_name}({t}): 매수 TWAP 진행 중(멱등 패스)")
-                                    continue
-                                sector_ok_us, sector_msg_us = allow_us_sector_entry(
-                                    t,
-                                    state.get("positions", {}),
-                                    MAX_POSITIONS_US,
-                                    normalize_ticker,
-                                )
-                                if not sector_ok_us:
-                                    print(f"  ⏭️ {us_name}({t}): {sector_msg_us} (패스)")
-                                    continue
-
-                                # OHLCV: 신호 계산에 필요
-                                ohlcv = get_ohlcv_yfinance(t)
-                                if not ohlcv:
-                                    print(f"  ⏭️ {us_name}({t}): OHLCV 데이터 부족 (패스)")
-                                    continue
-
-                                live_px_us = 0.0
-                                try:
-                                    _pr_us = kis_api.broker_us.fetch_price(t)
-                                    if _pr_us and _pr_us.get("rt_cd") == "0":
-                                        live_px_us = float((_pr_us.get("output") or {}).get("last", 0) or 0)
-                                except Exception:
-                                    pass
-
-                                strategy_type = "TREND_V8"
-                                entry_fib_level = 0.0
-                                is_buy, sl_p, s_name = calculate_pro_signals(ohlcv, weather['US'], t, us_name, idx, total_us)
-                                v8_ok = bool(is_buy) and _v8_trend_buy_allowed_in_weather(weather["US"])
-                                if bool(is_buy) and not v8_ok:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): BEAR 시장 — V8 신호 통과했으나 추세 매수 차단 (스윙만 허용)"
-                                    )
-                                if v8_ok:
-                                    print(f"  ✅ [V8-BUY] {us_name}({t}) 진입")
-                                else:
-                                    sw_ok, sw_fib, sw_why = check_swing_entry(
-                                        pd.DataFrame(ohlcv),
-                                        market="US",
-                                        reference_close=live_px_us if live_px_us > 0 else None,
-                                    )
-                                    if sw_ok:
-                                        strategy_type = "SWING_FIB"
-                                        entry_fib_level = float(sw_fib)
-                                        _sw_o = float(ohlcv[-1].get("o", 0) or 0)
-                                        _sw_c = float(live_px_us) if live_px_us > 0 else float(ohlcv[-1].get("c", 0) or 0)
-                                        sl_p = swing_entry_sl_p(_sw_c, sw_fib)
-                                        s_name = "SWING_FIB"
-                                        _sw_src = "KIS실시간" if live_px_us > 0 else "일봉종가"
-                                        print(
-                                            f"  ✅ [SWING-BUY] {us_name}({t}) entry_fib={entry_fib_level:.2f} "
-                                            f"| 양봉({_sw_src} 시가 {_sw_o:.2f} < 종가 {_sw_c:.2f})"
-                                            f"{' | BEAR 시장 스윙 예외' if weather['US'] == WEATHER_LABEL_BEAR else ''}"
-                                        )
-                                    else:
-                                        _prog = f"[{idx}/{total_us}]" if total_us > 0 else ""
-                                        _disp = f"{us_name}({t})" if us_name and us_name != t else t
-                                        print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
-                                        continue
-
-                                base_ratio = 1.0 / max(1, int(MAX_POSITIONS_US))
-                                ratio, t_name = _position_ratio_with_vol_target(
-                                    base_ratio,
-                                    ohlcv,
-                                    target_vol=_alpha_target_vol,
-                                    ticker=t,
-                                )
-
-                                _prospect_atr = atr_pct_from_ohlcv(ohlcv, t)
-                                _mkt_heat, _heat_blocked = _portfolio_heat_snapshot(
-                                    state,
-                                    "US",
-                                    total_us_equity,
-                                    get_cached_ohlcv,
-                                    extra_weight=float(ratio),
-                                    extra_atr_pct=float(_prospect_atr or 0.0),
-                                )
-                                if _heat_blocked:
-                                    _log_portfolio_heat_block("US", _mkt_heat, prospective=True)
-                                    continue
-
-                                target_budget = total_us_equity * ratio * macro_mult
-                                us_min_budget = 50.0
-
-                                if target_budget < us_min_budget:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): [US 예산 부족] 배정예산 ${target_budget:.2f} < "
-                                        f"최소 ${us_min_budget:.0f} (총자산 ${total_us_equity:.2f}×비중·macro, 예수금 ${us_cash:.2f})"
-                                    )
-                                    continue
-                                if us_cash < us_min_budget:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): [US 예수금 부족] 가용 ${us_cash:.2f} < 최소 ${us_min_budget:.0f} — 매수 불가"
-                                    )
-                                    continue
-                                if us_cash < target_budget:
-                                    print(f"  🧹 [미장 영끌 발동] {us_name}({t}): 예산(${target_budget:.2f}) 부족. 지갑에 남은 전액(${us_cash:.2f}) 풀매수 장전!")
-                                    target_budget = us_cash
-                                if not can_open_new(t, state, max_positions=MAX_POSITIONS_US):
-                                    print(f"  ⏭️ {us_name}({t}): 포지션 개수 초과 ({MAX_POSITIONS_US}개) (패스)")
-                                    continue
-
-                                curr_p = float(ohlcv[-1]['c'])
-                                qty = int(target_budget / curr_p) if curr_p > 0 else 0
-                                if qty <= 0:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): [US 매수 스킵] 시그널 통과했으나 정수주 0주 — "
-                                        f"배정예산 ${target_budget:.2f} < 종가기준 1주(~${curr_p:.2f}) "
-                                        f"(총자산 ${total_us_equity:.2f}, 비중캡 후 ratio={ratio:.4f}, macro×{macro_mult:.2f}, 예수금 ${us_cash:.2f})"
-                                    )
-                                    continue
-                                if not _ai_false_breakout_buy_gate(
-                                    t,
-                                    "US",
-                                    strategy_type,
-                                    AI_FALSE_BREAKOUT_THRESHOLD,
-                                    f"{us_name}({t})",
-                                ):
-                                    continue
-
-                                # 시장가 매수 (Phase2 TWAP: 대액 시 USD 분할, 슬라이스마다 101% 지정가)
-                                us_box = [float(us_cash)]
-                                entry_atr = float(get_safe_atr(t, ohlcv) or 0.0)
-                                ok_us_buy = _execute_us_market_buy_twap(
-                                    t,
-                                    us_name,
-                                    float(target_budget),
-                                    curr_p,
-                                    sl_p,
-                                    entry_atr,
-                                    t_name,
-                                    s_name,
-                                    state,
-                                    us_box,
-                                    strategy_type=strategy_type,
-                                    entry_fib_level=entry_fib_level,
-                                )
-                                if not ok_us_buy:
-                                    print(
-                                        f"  ⏭️ {us_name}({t}): [US 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
-                                        f"배정 ${target_budget:.2f}, 종가 ${curr_p:.2f} (TWAP·KIS·예수 확인)"
-                                    )
-                                else:
-                                    _cycle_buy_fills += 1
-                                    _register_swing_risk_after_buy(state, t, ohlcv, "US")
-                                us_cash = float(us_box[0])
-                            except Exception as e:
-                                print(f"  ❌ [US BUY 예외] {t}: {type(e).__name__}: {e}")
-                                traceback.print_exc()
-                                continue
-    else:
-        _log_us_market_closed_or_suppressed()
-
-    # -------------------------------------------------------------------------
-    # 코인(COIN) 엔진 — 업비트/바이낸스(CCXT). 매수는 **일봉 전환 직전 KST 창**·BTC 급락·
-    # 배정예산·최소주문·AI·TWAP. 스킵은 ``[COIN …]`` 태그.
-    # -------------------------------------------------------------------------
-    if is_market_open("COIN"):
-        coin_weather = weather.get('COIN', '☁️ SIDEWAYS')
-        print("▶️ [🪙 코인] 매매 엔진 시작...")
-        balances = coin_broker.get_balances() or []
-        krw_on_book, krw_bal = _compute_coin_krw_balances(balances)
-        held_coins = _extract_held_coins_from_balances(balances)
-
-        total_coin_equity = _compute_total_coin_equity_from_balances(balances, float(krw_on_book))
-        krw_bal_snap = float(krw_bal)
-        total_coin_equity_snap = float(total_coin_equity)
-
-        state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
-        save_state(STATE_PATH, state)
-
-        # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
-        positions_count = _count_coin_positions_for_sell_loop(balances, state.get("positions", {}))
-        print(f"  🔍 [코인 매도 루프] 보유 포지션 {positions_count}개 손익 체크 시작...")
-        if positions_count == 0:
-            print(f"  ✅ [코인 매도 루프] 매도할 종목 없음 (완료)")
-        for b in _iter_coin_asset_rows(balances):
-            t = coin_broker.held_ticker_row(b)
-            if not t:
-                continue
-
-            is_exit = False
-
-            if t not in state.get("positions", {}):
-                print(f"  ⏭️ {t}: 장부에 없음 (패스)")
-                continue
-            qty = float(_to_float(b.get('balance', 0)))
-            if not coin_broker.should_include_coin_balance_row(b):
-                print(f"  ⏭️ {t}: 명목 최소 미만 또는 수량 부족 ({qty}) (패스)")
-                continue
-            curr_p = coin_broker.get_current_price(t)
-            if not curr_p:
-                print(f"  ⏭️ {t}: 현재가 조회 실패 (패스)")
-                continue
-            ohlcv = coin_broker.fetch_ohlcv(t, "day", 250)
-            if not ohlcv or len(ohlcv) < 20:
-                # OHLCV 실패 시 현재가로만 손절 체크
-                print(f"  ⚠️  [{t}] OHLCV 데이터 부족, 현재가로 손절만 체크...")
-                pos_info = state.get("positions", {}).get(t, {})
-                buy_p = pos_info.get('buy_p', curr_p)
-                sl_p = float(pos_info.get('sl_p', buy_p * 0.9))
-                profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
-                
-                # max_p 갱신 (OHLCV 실패 시에도)
-                old_max_p = pos_info.get('max_p', buy_p)
-                pos_info['max_p'] = max(old_max_p, curr_p)
-                if pos_info['max_p'] > old_max_p:
-                    print(f"     📈 [{t}] max_p 업데이트: {old_max_p:,.0f} → {pos_info['max_p']:,.0f}")
-                state.setdefault("positions", {})[t] = pos_info
-                save_state(STATE_PATH, state)
-                
-                print(f"     📊 {t}: 현재가 {curr_p:,.0f}원 / 손절가 {sl_p:,.0f}원 / 수익률 {profit_rate_now:+.2f}%")
-            pos_info = state.get("positions", {}).get(t, {})
-            atr_val = get_safe_atr(t, ohlcv)
-            _update_position_current_atr_if_changed(state, t, pos_info, atr_val)
-            
-            # 🔄 [완전 동기화] GUI가 장부에 공유한 최신 가격을 최우선으로 사용
-            curr_p = _resolve_curr_price_with_gui_override(pos_info, float(curr_p))
-            # else: curr_p는 이미 위에서 coin_broker.get_current_price로 가져옴
-            strategy_type = str(pos_info.get("strategy_type", "TREND_V8") or "TREND_V8").upper()
-            _update_position_max_p(state, t, pos_info, float(curr_p))
-            pos_info = state.get("positions", {}).get(t, pos_info)
-            buy_p = pos_info.get('buy_p', curr_p)
-            max_p = pos_info.get('max_p', curr_p)
-            now_str, hours_held, trading_h, buy_time_log = _compute_holding_time_info(
-                pos_info, "COIN"
-            )
-            profit_rate_now = _calc_profit_rate_pct(float(curr_p), float(buy_p))
-            if len(ohlcv) < 20:
-                exit_line = _calc_hard_stop(
-                    pos_info,
-                    float(buy_p),
-                    ohlcv=ohlcv,
-                    strategy_type=strategy_type,
-                    ticker=t,
-                    trading_hours_held=trading_h,
-                )
-            else:
-                exit_line = _resolve_exit_display_price(
-                    t,
-                    curr_p,
-                    pos_info,
-                    ohlcv,
-                    strategy_type,
-                    state=state,
-                    trading_hours_held=trading_h,
-                )
-            _persist_exit_line_sl_p(state, t, pos_info, exit_line)
-            hard_stop = _calc_hard_stop(
-                pos_info,
-                float(buy_p),
-                ohlcv=ohlcv,
-                strategy_type=strategy_type,
-                ticker=t,
-                trading_hours_held=trading_h,
-            )
-
-            _exit_tag = "스윙" if strategy_type == "SWING_FIB" else "V8"
-            _sw_suffix = (
-                _format_swing_exit_log_suffix("COIN", pos_info, ohlcv, float(curr_p), float(buy_p))
-                if strategy_type == "SWING_FIB" and len(ohlcv) >= 20
-                else ""
-            )
-            curr_fmt, buy_fmt, max_fmt, chan_fmt, hard_fmt = _format_coin_price_log_fields(
-                float(curr_p), float(buy_p), float(max_p), float(exit_line), float(hard_stop)
-            )
-
-            print(
-                f"  📊 [COIN 보유] {t} | 현재가: {curr_fmt}원 | 매수가: {buy_fmt}원 | "
-                f"최고가: {max_fmt}원 | 매도선({_exit_tag}): {chan_fmt}원 | "
-                f"수익률: {profit_rate_now:+.2f}%{_sw_suffix}"
-            )
-
-            # 손절가 체크 로그
-            if profit_rate_now < 0:
-                print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: {curr_fmt} / 손절가: {hard_fmt})")
-                if curr_p <= hard_stop:
-                    print(f"     ➜ 손절 체크: 현재가 {curr_fmt} ≤ 손절가 {hard_fmt} = 🔴 매도 신호!")
-
-            # 수익률 +1% 미만·매수 후 15분: 매도 보류 (손실 구간 포함)
-            buy_time = pos_info.get('buy_time', 0)
-            if _new_buy_sell_protection_blocks(profit_rate_now, buy_time):
-                remain_sec = _new_buy_protection_remaining_sec(buy_time)
-                print(
-                    f"  ⏭️ {t}: 신규 매수 보호 구간 "
-                    f"({remain_sec}초 남음, 수익률 {profit_rate_now:+.2f}%)"
-                )
-                continue
-
-            if strategy_type == "SWING_FIB":
-                sw_action, sw_reason = check_swing_exit(
-                    pos_info,
-                    pd.DataFrame(ohlcv),
-                    reference_price=float(curr_p),
-                    market="COIN",
-                    ticker=t,
-                    trading_hours_held=trading_h,
-                )
-                if sw_action == "HALF":
-                    if order_idem.lane_has_filled_sell(
-                        state, "COIN", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag
-                    ):
-                        order_idem.reconcile_ticker_lane(
-                            state, "COIN", t, order_idem.LANE_SWING_HALF, _buy_cycle_tag, STATE_PATH
-                        )
-                        continue
-                    sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
-                    if not sell_q:
-                        print(f"  ⏭️ [SWING-SELL] {t} HALF 수량 0 (패스)")
-                        continue
-                    fill_half = _idempotent_coin_sell(
-                        state,
-                        ticker=t,
-                        lane=order_idem.LANE_SWING_HALF,
-                        qty=float(sell_q),
-                        fallback_price=float(curr_p),
-                        cycle_tag=_buy_cycle_tag,
-                    )
-                    if fill_half.ok:
-                        new_half = post_partial_ledger(
-                            pos_info, float(sell_q), float(curr_p), float(qty), set_scale_out_done=False
-                        )
-                        new_half["strategy_type"] = "SWING_FIB"
-                        new_half["entry_fib_level"] = float(pos_info.get("entry_fib_level", 0.0) or 0.0)
-                        ledger_apply.persist_position_set(
-                            state, t, new_half, context="SWING HALF COIN", state_path=STATE_PATH
-                        )
-                        _record_trade_event(
-                            "COIN",
-                            t,
-                            "SELL",
-                            float(sell_q),
-                            price=float(curr_p),
-                            profit_rate=float(profit_rate_now),
-                            reason=f"[SWING-SELL] {sw_reason}",
-                        )
-                        coin_nm = get_coin_name(t)
-                        print(f"  ✅ [SWING-SELL] {t}({coin_nm}) HALF | {sw_reason}")
-                        _qty_lbl = (
-                            f"{float(sell_q):.8f}".rstrip("0").rstrip(".")
-                            + (" USDT" if coin_config.is_binance() else "")
-                        )
-                        _telegram_swing_sell(
-                            "COIN",
-                            t,
-                            name=coin_nm,
-                            half=True,
-                            qty_label=_qty_lbl,
-                            profit_rate=float(profit_rate_now),
-                            reason=sw_reason,
-                        )
-                    else:
-                        print(f"  ❌ [SWING-SELL] {t} HALF 실패: {fill_half.note}")
-                    continue
-                if sw_action == "FULL":
-                    fill_full = _idempotent_coin_sell(
-                        state,
-                        ticker=t,
-                        lane=order_idem.LANE_SWING_FULL,
-                        qty=float(qty),
-                        fallback_price=float(curr_p),
-                        cycle_tag=_buy_cycle_tag,
-                    )
-                    if fill_full.ok:
-                        p_full = (
-                            (float(curr_p) - float(buy_p)) / float(buy_p) * 100
-                            if float(buy_p) > 0
-                            else 0.0
-                        )
-                        _record_trade_event(
-                            "COIN",
-                            t,
-                            "SELL",
-                            qty,
-                            price=float(curr_p),
-                            profit_rate=float(p_full),
-                            reason=f"[SWING-SELL] {sw_reason}",
-                        )
-                        coin_nm = get_coin_name(t)
-                        print(f"  ✅ [SWING-SELL] {t}({coin_nm}) FULL | {sw_reason}")
-                        _qty_lbl = (
-                            f"{float(qty):.8f}".rstrip("0").rstrip(".")
-                            + (" USDT" if coin_config.is_binance() else "")
-                        )
-                        _telegram_swing_sell(
-                            "COIN",
-                            t,
-                            name=coin_nm,
-                            half=False,
-                            qty_label=_qty_lbl,
-                            profit_rate=float(p_full),
-                            reason=sw_reason,
-                        )
-                        def _mut_coin_swing_full(st: dict) -> None:
-                            set_cooldown(st, t)
-                            set_ticker_cooldown_after_sell(
-                                st,
-                                t,
-                                sw_reason,
-                                profit_rate=float(p_full),
-                                strategy_type="SWING_FIB",
-                                market="COIN",
-                                remaining_qty=0.0,
-                            )
-
-                        ledger_apply.persist_position_remove(
-                            state, t, context="SWING FULL COIN", state_path=STATE_PATH, mutate_fn=_mut_coin_swing_full
-                        )
-                    else:
-                        print(f"  ❌ [SWING-SELL] {t} FULL 실패: {fill_full.note}")
-                    continue
-
-            # V7.1: 조건부 50% 분할 익절 (타임스탑·하드스탑·샹들리에 전)
-            usdk = float(estimate_usdkrw())
-            q_led = float(_to_float(pos_info.get("qty"), qty))
-            if q_led <= 0:
-                q_led = float(qty)
-            notion_krw_so = notional_krw_kr_us(
-                float(buy_p), float(curr_p), float(q_led), bool(coin_config.is_binance()), usdk
-            )
-            entry_atr = _to_float(pos_info.get("entry_atr", 0), 0.0)
-            so_hit, so_mode, so_target = scale_out_price_target_hit(float(buy_p), float(curr_p), entry_atr)
-            if order_idem.lane_has_filled_sell(
-                state, "COIN", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag
-            ):
-                order_idem.reconcile_ticker_lane(
-                    state, "COIN", t, order_idem.LANE_SCALE_OUT, _buy_cycle_tag, STATE_PATH
-                )
-                pos_info = (state.get("positions") or {}).get(t) or pos_info
-            if not position_scale_out_done(pos_info) and so_hit:
-                if float(notion_krw_so) < SCALE_OUT_MIN_NOTIONAL_KRW:
-                    mode_txt = "entry_atr*3.0" if so_mode == "entry_atr" else f"fallback +{SCALE_OUT_PROFIT_PCT:.0f}%"
-                    print(
-                        f"  ℹ️ [COIN Scale-Out 스킵] {t}: 트리거({mode_txt}, 목표 {so_target:,.0f})는 충족했지만 "
-                        f"명목 max(매수가×수량, 현재가×수량)={notion_krw_so:,.0f}원 < "
-                        f"{SCALE_OUT_MIN_NOTIONAL_KRW:,.0f}원"
-                    )
-                elif scale_out_trigger_ok(pos_info, SCALE_OUT_PROFIT_PCT, notion_krw_so):
-                    sell_q = compute_coin_scale_out_qty(float(qty), float(curr_p))
-                    if not sell_q:
-                        print(f"  ℹ️ [COIN Scale-Out 스킵] {t}: 50% 절삼 후 수량 0")
-                    elif not coin_broker.scale_out_min_notional_ok(float(sell_q), float(curr_p)):
-                        print(
-                            f"  ℹ️ [COIN Scale-Out 스킵] {t}: 매도분이 거래소 최소 명목 미만"
-                        )
-                    else:
-                        tw_th = TWAP_KRW_THRESHOLD if TWAP_ENABLED else float("inf")
-                        chunks = plan_coin_sell_chunks(float(sell_q), float(curr_p), threshold_krw=float(tw_th))
-
-                        ok_so = _run_coin_scale_out_slices_idempotent(
-                            state,
-                            ticker=t,
-                            chunks=chunks,
-                            curr_p=float(curr_p),
-                            cycle_tag=_buy_cycle_tag,
-                        )
-                        if ok_so:
-                            ledger_apply.persist_position_set(
-                                state,
-                                t,
-                                post_partial_ledger(pos_info, float(sell_q), float(curr_p), float(qty)),
-                                context="COIN Scale-Out",
-                                state_path=STATE_PATH,
-                            )
-                            try:
-                                _record_trade_event(
-                                    "COIN",
-                                    t,
-                                    "SELL",
-                                    float(sell_q),
-                                    price=float(curr_p),
-                                    profit_rate=float(profit_rate_now),
-                                    reason="V7.1 조건부 50% 분할 익절(Scale-Out)",
-                                )
-                            except Exception as _e_so:
-                                print(f"  ⚠️ [COIN Scale-Out] 매매내역 기록 실패: {_e_so}")
-                            cn = get_coin_name(t)
-                            print(f"  ✅ [COIN Scale-Out] {t}({cn}) 분할 익절 {sell_q} · 장부 보정 완료")
-                            send_telegram(f"💎 [COIN Scale-Out] {t}({cn})\n분할 익절 체결, 남은 물량은 샹들리에 추적 유지")
-                            continue
-                        print(f"  ⚠️ [COIN Scale-Out] {t} 주문 실패 — 다음 사이클에 재시도")
-
-            # 매도 결정 로직 (우선순위: 타임스탑 > 하드스탑 > 샹들리에)
-            reason = ""
-
-            _print_position_hold_status(
-                now_str,
-                t,
-                buy_time_log,
-                hours_held,
-                trading_hours=trading_h,
-                market="COIN",
-            )
-
-            ts_exit, ts_reason, ts_exempt = _evaluate_time_stop(
-                market="COIN",
-                strategy_type=strategy_type,
-                hours_held=float(trading_h),
-                profit_rate_now=float(profit_rate_now),
-            )
-            if ts_exit:
-                is_exit = True
-                reason = ts_reason
-                print(f"  ⏰ {reason}")
-            elif ts_exempt:
-                _ts_tag, _ts_min_h, _ts_exempt_pct = _time_stop_params("COIN", strategy_type)
-                print(
-                    f"   ✅ 타임스탑 유예 {_ts_tag} — 보유 {trading_h:.1f}h (≥{_ts_min_h:.0f}h), "
-                    f"수익률 {profit_rate_now:+.2f}% ≥ {_ts_exempt_pct:.1f}%"
-                )
-
-            # 2. 하드스탑 (SWING_FIB는 check_swing_exit 피보·구름 FULL 전담)
-            if not is_exit and profit_rate_now < 0 and strategy_type != "SWING_FIB":
-                if curr_p <= hard_stop:
-                    is_exit = True
-                    reason = "하드스탑 이탈 (손실구간 방어)"
-                    print(f"🔴 [하드스탑 발동] {t} - 현재가: {curr_p:,.0f}원 <= 손절가: {hard_stop:,.0f}원. 강제 청산! (is_exit={is_exit})")
-
-            # 3. 수익 구간 트레일링 (스윙: 수익 락만 / V8: 샹들리에)
-            if not is_exit and profit_rate_now >= 0:
-                if strategy_type == "SWING_FIB" and len(ohlcv) >= 20:
-                    is_exit, reason = _check_swing_trailing_exit(
-                        float(curr_p), pos_info, ohlcv, state, t
-                    )
-                elif strategy_type != "SWING_FIB":
-                    is_exit, reason_chandelier = check_pro_exit(t, curr_p, pos_info, ohlcv)
-                    if is_exit:
-                        reason = reason_chandelier
-
-            if is_exit: # 여기서 실제 매도 주문이 나감
-                fill_exit = _idempotent_coin_sell(
-                    state,
-                    ticker=t,
-                    lane=order_idem.LANE_EXIT,
-                    qty=float(qty),
-                    fallback_price=float(curr_p),
-                    cycle_tag=_buy_cycle_tag,
-                )
-                tag_exit = "♻️" if fill_exit.reused else "🧾"
-                print(
-                    f"  {tag_exit} [COIN EXIT] {t} ok={fill_exit.ok} qty={fill_exit.qty:.6f} "
-                    f"note={fill_exit.note}"
-                )
-
-                if fill_exit.ok:
-                    profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
-                    stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
-                    
-                    if profit_rate > 0:
-                        stats["wins"] = int(stats.get("wins", 0)) + 1
-                    else:
-                        stats["losses"] += 1
-                        
-                    stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
-                    
-                    _record_trade_event("COIN", t, "SELL", qty, price=curr_p, profit_rate=profit_rate, reason=reason)
-                    
-                    coin_name = get_coin_name(t)
-                    print(f"  ✅ [코인 매도 체결] {t}({coin_name}) | 수익률: {profit_rate:+.2f}% | 사유: {reason}")
-                    if strategy_type == "SWING_FIB":
-                        send_telegram(
-                            f"🚨 [코인 스윙 청산] {t}({coin_name})\n"
-                            f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
-                        )
-                    else:
-                        send_telegram(
-                            f"🚨 [코인 추세종료 매도] {t}({coin_name})\n"
-                            f"사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
-                        )
-                    def _mut_coin_exit(st: dict) -> None:
-                        set_cooldown(st, t)
-                        set_ticker_cooldown_after_sell(
-                            st,
-                            t,
-                            reason,
-                            profit_rate=float(profit_rate),
-                            strategy_type=strategy_type,
-                            market="COIN",
-                            remaining_qty=0.0,
-                        )
-
-                    ledger_apply.persist_position_remove(
-                        state, t, context="COIN EXIT", state_path=STATE_PATH, mutate_fn=_mut_coin_exit
-                    )
-
-                else: # 3번 모두 실패했다면
-                    print(f"  ❌ {t} 매도 최종 실패 ({retry_count}회 시도): 거래소 API 오류")
-
-        balances = coin_broker.get_balances() or []
-        krw_on_book, krw_bal = _compute_coin_krw_balances(balances)
-        held_coins = _extract_held_coins_from_balances(balances)
-        total_coin_equity = _compute_total_coin_equity_from_balances(balances, float(krw_on_book))
-        state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
-        save_state(STATE_PATH, state)
-        if (
-            abs(float(krw_bal) - krw_bal_snap) >= 100.0
-            or abs(float(total_coin_equity) - total_coin_equity_snap) >= 3000.0
-        ):
-            print(
-                f"  📌 [COIN] 매도 후 잔고 갱신 → 주문가능 약 {float(krw_bal):,.0f}원 · "
-                f"총평가 {float(total_coin_equity):,.0f}원 (매수·비중·보유패스 기준)"
-            )
-
-        # 매수는 MDD → Phase4 거시 체크 후에만 실행
-        if not check_mdd_break("COIN", total_coin_equity, state, STATE_PATH):
-            print("  -> 🚨 코인 MDD 브레이크 작동 중. 신규 매수 중단.")
-        elif macro_mult <= 0:
-            print(f"  -> 🚨 코인 Phase4 거시 방어막: 신규 매수 중단. ({macro_reason})")
-        elif in_account_circuit_cooldown(state):
-            print("  -> 🚨 코인 Phase5 계좌 서킷 쿨다운 — 신규 매수 중단.")
-        else:
-            # 업비트·바이낸스 동일: KST 일봉(09:00) 직전 N분 창 — 국·미 ``마감 직전 창`` 과 같은 패턴.
-            now_coin = datetime.now(pytz.timezone("Asia/Seoul"))
-            is_coin_buy_time, _coin_buy_start, _coin_close = _is_coin_buy_window_now(now_coin)
-            skip_buy = not is_coin_buy_time
-            if skip_buy:
-                _coin_sched_tag = "BINANCE" if coin_config.is_binance() else "COIN"
-                print(
-                    f"  ⏳ [{_coin_sched_tag} 매수 대기] 일봉 기준점 직전 {BUY_WINDOW_MINUTES_BEFORE_CLOSE}분만 매수 "
-                    f"({_coin_buy_start.strftime('%H:%M')}~{_coin_close.strftime('%H:%M')} KST, "
-                    f"현재 {now_coin.strftime('%H:%M')})"
-                )
-
-            if not skip_buy:
-                _cycle_buy_zone_coin = True
-                if not _macro_market_buy_allowed(macro_snap, "COIN"):
-                    print(
-                        f"  -> 🚨 코인 Phase4 글로벌 방어막: 신규 매수 중단. "
-                        f"({(macro_snap.get('market_buy_block_reason') or {}).get('COIN', '')})"
-                    )
-                else:
-                    # 지수 급락 체크
-                    coin_index_change = get_market_index_change("COIN")
-                    print(f"  📊 [BTC 지수] 변화율: {coin_index_change:+.2f}% 날씨는 {coin_weather}")
-                    if coin_index_change <= INDEX_CRASH_COIN:
-                        print(f"  🚫 [COIN 매수 중단] BTC {coin_index_change:+.2f}% 급락 (기준: {INDEX_CRASH_COIN}%)")
-                    else:
-                        if coin_weather == WEATHER_LABEL_BEAR:
-                            print(
-                                "  📌 [COIN] BEAR 날씨 — V8 추세 매수만 중단, SWING_FIB 스윙 후보는 계속 분석"
-                            )
-                        try:
-                            if coin_config.is_binance():
-                                from api import binance_api as _bna
-
-                                scan_targets = _bna.top_usdt_symbols_by_quote_volume(BINANCE_UNIVERSE_TOP)
-                                _ohlcv_pref = coin_broker.run_prefetch_daily_sync(scan_targets, 250)
-                            else:
-                                scan_targets = []
-                                markets = [
-                                    m["market"]
-                                    for m in requests.get(
-                                        "https://api.upbit.com/v1/market/all", timeout=10
-                                    ).json()
-                                    if m.get("market", "").startswith("KRW-")
-                                ]
-                                tickers_data = requests.get(
-                                    "https://api.upbit.com/v1/ticker?markets=" + ",".join(markets),
-                                    timeout=10,
-                                ).json()
-                                # 업비트 KRW 마켓의 USD/원화 페그 스테이블(KRW-USDT, KRW-DAI 등) 차단:
-                                # 1) base 심볼이 알려진 스테이블이면 제외
-                                # 2) 24h 고저 스프레드(=`high_price`/`low_price`) 가 종가의 0.5% 미만이면 제외
-                                _UPBIT_STABLE_BASES = {
-                                    "USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD",
-                                    "USDS", "USDD", "USDE", "PYUSD",
-                                }
-
-                                def _upbit_skip(t: dict) -> bool:
-                                    try:
-                                        mkt = str(t.get("market", "") or "")
-                                        if not mkt.startswith("KRW-"):
-                                            return True
-                                        base = mkt.split("-", 1)[1].upper()
-                                        if base in _UPBIT_STABLE_BASES:
-                                            return True
-                                        last = float(t.get("trade_price") or 0)
-                                        high = float(t.get("high_price") or 0)
-                                        low = float(t.get("low_price") or 0)
-                                        if last > 0 and high > 0 and low > 0:
-                                            if (high - low) / last < 0.005:
-                                                return True
-                                    except Exception:
-                                        return False
-                                    return False
-
-                                tickers_data = [t for t in tickers_data if not _upbit_skip(t)]
-                                scan_targets = [
-                                    x["market"]
-                                    for x in sorted(
-                                        tickers_data, key=lambda x: x.get("acc_trade_price_24h", 0), reverse=True
-                                    )[: max(1, UPBIT_UNIVERSE_TOP)]
-                                ]
-                                _ohlcv_pref = {}
-                        except Exception:
-                            scan_targets = []
-                            _ohlcv_pref = {}
-
-                        scan_targets = _sort_buy_targets_by_rs(scan_targets, "COIN")
-
-                        print(
-                            f"  -> 🪙 코인 실시간 수급 상위 {len(scan_targets)}개 정밀 분석 시작! "
-                            f"(매수 판단: V8→스윙, 국·미장과 동일)"
-                        )
-                        for idx, t in enumerate(scan_targets, 1):
-                            if in_ticker_cooldown(state, t):
-                                print(
-                                    f"  ⏭️ {t}: 매도 후 쿨다운(톱날 방지) 만료 "
-                                    f"{ticker_cooldown_human(state, t)} 이전 (패스)"
-                                )
-                                continue
-                            if in_cooldown(state, t):
-                                print(f"  ⏭️ {t}: 쿨다운 중 (패스)")
-                                continue
-                            if t in held_coins:
-                                print(f"  ⏭️ {get_coin_name(t)}({t}): 이미 보유중 (패스)")
-                                continue
-                            if order_idem.is_buy_inflight(state, "COIN", t, _buy_cycle_tag):
-                                print(f"  ⏭️ {get_coin_name(t)}({t}): 매수 TWAP 진행 중(멱등 패스)")
-                                continue
-                            ohlcv = _ohlcv_pref.get(t) if isinstance(_ohlcv_pref, dict) else None
-                            if not ohlcv or len(ohlcv) < 20:
-                                ohlcv = coin_broker.fetch_ohlcv(t, "day", 250)
-                            if not ohlcv or len(ohlcv) < 20:
-                                print(f"  ⏭️ {t}: OHLCV 데이터 부족 (패스)")
-                                continue
-
-                            strategy_type = "TREND_V8"
-                            entry_fib_level = 0.0
-                            is_buy, sl_p, s_name = calculate_pro_signals(
-                                ohlcv, coin_weather, t, get_coin_name(t), idx, len(scan_targets)
-                            )
-                            v8_ok = bool(is_buy) and _v8_trend_buy_allowed_in_weather(coin_weather)
-                            if bool(is_buy) and not v8_ok:
-                                print(
-                                    f"  ⏭️ {t}: BEAR 시장 — V8 신호 통과했으나 추세 매수 차단 (스윙만 허용)"
-                                )
-                            if v8_ok:
-                                print(f"  ✅ [V8-BUY] {t} 진입")
-                            else:
-                                live_px_coin = float(coin_broker.get_current_price(t) or 0.0)
-                                sw_ok, sw_fib, sw_why = check_swing_entry(
-                                    pd.DataFrame(ohlcv),
-                                    market="COIN",
-                                    reference_close=live_px_coin if live_px_coin > 0 else None,
-                                )
-                                if sw_ok:
-                                    strategy_type = "SWING_FIB"
-                                    entry_fib_level = float(sw_fib)
-                                    _sw_o = float(ohlcv[-1].get("o", 0) or 0)
-                                    _sw_c = live_px_coin if live_px_coin > 0 else float(ohlcv[-1].get("c", 0) or 0)
-                                    sl_p = swing_entry_sl_p(_sw_c, sw_fib)
-                                    s_name = "SWING_FIB"
-                                    _sw_src = "실시간" if live_px_coin > 0 else "일봉종가"
-                                    print(
-                                        f"  ✅ [SWING-BUY] {t} entry_fib={entry_fib_level:,.2f} "
-                                        f"| 양봉({_sw_src} 시가 {_sw_o:,.0f} < 종가 {_sw_c:,.0f})"
-                                        f"{' | BEAR 시장 스윙 예외' if coin_weather == WEATHER_LABEL_BEAR else ''}"
-                                    )
-                                else:
-                                    _cn = get_coin_name(t)
-                                    _prog = f"[{idx}/{len(scan_targets)}]" if scan_targets else ""
-                                    _disp = f"{_cn}({t})" if _cn and _cn != t else t
-                                    print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
-                                    continue
-
-                            base_ratio = 1.0 / max(1, int(MAX_POSITIONS_COIN))
-                            ratio, t_name = _position_ratio_with_vol_target(
-                                base_ratio,
-                                ohlcv,
-                                target_vol=_alpha_target_vol,
-                                ticker=t,
-                            )
-
-                            _prospect_atr = atr_pct_from_ohlcv(ohlcv, t)
-                            _mkt_heat, _heat_blocked = _portfolio_heat_snapshot(
-                                state,
-                                "COIN",
-                                total_coin_equity,
-                                lambda tk, _cb=coin_broker: _cb.fetch_ohlcv(tk, "day", 200),
-                                extra_weight=float(ratio),
-                                extra_atr_pct=float(_prospect_atr or 0.0),
-                            )
-                            if _heat_blocked:
-                                _log_portfolio_heat_block("COIN", _mkt_heat, prospective=True)
-                                continue
-
-                            budget = total_coin_equity * ratio * macro_mult
-                            coin_min_budget = _coin_min_order_krw()
-
-                            if budget < coin_min_budget:
-                                print(
-                                    f"  ⏭️ {t}: [COIN 예산 부족] 배정예산 {int(budget):,}원 < "
-                                    f"최소 {int(coin_min_budget):,}원 (총평가 {int(total_coin_equity):,}원×비중·macro, 주문가능 {int(krw_bal):,}원)"
-                                )
-                                continue
-                            if krw_bal < coin_min_budget:
-                                print(
-                                    f"  ⏭️ {t}: [COIN 예수금 부족] 주문가능 {int(krw_bal):,}원 < 최소 {int(coin_min_budget):,}원 — 매수 불가"
-                                )
-                                continue
-                            if krw_bal < budget:
-                                print(f"  🧹 [코인 영끌 발동] {t}: 예산({int(budget):,}원) 부족. 지갑에 남은 전액({int(krw_bal):,}원) 풀매수 장전!")
-                                budget = krw_bal
-
-                            if not can_open_new(t, state, max_positions=MAX_POSITIONS_COIN):
-                                print(f"  ⏭️ {t}: 포지션 개수 초과 ({MAX_POSITIONS_COIN}개) (패스)")
-                                continue
-
-                            if budget < coin_min_budget:
-                                print(
-                                    f"  ⏭️ {t}: [COIN 예산 부족] 영끌 후 {int(budget):,}원 < 최소 {int(coin_min_budget):,}원 (패스)"
-                                )
-                                continue
-
-                            if not _ai_false_breakout_buy_gate(
-                                t,
-                                "COIN",
-                                strategy_type,
-                                AI_FALSE_BREAKOUT_THRESHOLD_COIN,
-                                f"{get_coin_name(t)}({t})",
-                            ):
-                                continue
-
-                            krw_box = [float(krw_bal)]
-                            entry_atr = float(get_safe_atr(t, ohlcv) or 0.0)
-                            ok_coin_buy = _execute_coin_market_buy_twap(
-                                t,
-                                float(budget),
-                                sl_p,
-                                entry_atr,
-                                s_name,
-                                state,
-                                krw_box,
-                                held_coins,
-                                strategy_type=strategy_type,
-                                entry_fib_level=entry_fib_level,
-                            )
-                            if not ok_coin_buy:
-                                print(
-                                    f"  ⏭️ {t}: [COIN 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
-                                    f"예산 {int(budget):,}원, 주문가능 추정 {int(krw_box[0]):,}원 (TWAP·최소주문·업비트 응답 확인)"
-                                )
-                            else:
-                                _cycle_buy_fills += 1
-                                _register_swing_risk_after_buy(state, t, ohlcv, "COIN")
-                            krw_bal = float(krw_box[0])
-    else:
-        print("💤 코인은 점검 또는 데이터 조회 불가 상태입니다.")
 
     if (_cycle_buy_zone_kr or _cycle_buy_zone_us or _cycle_buy_zone_coin) and _cycle_buy_fills == 0:
         _buy_pass_zones = []

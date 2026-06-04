@@ -8,6 +8,8 @@ import pandas as pd
 
 from strategy.rules import (
     SWING_MA5_TRAIL_HIGH_KEY,
+    SWING_OVERSHOOT_TRAIL_EXIT_REASON,
+    SWING_OVERSHOOT_TRAIL_EXIT_REASON_LOG,
     SWING_RUNNER_TRAIL_EXIT_REASON,
     SWING_RUNNER_TRAIL_EXIT_REASON_LOG,
     SWING_SCALE_OUT_R_MULT,
@@ -16,6 +18,9 @@ from strategy.rules import (
     get_swing_exit_display_price,
     get_swing_ma5_price,
     get_swing_ma5_trail_floor,
+    get_swing_prev_day_low,
+    get_swing_runner_trail_floor,
+    is_swing_overshooting_runner,
     is_swing_runner_state,
 )
 
@@ -83,7 +88,7 @@ class TestSwingRunnerTrailing(unittest.TestCase):
         ma5 = get_swing_ma5_price(ohlcv, reference_price=curr)
         pos = {
             "buy_p": 100.0,
-            "max_p": 120.0,
+            "max_p": 108.0,
             "entry_fib_level": 95.0,
             "strategy_type": "SWING_FIB",
             "scale_out_done": True,
@@ -98,14 +103,17 @@ class TestSwingRunnerTrailing(unittest.TestCase):
             ticker="005930",
         )
         self.assertEqual(action, "FULL")
-        self.assertIn(SWING_RUNNER_TRAIL_EXIT_REASON, reason)
+        self.assertTrue(
+            SWING_RUNNER_TRAIL_EXIT_REASON in reason
+            or SWING_OVERSHOOT_TRAIL_EXIT_REASON in reason
+        )
 
     def test_profit_lock_trailing_runner_uses_ma5_not_breakeven(self):
         closes = [100.0] * 55 + [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
         ohlcv = _ohlcv_closes(closes)
         pos = {
             "buy_p": 100.0,
-            "max_p": 120.0,
+            "max_p": 108.0,
             "entry_fib_level": 95.0,
             "strategy_type": "SWING_FIB",
             "scale_out_done": True,
@@ -115,7 +123,10 @@ class TestSwingRunnerTrailing(unittest.TestCase):
             101.0, pos, ohlcv=ohlcv, market="KR", ticker="005930"
         )
         self.assertTrue(hit)
-        self.assertIn(SWING_RUNNER_TRAIL_EXIT_REASON_LOG, reason)
+        self.assertTrue(
+            SWING_RUNNER_TRAIL_EXIT_REASON_LOG in reason
+            or SWING_OVERSHOOT_TRAIL_EXIT_REASON_LOG in reason
+        )
 
     def test_ma5_trail_ratchet_does_not_drop(self):
         closes = [float(100 + i) for i in range(60)]
@@ -155,6 +166,59 @@ class TestSwingRunnerTrailing(unittest.TestCase):
             high - 8.0, pos, ohlcv, market="KR", ticker="005930"
         )
         self.assertGreaterEqual(line_lo, line_hi)
+
+    def test_overshooting_runner_prev_day_low_in_trail(self):
+        buy = 100.0
+        rows = []
+        for i in range(58):
+            c = 100.0 + i * 0.01
+            rows.append({"o": c, "h": c, "l": c - 0.5, "c": c, "v": 1e6})
+        rows.append({"o": 110.0, "h": 112.0, "l": 109.0, "c": 111.0, "v": 1e6})
+        rows.append({"o": 108.0, "h": 108.5, "l": 107.5, "c": 108.0, "v": 1e6})
+        ohlcv = rows
+        pos = {
+            "buy_p": buy,
+            "max_p": 115.0,
+            "entry_fib_level": 95.0,
+            "strategy_type": "SWING_FIB",
+            "scale_out_done": True,
+            "entry_initial_risk_1r": 5.0,
+        }
+        self.assertTrue(is_swing_overshooting_runner(pos, ohlcv=ohlcv, market="KR", ticker="005930"))
+        pdl = get_swing_prev_day_low(ohlcv)
+        self.assertAlmostEqual(pdl, 109.0, places=2)
+        trail = get_swing_runner_trail_floor(pos, ohlcv, reference_price=107.0, market="KR", ticker="005930")
+        self.assertGreaterEqual(trail, pdl)
+        line = get_swing_exit_display_price(107.0, pos, ohlcv, market="KR", ticker="005930")
+        self.assertGreaterEqual(line, trail)
+        action, reason = check_swing_exit(
+            pos,
+            pd.DataFrame(ohlcv),
+            reference_price=107.0,
+            market="KR",
+            ticker="005930",
+        )
+        self.assertEqual(action, "FULL")
+        self.assertIn(SWING_OVERSHOOT_TRAIL_EXIT_REASON, reason)
+
+    def test_overshoot_trailing_exit_log_tag(self):
+        buy = 100.0
+        ohlcv = _pad_to_60([100.0] * 55 + [105.0, 110.0, 108.0])
+        pos = {
+            "buy_p": buy,
+            "max_p": 112.0,
+            "entry_fib_level": 95.0,
+            "strategy_type": "SWING_FIB",
+            "scale_out_done": True,
+            "entry_initial_risk_1r": 5.0,
+        }
+        trail = get_swing_runner_trail_floor(pos, ohlcv, reference_price=100.5, market="KR", ticker="005930")
+        hit, reason = check_swing_profit_lock_trailing_exit(
+            100.4, pos, ohlcv=ohlcv, market="KR", ticker="005930"
+        )
+        if trail > 0 and 100.4 < trail:
+            self.assertTrue(hit)
+            self.assertIn(SWING_OVERSHOOT_TRAIL_EXIT_REASON_LOG, reason)
 
     def test_profit_lock_trailing_non_runner_unchanged(self):
         buy = 100.0

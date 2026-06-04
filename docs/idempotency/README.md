@@ -14,6 +14,7 @@
 | [SELL_LANES.md](./SELL_LANES.md) | 매도 경로(lane)별 멱등 키·기존 방어와 비교 |
 | [ANALYSIS.md](./ANALYSIS.md) | 최초 멱등 분석 요약(매수·매도 위험 구간) |
 | [BALANCE_READS.md](./BALANCE_READS.md) | 잔고 조회 TTL·스냅샷 (주문 멱등과 분리) |
+| [../KIS_GUI_DISPLAY.md](../KIS_GUI_DISPLAY.md) | GUI 국·미 라벨 · KIS 강제 새로고침 · 로그 |
 | [SMOKE_TEST.md](./SMOKE_TEST.md) | 실계좌 스모크 체크리스트 |
 | [LEDGER_RECONCILE.md](./LEDGER_RECONCILE.md) | positions ↔ 멱등 정합·저장 재시도 |
 

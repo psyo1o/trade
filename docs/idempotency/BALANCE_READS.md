@@ -64,5 +64,25 @@ run_gui.py
 
 ## 설정
 
-- 기본 TTL: **12초** (`balance_read._DEFAULT_TTL_SEC`)
+- 기본 TTL: **20초** (`BOT_KIS_BALANCE_CACHE_TTL_SEC`, `execution/balance_read.cache_ttl_sec`)
+- 최소 API 간격: **2.5초** (`BOT_KIS_BALANCE_MIN_INTERVAL_SEC`) — 짧은 시간 중복 KIS 호출 억제
+- 한도·오류 시: 직전 정상 응답 **stale** 최대 90초 (`BOT_KIS_BALANCE_STALE_SEC`)
 - 체결 검증 허용 오차: **85%** (`idempotency.balance_suggests_fill` / `balance_suggests_sell_fill`)
+
+## KIS 잔고 `on_trade` (표시 vs 매매)
+
+봇 전용 매매 가정 시 **평상시 GUI·사이클은 장부+현재가**로 예수·총평을 보고, **실 KIS 잔고**는 매수 창·체결·강제 새로고침·입출금 때만 호출한다.
+
+- 정책: `execution/balance_policy.py`, `kis_balance_sync_mode` in `config.json`
+- 장부 합산: `services/ledger_valuation.py` (`coalesce_ledger_kis_labels` — 예수·총평 이중 합산 방지)
+- Phase5·서킷·쿨다운: [`../PHASE5_ACCOUNT_CIRCUIT.md`](../PHASE5_ACCOUNT_CIRCUIT.md)
+- **GUI 강제 새로고침·로그·비장중 방어:** [`../KIS_GUI_DISPLAY.md`](../KIS_GUI_DISPLAY.md)
+
+`get_balance_with_retry()` / `get_us_positions_with_retry()` 는 내부적으로 `balance_read.kr_balance_raw` 를 탄다. `refresh=True` 이면 반드시 실 API(백오프·캐시 갱신).
+
+### 로그 접두사 (GUI)
+
+| 접두사 | 의미 |
+|--------|------|
+| `🔁 [KIS 강제 새로고침]` | KIS 실조회 + `last_kis_display_snapshot` 저장 |
+| `[표시] 장부+시세` | KIS 국·미 잔고 생략, 직전 KIS 스냅샷 예수 + 장부 보유평가 |

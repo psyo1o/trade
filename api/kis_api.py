@@ -383,6 +383,13 @@ def get_ohlcv_kis_us_daily(broker, ticker: str, exchange: str | None = None) -> 
                 if not isinstance(item, dict):
                     continue
                 try:
+                    d_raw = str(
+                        item.get("xymd")
+                        or item.get("stck_bsop_date")
+                        or item.get("date")
+                        or ""
+                    ).strip()
+                    d_key = d_raw[:8] if len(d_raw) >= 8 and d_raw[:8].isdigit() else ""
                     c = float(
                         item.get("clos")
                         or item.get("close")
@@ -392,15 +399,16 @@ def get_ohlcv_kis_us_daily(broker, ticker: str, exchange: str | None = None) -> 
                     )
                     if c <= 0:
                         continue
-                    page_rows.append(
-                        {
-                            "o": float(item.get("open") or item.get("stck_oprc") or c),
-                            "h": float(item.get("high") or item.get("stck_hgpr") or c),
-                            "l": float(item.get("low") or item.get("stck_lwpr") or c),
-                            "c": c,
-                            "v": float(item.get("tvol") or item.get("acml_vol") or item.get("volume") or 0),
-                        }
-                    )
+                    row = {
+                        "o": float(item.get("open") or item.get("stck_oprc") or c),
+                        "h": float(item.get("high") or item.get("stck_hgpr") or c),
+                        "l": float(item.get("low") or item.get("stck_lwpr") or c),
+                        "c": c,
+                        "v": float(item.get("tvol") or item.get("acml_vol") or item.get("volume") or 0),
+                    }
+                    if d_key:
+                        row["d"] = d_key
+                    page_rows.append(row)
                 except (TypeError, ValueError):
                     continue
             if not page_rows:
@@ -425,9 +433,19 @@ def get_ohlcv_kis_us_daily(broker, ticker: str, exchange: str | None = None) -> 
             except ValueError:
                 break
         if len(rows_acc) >= 14:
-            all_rows = rows_acc
-            if len(all_rows) > 260:
-                all_rows = all_rows[-260:]
+            try:
+                from utils.ohlcv_store import finalize_ohlcv_daily
+
+                all_rows = finalize_ohlcv_daily(
+                    rows_acc, ticker=sym, source=f"KIS 해외 {excd}"
+                )
+                if not all_rows:
+                    print(
+                        f"     ⚠️ [{sym}] KIS 해외 일봉 순서/최신성 이상 — 재페이지 생략 (EXCD={excd})"
+                    )
+                    continue
+            except Exception:
+                all_rows = rows_acc[-260:] if len(rows_acc) > 260 else rows_acc
             print(f"     ✅ [{sym}] KIS 해외 일봉 {len(all_rows)}봉 (EXCD={excd})")
             return all_rows
     return []
@@ -592,23 +610,22 @@ def execute_us_order_direct(broker, side, ticker, qty, price):
         return {"rt_cd": "1", "msg1": str(e)}
 
 
-def get_balance_with_retry():
-    """국내 잔고 조회 (재시도 포함, tr_cont 에러 우회)"""
+def _fetch_kr_balance_uncached():
+    """국내 잔고 API 1회 (캐시 없음, tr_cont 에러 우회)."""
     try:
         return broker_kr.fetch_balance()
     except KeyError as e:
         if str(e) == "'tr_cont'":
-            # mojito 라이브러리의 헤더 버그 우회 - 직접 API 호출
             try:
-                access_token = broker_kr.access_token if broker_kr else ''
-                cano, prdt_cd = _split_account_no(_cfg.get('kis_account', ''))
+                access_token = broker_kr.access_token if broker_kr else ""
+                cano, prdt_cd = _split_account_no(_cfg.get("kis_account", ""))
                 url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance"
                 headers = {
                     "content-type": "application/json; charset=utf-8",
                     "authorization": f"Bearer {access_token}",
-                    "appkey": _cfg['kis_key'],
-                    "appsecret": _cfg['kis_secret'],
-                    "tr_id": "TTTC8434R"
+                    "appkey": _cfg["kis_key"],
+                    "appsecret": _cfg["kis_secret"],
+                    "tr_id": "TTTC8434R",
                 }
                 params = {
                     "CANO": cano,
@@ -621,23 +638,77 @@ def get_balance_with_retry():
                     "FNCG_AMT_AUTO_RDPT_YN": "N",
                     "PRCS_DVSN": "00",
                     "CTX_AREA_FK100": "",
-                    "CTX_AREA_NK100": ""
+                    "CTX_AREA_NK100": "",
                 }
-                res = requests.get(url, headers=headers, params=params)
+                res = requests.get(url, headers=headers, params=params, timeout=12)
                 return res.json()
-            except Exception:
+            except Exception as inner:
+                print(f"❌ [국장 조회 실패] tr_cont 우회 실패: {type(inner).__name__}: {inner}")
                 return {}
+        print(f"❌ [국장 조회 실패] KeyError: {e}")
         return {}
-    except Exception:
+    except Exception as e:
+        print(f"❌ [국장 조회 실패] {type(e).__name__}: {e}")
         return {}
 
 
-def get_us_positions_with_retry():
-    """미국 포지션 조회 (재시도 포함)"""
+def _fetch_kr_balance_with_backoff(*, max_attempts: int = 3, base_delay_sec: float = 1.2):
+    """국내 잔고 — KIS 한도·일시 오류 시 짧은 백오프 재시도."""
+    from api.kis_parsers import kis_response_transient
+    import time
+
+    last: dict = {}
+    for i in range(max(1, int(max_attempts))):
+        last = _fetch_kr_balance_uncached() or {}
+        if not kis_response_transient(last):
+            return last
+        if i < max_attempts - 1:
+            delay = float(base_delay_sec) * (i + 1)
+            print(
+                f"  ⚠️ [KR 잔고] KIS 일시 제한/오류 — {delay:.1f}s 후 재시도 ({i + 2}/{max_attempts})"
+            )
+            time.sleep(delay)
+    return last
+
+
+def _fetch_us_positions_uncached():
     try:
         return get_real_us_positions(broker_us)
-    except Exception:
+    except Exception as e:
+        print(f"❌ [미장 조회 실패] {type(e).__name__}: {e}")
         return {}
+
+
+def _fetch_us_positions_with_backoff(*, max_attempts: int = 3, base_delay_sec: float = 1.2):
+    from api.kis_parsers import kis_response_transient
+    import time
+
+    last: dict = {}
+    for i in range(max(1, int(max_attempts))):
+        last = _fetch_us_positions_uncached() or {}
+        if not kis_response_transient(last):
+            return last
+        if i < max_attempts - 1:
+            delay = float(base_delay_sec) * (i + 1)
+            print(
+                f"  ⚠️ [US 잔고] KIS 일시 제한/오류 — {delay:.1f}s 후 재시도 ({i + 2}/{max_attempts})"
+            )
+            time.sleep(delay)
+    return last
+
+
+def get_balance_with_retry(*, refresh: bool = False):
+    """국내 잔고 — TTL 캐시·호출 간격 제한(``execution.balance_read``)."""
+    from execution import balance_read as br
+
+    return br.kr_balance_raw(refresh=bool(refresh))
+
+
+def get_us_positions_with_retry(*, refresh: bool = False):
+    """미국 잔고 — TTL 캐시·호출 간격 제한."""
+    from execution import balance_read as br
+
+    return br.us_balance_raw(refresh=bool(refresh))
 
 
 def get_valid_order_price(price, is_buy=True, is_us=False):

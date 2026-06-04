@@ -58,20 +58,33 @@ def save_state_verified(
     context: str = "",
     verify_ticker: str | None = None,
     verify_removed: bool = False,
+    mutate_fn: Callable[[dict], None] | None = None,
 ) -> bool:
     """``save_state`` + reload. ``verify_ticker`` 있으면 positions 포함/삭제 여부 확인."""
     path = Path(state_path)
-    merge_disk_if_newer(state, path)
     ctx = str(context or "장부").strip()
+    tk = str(verify_ticker or "").strip()
+    pending_pos: dict | None = None
+    if tk and not verify_removed:
+        positions = state.get("positions")
+        if isinstance(positions, dict) and tk in positions and isinstance(positions[tk], dict):
+            pending_pos = dict(positions[tk])
 
     for attempt in range(1, 4):
+        merge_disk_if_newer(state, path)
+        if tk:
+            if verify_removed:
+                state.setdefault("positions", {}).pop(tk, None)
+            elif pending_pos is not None:
+                state.setdefault("positions", {})[tk] = pending_pos
+        if mutate_fn is not None:
+            mutate_fn(state)
         try:
             save_state(path, state)
             latest = load_state(path)
             if not isinstance(latest, dict):
                 print(f"  ⚠️ [{ctx}] 저장 후 로드 실패 (시도 {attempt}/3)")
-            elif verify_ticker:
-                tk = str(verify_ticker).strip()
+            elif tk:
                 pos = (latest.get("positions") or {}) if isinstance(latest.get("positions"), dict) else {}
                 if verify_removed:
                     if tk not in pos:
@@ -109,14 +122,13 @@ def persist_position_set(
         return False
     payload = dict(position_payload)
     state.setdefault("positions", {})[tk] = payload
-    if mutate_fn is not None:
-        mutate_fn(state)
     return save_state_verified(
         state,
         state_path,
         context=context or "장부 등록",
         verify_ticker=tk,
         verify_removed=False,
+        mutate_fn=mutate_fn,
     )
 
 
@@ -133,12 +145,11 @@ def persist_position_remove(
     if not tk:
         return False
     state.get("positions", {}).pop(tk, None)
-    if mutate_fn is not None:
-        mutate_fn(state)
     return save_state_verified(
         state,
         state_path,
         context=context or "장부 삭제",
         verify_ticker=tk,
         verify_removed=True,
+        mutate_fn=mutate_fn,
     )

@@ -30,6 +30,7 @@ _SUBMITTED_STALE_SEC = 90.0
 LANE_SWING_HALF = "swing_half"
 LANE_SWING_FULL = "swing_full"
 LANE_SCALE_OUT = "scale_out"
+LANE_SCALE_OUT_2 = "scale_out_2"
 LANE_EXIT = "exit"
 LANE_MANUAL = "manual"
 LANE_PHASE5 = "phase5"
@@ -1282,7 +1283,11 @@ def reconcile_positions_for_cycle(
     체결 성공 후 ``save_state`` 만 실패한 경우 사이클 시작·동기화 직후 호출.
     """
     from execution.ledger_apply import persist_position_remove, persist_position_set
-    from execution.scale_out import position_scale_out_done, post_partial_ledger
+    from execution.scale_out import (
+        position_scale_out_done,
+        position_second_scale_out_done,
+        post_partial_ledger,
+    )
 
     post_partial = post_partial_fn or post_partial_ledger
     fixes = 0
@@ -1317,17 +1322,25 @@ def reconcile_positions_for_cycle(
                 print(f"  🔧 [장부 정합] {ctx} — positions 삭제 반영")
             continue
 
-        if lane not in (LANE_SWING_HALF, LANE_SCALE_OUT):
+        if lane not in (LANE_SWING_HALF, LANE_SCALE_OUT, LANE_SCALE_OUT_2):
             continue
         if not isinstance(pos, dict):
             continue
-        if lane == LANE_SCALE_OUT and position_scale_out_done(pos):
+        if lane in (LANE_SCALE_OUT, LANE_SWING_HALF) and position_scale_out_done(pos):
+            continue
+        if lane == LANE_SCALE_OUT_2 and position_second_scale_out_done(pos):
             continue
         qty_b = float(pos.get("qty", 0) or 0)
         if qty_b <= 0:
             continue
-        set_so = lane == LANE_SCALE_OUT
-        new_pos = post_partial(pos, sold, px, qty_b, set_scale_out_done=set_so)
+        new_pos = post_partial(
+            pos,
+            sold,
+            px,
+            qty_b,
+            set_scale_out_done=(lane in (LANE_SCALE_OUT, LANE_SWING_HALF)),
+            set_second_scale_out_done=(lane == LANE_SCALE_OUT_2),
+        )
         ctx = f"정합 {lane} {mkt}:{tk}"
         if persist_position_set(state, tk, new_pos, context=ctx, state_path=state_path):
             fixes += 1
@@ -1347,7 +1360,11 @@ def reconcile_ticker_lane(
 ) -> bool:
     """단일 티커·lane — HALF/Scale-Out 게이트 직전 1회 보정."""
     from execution.ledger_apply import persist_position_remove, persist_position_set
-    from execution.scale_out import position_scale_out_done, post_partial_ledger
+    from execution.scale_out import (
+        position_scale_out_done,
+        position_second_scale_out_done,
+        post_partial_ledger,
+    )
 
     post_partial = post_partial_fn or post_partial_ledger
     m = str(market or "").strip().upper()
@@ -1373,12 +1390,21 @@ def reconcile_ticker_lane(
     pos = positions.get(t)
     if not isinstance(pos, dict):
         return False
-    if ln == LANE_SCALE_OUT and position_scale_out_done(pos):
+    if ln in (LANE_SCALE_OUT, LANE_SWING_HALF) and position_scale_out_done(pos):
+        return False
+    if ln == LANE_SCALE_OUT_2 and position_second_scale_out_done(pos):
         return False
     qty_b = float(pos.get("qty", 0) or 0)
     if qty_b <= 0:
         return False
-    new_pos = post_partial(pos, sold, px, qty_b, set_scale_out_done=(ln == LANE_SCALE_OUT))
+    new_pos = post_partial(
+        pos,
+        sold,
+        px,
+        qty_b,
+        set_scale_out_done=(ln in (LANE_SCALE_OUT, LANE_SWING_HALF)),
+        set_second_scale_out_done=(ln == LANE_SCALE_OUT_2),
+    )
     ctx = f"정합 {ln} {m}:{t}"
     ok = persist_position_set(state, t, new_pos, context=ctx, state_path=state_path)
     if ok:

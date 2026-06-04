@@ -40,7 +40,7 @@ from pathlib import Path
 import pandas as pd
 
 from api import coin_broker, coin_config
-from api.kis_api import get_balance_with_retry, get_us_positions_with_retry
+from execution import balance_read as bal_read
 from execution.guard import save_state
 from strategy.rules import get_ohlcv_yfinance
 from utils.helpers import (
@@ -166,7 +166,7 @@ def _get_live_position_seeds(*, skip_kr: bool = False, skip_us: bool = False):
     # ===== 🇰🇷 국장 (KIS 점검 구간이면 API 미호출) =====
     if (not skip_kr) and (not kis_equities_weekend_suppress_window_kst()):
         try:
-            kr_bal = ensure_dict(get_balance_with_retry())
+            kr_bal = ensure_dict(bal_read.kr_balance_raw(refresh=False))
             output1 = kr_bal.get('output1', []) if isinstance(kr_bal.get('output1'), list) else []
             for stock in output1:
                 code = normalize_ticker(stock.get('pdno', ''))
@@ -189,7 +189,7 @@ def _get_live_position_seeds(*, skip_kr: bool = False, skip_us: bool = False):
     # ===== 🇺🇸 미장 (KIS 점검 구간이면 API 미호출) =====
     if (not skip_us) and (not kis_equities_weekend_suppress_window_kst()):
         try:
-            us_bal = ensure_dict(get_us_positions_with_retry())
+            us_bal = ensure_dict(bal_read.us_balance_raw(refresh=False))
             output1 = us_bal.get('output1', []) if isinstance(us_bal.get('output1'), list) else []
             for stock in output1:
                 code = normalize_ticker(stock.get('ovrs_pdno', stock.get('pdno', '')))
@@ -232,7 +232,15 @@ def _get_live_position_seeds(*, skip_kr: bool = False, skip_us: bool = False):
     return seeds
 
 
-def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
+def sync_all_positions(
+    state,
+    held_kr,
+    held_us,
+    held_coins,
+    state_path=None,
+    *,
+    force_equity_sync: bool = False,
+):
     """국장/미장/코인 통합 장부 정리
     1) 실보유인데 장부에 없는 종목은 즉시 등록
     2) 장부에만 있고 실보유가 아닌 유령종목 삭제
@@ -251,8 +259,8 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
 
     kr_open = bool(_rb.is_market_open("KR"))
     us_open = bool(_rb.is_market_open("US"))
-    skip_kr_sync = not kr_open
-    skip_us_sync = not us_open
+    skip_kr_sync = (not kr_open) and (not force_equity_sync)
+    skip_us_sync = (not us_open) and (not force_equity_sync)
     if skip_kr_sync or skip_us_sync:
         parts = []
         if skip_kr_sync:
@@ -262,6 +270,10 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
         print(
             f"  💤 [휴장] {'·'.join(parts)} 휴장 — KIS 시드·평단보정·유령삭제·주식 자동복구 생략 "
             f"(장부 유지). 코인은 동기화 계속."
+        )
+    elif force_equity_sync and (not kr_open or not us_open):
+        print(
+            "  🔁 [장부 동기화] KIS 강제 새로고침 — 비장중에도 국·미 KIS 보유·자동복구 수행"
         )
 
     # 비장중 KIS가 빈 보유([])를 주면 held_kr_set 이 비어 장부 국장·미장 줄이 유령으로 몰릴 수 있다.
@@ -371,18 +383,42 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
         if ticker not in current_positions:
             if real_avg_p <= 0 and is_coin_ticker(ticker):
                 continue
-            # 신규 복구 로직: 코인과 주식 데이터 수집 분리
+            # 신규 복구: trade_history BUY 우선, 없으면 ATR 자동복구
             if is_coin_ticker(ticker):
                 ohlcv = coin_broker.fetch_ohlcv(ticker, "day", 30)
             else:
-                # 주식(국장/미장)은 기존대로 yfinance 사용
                 ohlcv = get_ohlcv_yfinance(ticker)
-                
+
+            mkt = "KR" if str(ticker).isdigit() else ("COIN" if is_coin_ticker(ticker) else "US")
+            from services.trade_history_ledger import (
+                build_recovered_position_from_history,
+                enrich_position_from_buy_history,
+            )
+
+            hist_row = build_recovered_position_from_history(
+                ticker,
+                mkt,
+                live_avg_p=real_avg_p,
+                live_qty=live_qty,
+                ohlcv=ohlcv,
+            )
+            if hist_row:
+                current_positions[ticker] = hist_row
+                name = get_kr_company_name(ticker) if ticker.isdigit() else (
+                    ticker if is_coin_ticker(ticker) else get_us_company_name(ticker)
+                )
+                print(
+                    f"  -> 🚨 [매매내역 복구] {name}({ticker}) 장부 등록 "
+                    f"(평단={real_avg_p:,.2f}, 전략={hist_row.get('tier', '?')})"
+                )
+                changes_made = True
+                recovered_count += 1
+                continue
+
             atr = calculate_atr(ohlcv)
             sl_p = real_avg_p - (atr * 2.5) if atr > 0 else real_avg_p * 0.90
             tier = "자동복구(V5.0손절-매수가)" if atr > 0 else "자동복구(-10%손절)"
 
-            mkt = "KR" if str(ticker).isdigit() else ("COIN" if is_coin_ticker(ticker) else "US")
             buy_from_hist = _last_buy_timestamp_from_trade_history(ticker, mkt)
             buy_date_val = buy_from_hist if buy_from_hist else datetime.now().isoformat()
 
@@ -396,6 +432,9 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
             }
             if live_qty > 0:
                 row["qty"] = float(live_qty)
+            enrich_position_from_buy_history(
+                row, ticker, mkt, ohlcv=ohlcv, live_qty=live_qty, live_avg_p=real_avg_p
+            )
             current_positions[ticker] = row
             name = get_kr_company_name(ticker) if ticker.isdigit() else (ticker if is_coin_ticker(ticker) else get_us_company_name(ticker))
             bd_note = f"매수일=trade_history" if buy_from_hist else "매수일=복구시각(히스토리 없음)"
@@ -423,6 +462,43 @@ def sync_all_positions(state, held_kr, held_us, held_coins, state_path=None):
                 if abs(pq - live_qty) > 1e-8:
                     pos["qty"] = float(live_qty)
                     changes_made = True
+
+    # -----------------------------------------------------------------
+    # 1.5) trade_history BUY 로 스윙·buy_time·entry_fib 등 보강
+    # -----------------------------------------------------------------
+    from services.trade_history_ledger import (
+        enrich_position_from_buy_history,
+        position_needs_history_enrich,
+    )
+
+    for ticker in list(current_positions.keys()):
+        pos = current_positions.get(ticker)
+        if not isinstance(pos, dict) or not position_needs_history_enrich(pos):
+            continue
+        if str(ticker).isdigit() and skip_kr_sync and not force_equity_sync:
+            continue
+        if (not str(ticker).isdigit()) and (not is_coin_ticker(str(ticker))) and skip_us_sync and not force_equity_sync:
+            continue
+        mkt = "KR" if str(ticker).isdigit() else ("COIN" if is_coin_ticker(ticker) else "US")
+        seed = live_seeds.get(ticker) or {}
+        try:
+            if is_coin_ticker(ticker):
+                ohlcv = coin_broker.fetch_ohlcv(ticker, "day", 30)
+            else:
+                ohlcv = get_ohlcv_yfinance(ticker)
+        except Exception:
+            ohlcv = None
+        if enrich_position_from_buy_history(
+            pos,
+            ticker,
+            mkt,
+            ohlcv=ohlcv,
+            live_qty=float(seed.get("qty", pos.get("qty", 0)) or 0) or None,
+            live_avg_p=float(seed.get("avg_p", pos.get("buy_p", 0)) or 0) or None,
+        ):
+            current_positions[ticker] = pos
+            print(f"  -> 📜 [매매내역 보강] {ticker} — buy_time·SWING·손절 메타 복구")
+            changes_made = True
 
     # -----------------------------------------------------------------
     # 2) 유령 제거: 장부에만 있고 계좌에 없는 종목은 삭제

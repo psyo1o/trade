@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import unittest
 
-from run_bot import _new_buy_sell_protection_blocks
+from run_bot import _new_buy_sell_protection_blocks, _resolve_sell_loop_strategy_type
 from strategy.rules import (
     BREAKEVEN_LOCK_MULT,
     SWING_PROFIT_LOCK_ACTIVATE_PCT,
@@ -15,6 +15,19 @@ from strategy.rules import (
     get_swing_profit_lock_floor,
     swing_entry_sl_p,
 )
+
+
+class TestSellLoopStrategyIsolation(unittest.TestCase):
+    def test_tier_swing_fib_without_strategy_type(self):
+        pos = {"tier": "SWING_FIB", "buy_p": 100.0}
+        self.assertEqual(_resolve_sell_loop_strategy_type(pos), "SWING_FIB")
+
+    def test_missing_fields_defaults_v8(self):
+        self.assertEqual(_resolve_sell_loop_strategy_type({}), "TREND_V8")
+
+    def test_explicit_v8(self):
+        pos = {"strategy_type": "TREND_V8", "tier": "1/3"}
+        self.assertEqual(_resolve_sell_loop_strategy_type(pos), "TREND_V8")
 
 
 class TestBuySellProtection(unittest.TestCase):

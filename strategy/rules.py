@@ -141,25 +141,38 @@ def get_ohlcv_pykrx(ticker: str) -> list:
         if df is None or df.empty:
             return []
         rows = []
-        for _, row in df.iterrows():
+        for idx, row in df.iterrows():
             try:
                 c = float(row["종가"])
                 if c <= 0:
                     continue
-                rows.append(
-                    {
-                        "o": float(row["시가"]),
-                        "h": float(row["고가"]),
-                        "l": float(row["저가"]),
-                        "c": c,
-                        "v": float(row["거래량"]),
-                    }
-                )
+                try:
+                    d_key = idx.strftime("%Y%m%d")
+                except Exception:
+                    d_key = str(idx)[:10].replace("-", "")[:8]
+                bar = {
+                    "o": float(row["시가"]),
+                    "h": float(row["고가"]),
+                    "l": float(row["저가"]),
+                    "c": c,
+                    "v": float(row["거래량"]),
+                }
+                if len(d_key) >= 8 and d_key[:8].isdigit():
+                    bar["d"] = d_key[:8]
+                rows.append(bar)
             except (TypeError, ValueError, KeyError):
                 continue
-        if rows:
-            print(f"     ✅ [{code}] pykrx 일봉 {len(rows)}봉")
-        return rows
+        try:
+            from utils.ohlcv_store import finalize_ohlcv_daily
+
+            out = finalize_ohlcv_daily(rows, ticker=code, source="pykrx")
+            if out:
+                print(f"     ✅ [{code}] pykrx 일봉 {len(out)}봉")
+            return out
+        except Exception:
+            if rows:
+                print(f"     ✅ [{code}] pykrx 일봉 {len(rows)}봉")
+            return rows
     except Exception as e:
         print(f"     ⚠️ [{code}] pykrx 조회 실패: {type(e).__name__}: {e}")
         return []
@@ -351,18 +364,41 @@ def get_ohlcv_kis_domestic_daily(broker, ticker):
             return []
 
         rows = []
-        for item in reversed(output2):
+        for item in output2:
+            if not isinstance(item, dict):
+                continue
             try:
-                rows.append({
-                    "o": float(item.get("open", item.get("stck_oprc", 0))),
-                    "h": float(item.get("high", item.get("stck_hgpr", 0))),
-                    "l": float(item.get("low", item.get("stck_lwpr", 0))),
-                    "c": float(item.get("close", item.get("stck_clpr", 0))),
-                    "v": float(item.get("volume", item.get("acml_vol", 0))),
-                })
+                d_raw = str(
+                    item.get("stck_bsop_date")
+                    or item.get("bsop_date")
+                    or item.get("date")
+                    or ""
+                ).strip()
+                d_key = d_raw[:8] if len(d_raw) >= 8 and d_raw[:8].isdigit() else ""
+                c = float(item.get("close", item.get("stck_clpr", 0)) or 0)
+                if c <= 0:
+                    continue
+                row = {
+                    "o": float(item.get("open", item.get("stck_oprc", 0)) or c),
+                    "h": float(item.get("high", item.get("stck_hgpr", 0)) or c),
+                    "l": float(item.get("low", item.get("stck_lwpr", 0)) or c),
+                    "c": c,
+                    "v": float(item.get("volume", item.get("acml_vol", 0)) or 0),
+                }
+                if d_key:
+                    row["d"] = d_key
+                rows.append(row)
             except (ValueError, TypeError):
                 continue
-        return rows
+        try:
+            from utils.ohlcv_store import finalize_ohlcv_daily
+
+            out = finalize_ohlcv_daily(rows, ticker=str(ticker), source="KIS 국내")
+            if out:
+                print(f"     ✅ [{ticker}] KIS 국내 일봉 {len(out)}봉")
+            return out
+        except Exception:
+            return rows
     except Exception as e:
         print(f"     🔴 get_ohlcv_kis_domestic_daily({ticker}) → 예외: {type(e).__name__}: {e}")
         return []
@@ -971,6 +1007,10 @@ SWING_SCALE_OUT_R_MULT = 1.5
 SWING_RUNNER_TRAIL_MA_DAYS = 5
 SWING_RUNNER_TRAIL_EXIT_REASON = "5MA 트레일링 이탈"
 SWING_RUNNER_TRAIL_EXIT_REASON_LOG = "[SWING-SELL] 5MA 트레일링 이탈"
+# 오버슈팅 러너: max_p 최고수익 ≥ 이 값(%) → 전일 저가(Bar-by-Bar) 트레일 추가
+SWING_OVERSHOOT_MAX_PROFIT_ACTIVATE_PCT = 10.0
+SWING_OVERSHOOT_TRAIL_EXIT_REASON = "오버슈팅 캔들 트레일링 이탈"
+SWING_OVERSHOOT_TRAIL_EXIT_REASON_LOG = "[SWING-SELL] 오버슈팅 캔들 트레일링 이탈"
 # 장부 키 — 스윙 통합 매도선·러너 5MA 트레일 고점(한 번 올라간 값은 유지)
 SWING_EXIT_HIGH_WATER_KEY = "swing_exit_high_water"
 SWING_MA5_TRAIL_HIGH_KEY = "swing_ma5_trail_high"
@@ -1378,6 +1418,64 @@ def get_swing_ma5_trail_floor(
     return _swing_ratchet_high(pos_info, SWING_MA5_TRAIL_HIGH_KEY, ma5)
 
 
+def get_swing_prev_day_low(ohlcv) -> float:
+    """직전 영업일 일봉 저가 (``ohlcv[-2].l``)."""
+    w = _swing_ohlcv_working_df(ohlcv)
+    if w is None or len(w) < 2:
+        return 0.0
+    try:
+        lo = float(w.iloc[-2]["l"])
+    except (TypeError, ValueError, KeyError, IndexError):
+        return 0.0
+    return lo if lo > 0 and np.isfinite(lo) else 0.0
+
+
+def is_swing_overshooting_runner(
+    pos_info: dict,
+    *,
+    ohlcv=None,
+    market: str | None = None,
+    ticker: str | None = None,
+) -> bool:
+    """러너 + ``max_p`` 기준 최고 수익 ≥ ``SWING_OVERSHOOT_MAX_PROFIT_ACTIVATE_PCT``."""
+    if not is_swing_runner_state(
+        pos_info, ohlcv=ohlcv, market=market, ticker=ticker
+    ):
+        return False
+    buy = _swing_avg_price(pos_info if isinstance(pos_info, dict) else {})
+    if buy <= 0:
+        return False
+    p = pos_info if isinstance(pos_info, dict) else {}
+    max_p = _finite_price(p.get("max_p", buy), buy)
+    return _max_profit_rate_pct(buy, max_p) >= SWING_OVERSHOOT_MAX_PROFIT_ACTIVATE_PCT
+
+
+def get_swing_runner_trail_floor(
+    pos_info: dict,
+    ohlcv,
+    *,
+    reference_price: float | None = None,
+    market: str | None = None,
+    ticker: str | None = None,
+) -> float:
+    """
+    러너 트레일 바닥 — 기본 5MA 고점 래칫.
+
+    오버슈팅(러너·최고수익≥10%): ``max(5MA, 전일 저가)`` — 전일 저가가 5MA보다 빠르게 따라감.
+    """
+    ma5 = get_swing_ma5_trail_floor(pos_info, ohlcv, reference_price=reference_price)
+    if not is_swing_overshooting_runner(
+        pos_info, ohlcv=ohlcv, market=market, ticker=ticker
+    ):
+        return ma5
+    pdl = get_swing_prev_day_low(ohlcv)
+    if pdl <= 0:
+        return ma5
+    if ma5 <= 0:
+        return pdl
+    return max(ma5, pdl)
+
+
 def is_swing_runner_state(
     pos_info: dict,
     *,
@@ -1432,9 +1530,9 @@ def get_swing_exit_display_price(
     SWING_FIB **표시용 통합 매도선** (GUI·``sl_p``·로그).
 
     - 기본: ``max(하드스탑, 본절 락)`` (피보·구름·시간가중 + **max_p**>3% 시 평단×1.005, 락선은 하향 없음)
-    - 러너: ``max(기본, 5MA 고점 래칫)`` — 당일 5MA가 내려가도 매도선·청산 기준은 **이전 고점 유지**
+    - 러너: ``max(기본, 5MA 고점 래칫)`` — 오버슈팅(최고수익≥10%)이면 **+ 전일 저가**
     - 통합선: ``swing_exit_high_water`` 로 **한 번 올라간 매도선은 내려가지 않음**
-    - **실행:** 하드 FULL은 **당일** 피보·구름 바닥(구조 이탈), 5MA·표시는 래칫 · 비러너 락은 ``check_swing_profit_lock_trailing_exit``
+    - **실행:** 하드 FULL은 **당일** 피보·구름 바닥(구조 이탈), 러너 트레일은 ``get_swing_runner_trail_floor``
     """
     p = pos_info if isinstance(pos_info, dict) else {}
     cp = _finite_price(curr_p, 0.0)
@@ -1448,11 +1546,15 @@ def get_swing_exit_display_price(
     if profit_floor > 0:
         floors.append(profit_floor)
     if is_swing_runner_state(p, ohlcv=ohlcv, market=market, ticker=ticker):
-        ma5_trail = get_swing_ma5_trail_floor(
-            p, ohlcv, reference_price=cp if cp > 0 else None
+        runner_trail = get_swing_runner_trail_floor(
+            p,
+            ohlcv,
+            reference_price=cp if cp > 0 else None,
+            market=market,
+            ticker=ticker,
         )
-        if ma5_trail > 0:
-            floors.append(ma5_trail)
+        if runner_trail > 0:
+            floors.append(runner_trail)
     raw = _finite_price(max(floors), 0.0)
     if raw <= 0:
         return 0.0
@@ -1504,8 +1606,8 @@ def check_swing_exit(
     ``reference_price`` — 장중 실시간가(KIS 등). 없으면 당일 종가로 판정.
     HALF: 현재가 − 평단 ≥ ``SWING_SCALE_OUT_R_MULT`` × ``entry_initial_risk_1r`` (1.5R).
     FULL 하드스탑: 피보·구름 + 시간가중 바닥.
-    FULL 러너: 5MA 하향 이탈 (1차 익절 완료 또는 max_p≥1.5R).
-    RSI FULL: 수익 +1%~+10% 구간에서만.
+    FULL 러너: 5MA·(오버슈팅 시 전일 저가) 트레일 이탈.
+    RSI FULL: 수익 +1%~+10% 구간에서만 (오버슈팅≥10%는 RSI 미사용).
 
     Returns:
         ("FULL"|"HALF"|"HOLD", 사유)
@@ -1562,17 +1664,29 @@ def check_swing_exit(
                     f"목표≥{tgt_lbl}, 평단 {avg_price:,.0f} 수익 {profit_pct:+.2f}%)",
                 )
 
-    # 3) 러너 5MA 트레일링 FULL — 1차 익절·1.5R 이후 잔량
+    # 3) 러너 트레일링 FULL — 5MA (+ 오버슈팅 시 전일 저가)
     if is_swing_runner_state(
         pos_info, ohlcv=w, market=market, ticker=ticker
     ):
-        ma5 = get_swing_ma5_trail_floor(pos_info, w, reference_price=reference_price)
-        if ma5 > 0 and current_px < float(ma5):
+        trail = get_swing_runner_trail_floor(
+            pos_info, w, reference_price=reference_price, market=market, ticker=ticker
+        )
+        if trail > 0 and current_px < float(trail):
             cur_lbl = _format_swing_price_label(current_px, market=market, ticker=ticker)
-            ma5_lbl = _format_swing_price_label(ma5, market=market, ticker=ticker)
+            trail_lbl = _format_swing_price_label(trail, market=market, ticker=ticker)
+            if is_swing_overshooting_runner(
+                pos_info, ohlcv=w, market=market, ticker=ticker
+            ):
+                pdl = get_swing_prev_day_low(w)
+                pdl_lbl = _format_swing_price_label(pdl, market=market, ticker=ticker)
+                return (
+                    "FULL",
+                    f"{SWING_OVERSHOOT_TRAIL_EXIT_REASON} "
+                    f"(현재가: {cur_lbl} < 트레일: {trail_lbl}, 전일저가: {pdl_lbl})",
+                )
             return (
                 "FULL",
-                f"{SWING_RUNNER_TRAIL_EXIT_REASON} (현재가: {cur_lbl} < 5MA: {ma5_lbl})",
+                f"{SWING_RUNNER_TRAIL_EXIT_REASON} (현재가: {cur_lbl} < 5MA: {trail_lbl})",
             )
 
     # 4) RSI 데드크로스 FULL — +1% 이상 ~ +10% 미만만 (고수익은 수익 락·5MA 트레일링)
@@ -1606,7 +1720,7 @@ def check_swing_profit_lock_trailing_exit(
     """
     스윙 **트레일링 청산** (하드스탑·5MA FULL은 ``check_swing_exit`` 와 병행).
 
-    * **러너** — 5MA 하향 이탈 시 전량 (고정 본절 락 대신 5MA 바닥).
+    * **러너** — ``get_swing_runner_trail_floor`` 이탈 시 전량 (오버슈팅 시 전일 저가 포함).
     * **비러너** — 최고수익>3% 본절 락(평단×1.005) 이탈 시 전량.
     """
     p = pos_info if isinstance(pos_info, dict) else {}
@@ -1621,13 +1735,23 @@ def check_swing_profit_lock_trailing_exit(
     if is_swing_runner_state(
         p, ohlcv=ohlcv_ref, market=market, ticker=ticker
     ):
-        ma5 = get_swing_ma5_trail_floor(p, ohlcv_ref, reference_price=cp)
-        if ma5 > 0 and cp < float(ma5):
+        trail = get_swing_runner_trail_floor(
+            p, ohlcv_ref, reference_price=cp, market=market, ticker=ticker
+        )
+        if trail > 0 and cp < float(trail):
             cur_lbl = _format_swing_price_label(cp, market=market, ticker=ticker)
-            ma5_lbl = _format_swing_price_label(ma5, market=market, ticker=ticker)
+            trail_lbl = _format_swing_price_label(trail, market=market, ticker=ticker)
+            if is_swing_overshooting_runner(
+                p, ohlcv=ohlcv_ref, market=market, ticker=ticker
+            ):
+                return (
+                    True,
+                    f"{SWING_OVERSHOOT_TRAIL_EXIT_REASON_LOG} "
+                    f"(현재가: {cur_lbl} < 트레일: {trail_lbl})",
+                )
             return (
                 True,
-                f"{SWING_RUNNER_TRAIL_EXIT_REASON_LOG} (현재가: {cur_lbl} < 5MA: {ma5_lbl})",
+                f"{SWING_RUNNER_TRAIL_EXIT_REASON_LOG} (현재가: {cur_lbl} < 5MA: {trail_lbl})",
             )
         return False, ""
 

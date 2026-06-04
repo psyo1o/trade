@@ -7,8 +7,9 @@
     * ``cooldown`` — 매수 직후 짧은 재진입 방지(분 단위, ``in_cooldown``).
     * ``ticker_cooldowns`` — **매도 후** 티커별 절대 만료 시각(ISO). 매도 사유별(익절 1h·손절·타임스탑 24h); 분할 익절 잔량 시 미부여.
     * ``peak_equity_{KR|US|COIN}`` — 시장별 MDD 브레이크용 고점.
-    * ``peak_total_equity`` / ``last_reset_week`` / ``account_circuit_peak_reset_pending`` /
-      ``account_circuit_cooldown_until`` — Phase5 합산 서킷(월요일 주차 MDD).
+    * ``peak_total_equity`` / ``last_reset_week`` — (레거시) 합산 서킷·월요일 앵커.
+    * ``phase5_share_anchor`` — 시장별 포트폴리오 비중 앵커(KR/US/COIN).
+    * ``account_circuit_market_cooldowns`` — 시장별 서킷 쿨다운(해당 시장 매수만 차단).
 
 V7.1: 모든 보유 종목을 액티브 매매·샹들리에 동일 적용. 포지션별 ``scale_out_done`` 은
 ``load_state`` 시 기본값 ``false`` 로 보강된다.
@@ -263,6 +264,9 @@ PEAK_TOTAL_EQUITY_KEY = "peak_total_equity"
 LAST_RESET_WEEK_KEY = "last_reset_week"
 ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY = "account_circuit_peak_reset_pending"
 PHASE5_LAST_LOOP_TOTAL_KEY = "phase5_last_loop_total_krw"
+PHASE5_SHARE_ANCHOR_KEY = "phase5_share_anchor"
+PHASE5_MARKET_COOLDOWNS_KEY = "account_circuit_market_cooldowns"
+PHASE5_PENDING_LIQUIDATION_MARKETS_KEY = "phase5_pending_liquidation_markets"
 # KIS 미장 개장 직후 합산 급등 오발동 방지 (peak 상향만 동결·MDD 판정은 유지)
 PHASE5_US_OPEN_FREEZE_MINUTES = 5
 PHASE5_PEAK_SPIKE_JUMP_PCT = 5.0
@@ -443,8 +447,15 @@ def apply_phase5_trailing_week_and_cooldown(state: dict, current_total_krw: floa
         save_state(path, state)
 
 
-def in_account_circuit_cooldown(state) -> bool:
-    raw = state.get(ACCOUNT_CIRCUIT_COOLDOWN_KEY)
+def _market_cooldowns_map(state: dict) -> dict:
+    raw = state.get(PHASE5_MARKET_COOLDOWNS_KEY)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def in_market_circuit_cooldown(state: dict, market: str) -> bool:
+    """시장별 서킷 쿨다운 — ``KR`` / ``US`` / ``COIN``."""
+    mk = str(market or "").strip().upper()
+    raw = _market_cooldowns_map(state).get(mk)
     if not raw:
         return False
     try:
@@ -454,7 +465,85 @@ def in_account_circuit_cooldown(state) -> bool:
         return False
 
 
+def set_market_circuit_cooldown(
+    state: dict, market: str, path: Path, hours: float = 24.0
+) -> None:
+    mk = str(market or "").strip().upper()
+    until = datetime.now() + timedelta(hours=float(hours))
+    cds = _market_cooldowns_map(state)
+    cds[mk] = until.isoformat(timespec="seconds")
+    state[PHASE5_MARKET_COOLDOWNS_KEY] = cds
+    save_state(path, state)
+
+
+def apply_phase5_share_anchor(
+    state: dict,
+    *,
+    kr_krw: float,
+    us_krw: float,
+    coin_krw: float,
+    path: Path,
+    market_ok: dict[str, bool] | None = None,
+) -> bool:
+    """
+    시장별 비중 앵커 갱신 — OK 시장 합이 양수일 때만.
+
+    ``market_ok`` 가 있으면 True 인 시장만 합·비중에 포함(API 실패 시장 제외).
+    """
+    eq = {"KR": max(0.0, float(kr_krw)), "US": max(0.0, float(us_krw)), "COIN": max(0.0, float(coin_krw))}
+    ok = market_ok if isinstance(market_ok, dict) else {"KR": True, "US": True, "COIN": True}
+    total = sum(v for mk, v in eq.items() if bool(ok.get(mk, False)))
+    if total <= 0.0:
+        return False
+    anchor = {mk: (eq[mk] / total if bool(ok.get(mk, False)) else 0.0) for mk in eq}
+    state[PHASE5_SHARE_ANCHOR_KEY] = anchor
+    save_state(path, state)
+    return True
+
+
+def get_phase5_share_anchor(state: dict) -> dict[str, float]:
+    raw = state.get(PHASE5_SHARE_ANCHOR_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for mk in ("KR", "US", "COIN"):
+        try:
+            v = float(raw.get(mk, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            out[mk] = v
+    return out
+
+
+def in_account_circuit_cooldown(state, market: str | None = None) -> bool:
+    """
+    레거시 전역 쿨다운 또는 시장별 쿨다운.
+
+    ``market`` 이 있으면 해당 시장만, 없으면 전역 키 또는 **어느 시장이든** 쿨다운 중이면 True.
+    """
+    if market is not None:
+        return in_market_circuit_cooldown(state, market)
+    raw = state.get(ACCOUNT_CIRCUIT_COOLDOWN_KEY)
+    if raw:
+        try:
+            if datetime.now() < datetime.fromisoformat(str(raw)):
+                return True
+        except Exception:
+            pass
+    cds = _market_cooldowns_map(state)
+    now = datetime.now()
+    for iso in cds.values():
+        try:
+            if now < datetime.fromisoformat(str(iso)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def set_account_circuit_cooldown(state, path: Path, hours: float = 24.0) -> None:
+    """레거시 합산 서킷용 전역 쿨다운."""
     until = datetime.now() + timedelta(hours=float(hours))
     state[ACCOUNT_CIRCUIT_COOLDOWN_KEY] = until.isoformat(timespec="seconds")
     state[ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY] = True

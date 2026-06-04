@@ -20,10 +20,15 @@ SCALE_OUT_PROFIT_PCT = 30.0
 SCALE_OUT_MIN_NOTIONAL_KRW = 3_000_000.0
 COIN_DECIMALS = 8
 SCALE_OUT_ENTRY_ATR_MULT = 3.0
+SCALE_OUT_SECOND_ENTRY_ATR_MULT = 6.0
 
 
 def position_scale_out_done(pos: dict) -> bool:
     return bool(isinstance(pos, dict) and pos.get("scale_out_done"))
+
+
+def position_second_scale_out_done(pos: dict) -> bool:
+    return bool(isinstance(pos, dict) and pos.get("second_scale_out_done"))
 
 
 def notional_krw_kr_us(buy_p: float, curr_p: float, qty: float, is_us: bool, usdkrw: float) -> float:
@@ -79,6 +84,34 @@ def scale_out_trigger_ok(pos: dict, profit_rate: float, notional_krw: float) -> 
     return True
 
 
+def scale_out_second_trigger_ok(
+    pos: dict,
+    buy_price: float,
+    curr_price: float,
+    entry_atr: float | None,
+    notional_krw: float,
+) -> tuple[bool, str, float]:
+    """
+    V8 2차 분할 익절 — 1차(``scale_out_done``) 완료 후 ``entry_atr×6`` 도달 시.
+
+    Returns:
+        (may_execute, mode, target_price)
+    """
+    if not position_scale_out_done(pos):
+        return False, "need_first_scale_out", 0.0
+    if position_second_scale_out_done(pos):
+        return False, "second_done", 0.0
+    if float(notional_krw) < SCALE_OUT_MIN_NOTIONAL_KRW:
+        return False, "notional", 0.0
+    hit, mode, target = scale_out_price_target_hit(
+        buy_price,
+        curr_price,
+        entry_atr,
+        atr_mult=SCALE_OUT_SECOND_ENTRY_ATR_MULT,
+    )
+    return hit, mode, float(target)
+
+
 def scale_out_price_target_hit(
     buy_price: float,
     curr_price: float,
@@ -113,6 +146,7 @@ def post_partial_ledger(
     qty_before: float,
     *,
     set_scale_out_done: bool = True,
+    set_second_scale_out_done: bool = False,
 ) -> dict:
     """부분 매도 후 ``buy_p``·``qty``·``max_p``·``sl_p`` 보정. 수동 부분 매도 등에서는 ``scale_out_done`` 을 건드리지 않도록 할 수 있다."""
     out = dict(pos) if isinstance(pos, dict) else {}
@@ -140,6 +174,8 @@ def post_partial_ledger(
     out["max_p"] = max(old_max, px)
     if set_scale_out_done:
         out["scale_out_done"] = True
+    if set_second_scale_out_done:
+        out["second_scale_out_done"] = True
     return out
 
 

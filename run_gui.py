@@ -92,8 +92,6 @@ from strategy.rules import (
     SWING_TIME_DECAY_START_TRADING_HOURS,
     SWING_UPPER_WICK_DROP_PCT,
     V8_PROFIT_LOCK_ACTIVATE_PCT,
-    get_swing_exit_display_price,
-    reconcile_swing_position,
 )
 
 TRADE_HISTORY_PATH = Path(__file__).resolve().parent / "trade_history.json"
@@ -265,7 +263,10 @@ def _build_strategy_guide_text() -> str:
         "- 국장 추가: V8 루프 갭 +5% 컷 (스윙 갭 +3%와 별도)\n"
         "- 통과 로그: [V8-BUY] / 실패: [V8] … 패스 사유\n\n"
         "■ 4) V8 매도 — get_final_exit_price · check_pro_exit\n"
-        "- 루프 순서: 분할익절(Scale-Out) → 타임스탑 → 손실 시 hard_stop(sl_p) → 수익 시 check_pro_exit\n"
+        "- 루프(TREND_V8만): 1차 Scale-Out(entry_atr×3.0) → 2차(entry_atr×6.0, 1차 후 잔량 50%)\n"
+        "  · 장부: scale_out_done / second_scale_out_done · lane scale_out / scale_out_2\n"
+        "  · SWING_FIB는 Scale-Out 전면 스킵(_resolve_sell_loop_strategy_type)\n"
+        "  → 타임스탑 → 손실 hard_stop → 수익 check_pro_exit\n"
         f"- 타임스탑: 주식 {v8_eq:.0f}h / 코인 {v8_coin:.0f}h, 유예 수익 +{v8_ex:.1f}% 이상이면 유예\n"
         "- 매도선 = max(샹들리에, 20MA−ATR·종가−2ATR 기술선, 본절락, 장부 sl_p)\n"
         "  · 샹들리에: max_p − ATR×2.5\n"
@@ -282,14 +283,17 @@ def _build_strategy_guide_text() -> str:
         "- 피보 38.2/50/61.8% 중 현재가 아래 지지 → entry_fib_level\n"
         "- 통과: [SWING-BUY] · 실패: [스윙] 한 줄 사유\n\n"
         "■ 6) 스윙 매도 — check_swing_exit · get_swing_exit_display_price\n"
-        "- 루프: check_swing_exit(FULL/HALF) → Scale-Out → 타임스탑 → 트레일링\n"
+        "- 루프: check_swing_exit(FULL/HALF/HOLD) 먼저\n"
+        "  · HALF/FULL 후 continue / HOLD는 V8 Scale-Out 미진입(전략 격리)\n"
+        "- 절반 익절: 오직 1.5R HALF(check_swing_exit). entry_atr×3.0 Scale-Out 금지\n"
         f"- 타임스탑: 주식 {sw_eq:.0f}h / 코인 {sw_coin:.0f}h, 유예 +{sw_ex:.1f}%\n"
         "- FULL: 하드(피보·구름+시간가중) · 러너 5MA 이탈 · RSI +1~10%\n"
         f"- HALF: 수익≥{sw_r:.1f}R → 50% 익절 → 러너 후보\n"
         f"- 시간가중: 영업 {SWING_TIME_DECAY_START_TRADING_HOURS:.0f}h 후 24h마다 gap {decay_pct}% 상향\n"
         f"- 본절락: max_p>{SWING_PROFIT_LOCK_ACTIVATE_PCT:.0f}% → 평단×1.005\n"
-        f"- 러너: scale_out 또는 max_p≥{sw_r:.1f}R → 5MA 트레일(고점 래칫, sl_p·표시선 하향 없음)\n"
-        "- 비러너 트레일: 본절락 이탈 전량 / 러너: 5MA 이탈 전량\n"
+        f"- 러너: scale_out 또는 max_p≥{sw_r:.1f}R → 5MA 트레일(고점 래칫)\n"
+        f"- 오버슈팅(러너·max_p≥{10:.0f}%): 매도선 max(하드,락,5MA,전일저가) · [SWING-SELL] 오버슈팅 캔들 트레일링 이탈\n"
+        "- 비러너 트레일: 본절락 이탈 / 러너: 5MA·오버슈팅 트레일 이탈\n"
         "- V8식 hard_stop 루프는 스윙에 미적용\n\n"
         "■ 7) 타임스탑·쿨다운\n"
         "- KR/US 보유시간: 거래일 연속(장외 포함), 휴장일 Pause (XKRX/NYSE 캘린더)\n"
@@ -316,8 +320,9 @@ def _table_cell(text) -> QTableWidgetItem:
 class _DashboardTabBar(QTabBar):
     """한글 탭 제목이 말줄임·세로 클립 없이 보이도록 너비·높이 힌트."""
 
-    _TAB_WIDTH_PAD = 96
-    _TAB_MIN_WIDTH = 178
+    _TAB_WIDTH_PAD = 128
+    _TAB_MIN_WIDTH = 220
+    _TAB_WIDTH_FUDGE = 16
 
     def tabSizeHint(self, index: int) -> QSize:
         base = super().tabSizeHint(index)
@@ -325,8 +330,8 @@ class _DashboardTabBar(QTabBar):
         fm = self.fontMetrics()
         rect = fm.boundingRect(0, 0, 0, 0, Qt.TextSingleLine, text)
         text_w = max(int(rect.width()), int(fm.horizontalAdvance(text)))
-        w = max(self._TAB_MIN_WIDTH, text_w + self._TAB_WIDTH_PAD)
-        h = max(int(base.height()), int(rect.height()) + 22)
+        w = max(self._TAB_MIN_WIDTH, text_w + self._TAB_WIDTH_PAD + self._TAB_WIDTH_FUDGE)
+        h = max(int(base.height()), int(rect.height()) + 26)
         return QSize(w, h)
 
 
@@ -335,8 +340,10 @@ def _configure_main_tab_widget(tabs: QTabWidget) -> None:
     bar.setExpanding(False)
     bar.setElideMode(Qt.ElideNone)
     bar.setUsesScrollButtons(True)
-    bar.setMinimumHeight(40)
-    bar.setStyleSheet("QTabBar::tab { font-size: 11px; }")
+    bar.setMinimumHeight(46)
+    bar.setStyleSheet(
+        "QTabBar::tab { font-size: 15px; padding-left: 22px; padding-right: 22px; min-width: 220px; }"
+    )
 
 
 def _dashboard_stylesheet() -> str:
@@ -348,6 +355,7 @@ def _dashboard_stylesheet() -> str:
     }
     QLabel {
         color: #cbd5e1;
+        font-size: 15px;
     }
     QLabel#StatsBanner {
         font-size: 15px;
@@ -360,7 +368,7 @@ def _dashboard_stylesheet() -> str:
         border: 1px solid #334155;
     }
     QLabel#SectionTitle {
-        font-size: 13px;
+        font-size: 15px;
         font-weight: 600;
         color: #94a3b8;
         padding: 2px 0 4px 0;
@@ -375,7 +383,7 @@ def _dashboard_stylesheet() -> str:
     QWidget#MarketCoin { border-top: 3px solid #fbbf24; }
     QWidget#MarketKr QLabel, QWidget#MarketUs QLabel, QWidget#MarketCoin QLabel {
         color: #f1f5f9;
-        font-size: 12px;
+        font-size: 15px;
         font-weight: 600;
         padding: 3px 8px;
     }
@@ -391,13 +399,14 @@ def _dashboard_stylesheet() -> str:
     QTabBar::tab {
         background: #1a2030;
         color: #94a3b8;
-        padding: 12px 32px;
-        margin-right: 6px;
+        padding: 12px 40px;
+        margin-right: 8px;
         border-top-left-radius: 8px;
         border-top-right-radius: 8px;
+        font-size: 15px;
         font-weight: 600;
-        min-height: 30px;
-        min-width: 178px;
+        min-height: 34px;
+        min-width: 220px;
     }
     QTabBar::tab:selected {
         background: #243044;
@@ -413,6 +422,7 @@ def _dashboard_stylesheet() -> str:
         alternate-background-color: #181e2a;
         gridline-color: #2a3348;
         color: #e2e8f0;
+        font-size: 15px;
         border: 1px solid #2d3748;
         border-radius: 8px;
         selection-background-color: #2563eb;
@@ -425,7 +435,7 @@ def _dashboard_stylesheet() -> str:
         border: none;
         border-bottom: 2px solid #334155;
         font-weight: 600;
-        font-size: 11px;
+        font-size: 15px;
     }
     QTableWidget::item {
         padding: 4px 6px;
@@ -436,6 +446,7 @@ def _dashboard_stylesheet() -> str:
         border: 1px solid #3d4f66;
         border-radius: 8px;
         padding: 8px 14px;
+        font-size: 15px;
         font-weight: 600;
     }
     QPushButton:hover {
@@ -479,6 +490,7 @@ def _dashboard_stylesheet() -> str:
     QSpinBox, QLineEdit {
         background-color: #1a2030;
         color: #e2e8f0;
+        font-size: 15px;
         border: 1px solid #3d4f66;
         border-radius: 6px;
         padding: 5px 8px;
@@ -489,6 +501,7 @@ def _dashboard_stylesheet() -> str:
     }
     QRadioButton {
         color: #cbd5e1;
+        font-size: 15px;
         spacing: 6px;
     }
     QRadioButton::indicator {
@@ -499,7 +512,7 @@ def _dashboard_stylesheet() -> str:
         background-color: #0c0f14;
         color: #86efac;
         font-family: Consolas, 'Cascadia Mono', 'Malgun Gothic', monospace;
-        font-size: 12px;
+        font-size: 15px;
         border: 1px solid #2d3748;
         border-radius: 8px;
         padding: 6px;
@@ -789,27 +802,65 @@ class BalanceUpdaterThread(QThread):
                     return True
                 return False
 
-            # 1. 무거운 장부 동기화 작업
+            from execution.balance_policy import (
+                is_on_trade_balance_mode,
+                wants_live_kis_balance,
+            )
+            from services.ledger_valuation import (
+                held_kr_codes_from_ledger,
+                held_us_codes_from_ledger,
+            )
+
+            state = load_state(STATE_PATH)
+            force_live = self.force_kis or wants_live_kis_balance(
+                state, run_bot.config, force=False
+            )
+            ledger_only = is_on_trade_balance_mode(run_bot.config) and not force_live
+
+            if self.force_kis:
+                print(
+                    "  🔁 [KIS 강제 새로고침] 실조회 모드 — "
+                    f"장부동기화={'KIS 보유·자동복구' if self.sync_first else '생략(비권장)'}"
+                )
+            elif ledger_only:
+                print("  [표시] 장부+시세 — 국·미 KIS 잔고 API 생략 (코인만 거래소 조회)")
+
+            # 1. 장부 동기화 — on_trade 평상시는 장부 보유 목록만( KIS 생략 )
             if self.sync_first:
                 try:
-                    state = load_state(STATE_PATH)
-                    _hk, _hu = run_bot.fetch_equity_held_lists_for_position_sync()
-                    _hc = run_bot.get_held_coins()
+                    if ledger_only:
+                        _hk = held_kr_codes_from_ledger(state)
+                        _hu = held_us_codes_from_ledger(state)
+                        _hc = run_bot.get_held_coins()
+                        print(
+                            f"  [GUI 장부] KIS 생략 — 장부 기준 동기화 KR {len(_hk)} · US {len(_hu)}"
+                        )
+                    else:
+                        _hk, _hu = run_bot.fetch_equity_held_lists_for_position_sync()
+                        _hc = run_bot.get_held_coins()
                     if _hk is not None and _hu is not None and _hc is not None:
-                        sync_all_positions(state, _hk, _hu, _hc, STATE_PATH)
+                        sync_all_positions(
+                            state,
+                            _hk,
+                            _hu,
+                            _hc,
+                            STATE_PATH,
+                            force_equity_sync=self.force_kis,
+                        )
                     else:
                         print("  ⚠️ [GUI 장부 동기화 건너뜀] 실보유 조회 실패 — 기존 장부 유지")
                 except Exception as e:
                     print(f"⚠️ 장부 동기화 중 오류: {e}")
 
-            # 2~4. KR/US/COIN 스냅샷 공용 fetch (GUI force/쿨다운/백오프 정책 주입)
-            if kis_equities_weekend_suppress_window_kst() and not self.sync_first:
+            # 2~4. KR/US/COIN 스냅샷 (ledger_only 시 장부+시세, 코인만 거래소 조회)
+            if kis_equities_weekend_suppress_window_kst() and not self.sync_first and not ledger_only:
                 print("💤 [주말 점검] 증권사 API 통신을 건너뛰고 기존 장부를 유지합니다.")
             snap = run_bot.build_account_snapshot_for_report(
                 allow_kis_fetch=_allow_kis_fetch,
                 with_backoff=_with_backoff,
                 force_kis_labels=self.force_kis,
-                fresh_balances=True,
+                fresh_balances=not ledger_only,
+                ledger_only=ledger_only,
             )
             labels = snap.get("labels", {})
             d2_kr = int(_safe_num((labels.get("kr") or {}).get("cash", 0), 0))
@@ -971,6 +1022,7 @@ class BotDashboard(QMainWindow):
         self._heartbeat_pending_after_trade = False
         self._heartbeat_due_slot = ""
         self._refresh_inflight = False
+        self._refresh_was_force_kis = False
         self._refresh_done_callbacks = []
 
         self._net_fail_count = 0
@@ -1084,7 +1136,7 @@ class BotDashboard(QMainWindow):
         self.setMinimumSize(1280, 760)
         self.setStyleSheet(_dashboard_stylesheet())
 
-        base_ui_font = QFont("Malgun Gothic", 10)
+        base_ui_font = QFont("Malgun Gothic", 15)
         self.setFont(base_ui_font)
 
         main_widget = QWidget()
@@ -1102,7 +1154,7 @@ class BotDashboard(QMainWindow):
         top_layout = QHBoxLayout()
         top_layout.setSpacing(10)
 
-        font_value = QFont("Malgun Gothic", 11, QFont.Bold)
+        font_value = QFont("Malgun Gothic", 15, QFont.Bold)
 
         def make_market_box(object_name: str):
             box = QWidget()
@@ -1349,7 +1401,11 @@ class BotDashboard(QMainWindow):
         self._capital_thread = None
         if ok:
             QMessageBox.information(self, "고점 보정 완료", msg.replace("\n", "<br>"))
-            self.refresh_balance()
+            print(
+                "  💰 [고점 보정] 입출금 반영 — KIS 라벨 1회 실조회 "
+                "(비장중 급변 방어 스킵)"
+            )
+            self.refresh_balance(sync_first=False, force_kis=True)
         else:
             QMessageBox.warning(self, "고점 보정 실패", msg.replace("\n", "<br>"))
 
@@ -1566,55 +1622,8 @@ class BotDashboard(QMainWindow):
                         name = ticker
             
             buy_p = float(pos_info.get('buy_p', 0.0))
-            sl_p = float(pos_info.get('sl_p', 0.0))
             max_p = float(pos_info.get('max_p', 0.0))
 
-            # 스윙: 장부 sl_p 대신 피보·구름·수익락 통합 매도선을 실시간 재계산(GUI 표시)
-            st_led = str(pos_info.get("strategy_type") or "").strip().upper()
-            tier_led = str(pos_info.get("tier") or "").strip().upper()
-            if st_led == "SWING_FIB" or tier_led in ("SWING_FIB", "SWING"):
-                try:
-                    curr_led = 0.0
-                    ohlcv_led = None
-                    if market == "🪙 코인":
-                        from api import coin_broker
-
-                        curr_led = float(coin_broker.get_current_price(ticker) or 0.0)
-                        ohlcv_led = coin_broker.fetch_ohlcv(ticker, "day", 250)
-                    elif market == "🇰🇷 국장":
-                        from strategy.rules import get_ohlcv_yfinance
-
-                        ohlcv_led = get_ohlcv_yfinance(ticker)
-                        if ohlcv_led and len(ohlcv_led) >= 2:
-                            curr_led = float(ohlcv_led[-1].get("c", 0) or 0)
-                    else:
-                        from strategy.rules import get_ohlcv_yfinance
-
-                        ohlcv_led = get_ohlcv_yfinance(ticker)
-                        if ohlcv_led and len(ohlcv_led) >= 2:
-                            curr_led = float(ohlcv_led[-1].get("c", 0) or 0)
-                    if ohlcv_led and len(ohlcv_led) >= 60 and curr_led > 0:
-                        mp_led = max(max_p if max_p > 0 else buy_p, curr_led)
-                        pos_info = dict(pos_info)
-                        pos_info["max_p"] = mp_led
-                        reconcile_swing_position(
-                            pos_info, ohlcv_led, reference_price=curr_led
-                        )
-                        m_led = (
-                            "KR"
-                            if market == "🇰🇷 국장"
-                            else ("US" if market == "🇺🇸 미장" else "COIN")
-                        )
-                        sl_live = float(
-                            get_swing_exit_display_price(
-                                curr_led, pos_info, ohlcv_led, market=m_led, ticker=ticker
-                            )
-                        )
-                        if sl_live > 0:
-                            sl_p = sl_live
-                except Exception:
-                    pass
-            
             strategy_label = _position_strategy_label(pos_info)
             buy_time = pos_info.get('buy_time', '')
             row_key = _ledger_row_key(ticker)
@@ -1737,6 +1746,15 @@ class BotDashboard(QMainWindow):
             print("\n▶️ [시스템] 봇 출동 전, 실시간 최고가(max_p) 사전 갱신 중...")
             # 매매는 갱신 완료 후 시작해 max_p 반영 정확도를 높입니다.
             def _launch_trade_worker():
+                import run_bot as _rb
+
+                if not _rb.kis_equities_ready_for_trading_cycle():
+                    print(
+                        "  ⏸️ [시스템] KIS 잔고·보유 미확인 — 매매 사이클 연기 "
+                        "(다음 :00/:15/:30/:45 슬롯 또는 KIS 강제 새로고침 후 재시도)"
+                    )
+                    self._trade_worker_busy = False
+                    return
                 print("\n▶️ [시스템] 최신 최고가가 반영된 장부를 들고 사냥꾼 출동!")
                 self.worker = WorkerThread()
                 self.worker.finished.connect(self._on_trade_worker_finished)
@@ -1748,16 +1766,30 @@ class BotDashboard(QMainWindow):
 
     def force_refresh_kis(self):
         """장외/쿨다운 중에도 KIS를 1회 강제 조회."""
-        self.refresh_balance(sync_first=False, force_kis=True)
+        from execution.balance_policy import mark_balance_live_sync
+
+        print(
+            "🔁 [KIS 강제 새로고침] 국·미 예수·총평 KIS 실조회 "
+            "(비장중·쿨다운 무시, 총평 직전보다 급변 시만 라벨 유지 · 장부 KIS 동기화)"
+        )
+        st = load_state(STATE_PATH)
+        mark_balance_live_sync(st, STATE_PATH)
+        self.refresh_balance(sync_first=True, force_kis=True)
 
     def refresh_balance(self, sync_first=True, force_kis=False, on_finished=None):
         """비동기 스레드를 가동하여 화면 멈춤 없이 잔고를 갱신합니다."""
         if on_finished is not None and callable(on_finished):
             self._refresh_done_callbacks.append(on_finished)
         if self._refresh_inflight:
+            if force_kis:
+                print("  ⏭️ [KIS 강제 새로고침] 다른 잔고 갱신이 진행 중 — 완료 후 다시 눌러 주세요.")
             return
         self._refresh_inflight = True
-        print("🔄 예수금 및 보유종목 데이터를 갱신합니다... (GUI 백그라운드 처리)")
+        self._refresh_was_force_kis = bool(force_kis)
+        if force_kis:
+            print("🔄 [KIS 강제 새로고침] 예수금·보유종목 갱신 중… (GUI 백그라운드)")
+        else:
+            print("🔄 예수금 및 보유종목 데이터를 갱신합니다… (장부+시세·GUI 백그라운드)")
         
         # 일꾼 고용 및 데이터 받을 창구 연결
         self.updater_thread = BalanceUpdaterThread(sync_first=sync_first, dashboard=self, force_kis=force_kis)
@@ -1885,7 +1917,11 @@ class BotDashboard(QMainWindow):
         self._refresh_inflight = False
         self.refresh_trade_history()
         self.refresh_ledger()
-        print("✅ 모든 계좌 정보 및 화면 표시가 최신 상태로 업데이트되었습니다.")
+        if getattr(self, "_refresh_was_force_kis", False):
+            print("✅ [KIS 강제 새로고침] 완료 — 국·미 예수·총평·보유 표 반영 (last_kis_display_snapshot 갱신)")
+            self._refresh_was_force_kis = False
+        else:
+            print("✅ [표시] 장부+시세 갱신 완료 — 보유·코인 반영 (국·미 상단 라벨은 직전 KIS 스냅샷 기준)")
         callbacks = self._refresh_done_callbacks[:]
         self._refresh_done_callbacks.clear()
         for cb in callbacks:

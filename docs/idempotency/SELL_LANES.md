@@ -12,9 +12,10 @@
 
 | lane | 트리거 | sell_inflight | TWAP 슬라이스 |
 |------|--------|---------------|----------------|
-| `swing_half` | `check_swing_exit` → HALF | ✅ | 0만 |
+| `swing_half` | `check_swing_exit` → HALF | ✅ | 0만 — 체결·정합 시 **`scale_out_done=True`** (`post_partial_ledger`) |
 | `swing_full` | `check_swing_exit` → FULL | ✅ | 0만 |
-| `scale_out` | V8 Scale-Out 50% | ❌ (슬라이스 키만) | 0..n-1 |
+| `scale_out` | **TREND_V8** 1차 Scale-Out 50% (`entry_atr×3.0`) — **SWING_FIB 미사용** | ❌ (슬라이스 키만) | 0..n-1 |
+| `scale_out_2` | **TREND_V8** 2차 Scale-Out (`entry_atr×6.0`, 1차 후 잔량 50%) | ❌ | 0..n-1 |
 | `exit` | 타임스탑·하드스탑·샹들리에·스윙 트레일 전량 | ✅ | 0만 |
 | `manual` | GUI 수동 매도 | ✅ | 0 (부분도 0) |
 | `phase5` | 합산 서킷 `manual_sell` 위임 | ✅ | 0 |

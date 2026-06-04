@@ -8,7 +8,7 @@ account_read_facade — 국·미 보유 조회의 **단일 진입점**.
 로그 정책
     * API 실패·필드 누락은 ``❌`` 로 즉시 출력(기존 유지).
     * 장부 폴백·빈 응답도 **조용히 빈 리스트를 반환하지 않고** 이유를 한 줄 남긴다(2026-04-22).
-    * 미장 보유 0건(API output1 수량 전부 0 + 장부 US 없음)은 정상 상태로 **로그 없이** ``[]`` 반환.
+    * 국·미 **info** — API 실패·보유 0건 시 장부 ``positions`` 폴백(미장과 동일). 장부도 비면 ``[]``·로그 없음.
     * 주말·점검 창 또는 **비장중**에는 KIS 실보유 API를 호출하지 않고 장부만 사용.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from api.kis_parsers import parse_us_qty
+from api.kis_parsers import kis_response_rate_limited, parse_us_qty
 from utils.helpers import is_coin_ticker
 
 
@@ -39,6 +39,10 @@ def _skip_kis_equities_live(
 
 def _ledger_us_codes(pos: dict[str, Any]) -> list[str]:
     return [t for t in pos if (not str(t).isdigit() and not is_coin_ticker(str(t)))]
+
+
+def _ledger_kr_codes(pos: dict[str, Any]) -> list[str]:
+    return [t for t in pos if str(t).isdigit()]
 
 
 def get_held_stocks_kr(
@@ -67,6 +71,14 @@ def get_held_stocks_kr(
             print("❌ [국장 조회 실패] 잔고 API 응답 없음")
             return None
         if "output1" not in bal:
+            if kis_response_rate_limited(bal):
+                print("  📌 [조회 facade KR] KIS 호출 한도 — 장부 보유 목록 사용")
+                try:
+                    st = load_state(state_path)
+                    pos = st.get("positions") or {}
+                    return [t for t in pos if str(t).isdigit()]
+                except Exception:
+                    pass
             print("❌ [국장 조회 실패] output1 필드 없음")
             return None
         held = []
@@ -131,33 +143,54 @@ def get_held_stocks_kr_info(
     ledger_qty_for_ui,
     is_market_open: Callable[[str], bool] | None = None,
 ):
-    if _skip_kis_equities_live("KR", is_weekend=is_weekend, is_market_open=is_market_open):
+    def _from_ledger():
         try:
             st = load_state(state_path)
             pos = st.get("positions") or {}
-            rows = [
+            return [
                 {"code": t, "name": kr_name_dict.get(t, t), "qty": ledger_qty_for_ui(pos.get(t), 1.0)}
-                for t in pos
-                if str(t).isdigit()
+                for t in _ledger_kr_codes(pos)
             ]
-            print(f"  📌 [조회 facade KR info] 비장·점검 억제 — 장부 기반 {len(rows)}행 (API 미호출)")
-            return rows
         except Exception as e:
-            print(f"  ⚠️ [조회 facade KR info] 비장·점검 장부 로드 실패: {type(e).__name__}: {e}")
+            print(f"  ⚠️ [조회 facade KR info] 장부 폴백 실패: {type(e).__name__}: {e}")
             return []
+
+    def _fallback_from_ledger_or_empty(*, reason: str) -> list:
+        rows = _from_ledger()
+        if rows:
+            print(f"  📌 [조회 facade KR info] {reason} — 장부 {len(rows)}행 사용")
+        return rows
+
+    if _skip_kis_equities_live("KR", is_weekend=is_weekend, is_market_open=is_market_open):
+        rows = _from_ledger()
+        print(f"  📌 [조회 facade KR info] 비장·점검 억제 — 장부 기반 {len(rows)}행 (API 미호출)")
+        return rows
     try:
         bal = get_balance_with_retry()
+        if bal and "output1" not in bal and kis_response_rate_limited(bal):
+            return _fallback_from_ledger_or_empty(reason="KIS 호출 한도")
         if bal and "output1" in bal:
-            return [
-                {"code": s["pdno"], "name": kr_name_dict.get(s["pdno"], s.get("prdt_name", "")), "qty": to_float(s.get("hldg_qty"))}
-                for s in bal["output1"]
-                if to_float(s.get("hldg_qty")) > 0
-            ]
-        print("  ⚠️ [조회 facade KR info] 잔고 응답 없음 또는 output1 없음 — 빈 리스트 반환")
-        return []
+            out = []
+            for s in bal["output1"]:
+                hldg_qty = to_float(s.get("hldg_qty", 0))
+                ccld_qty = to_float(s.get("ccld_qty_smtl1", 0))
+                qty = hldg_qty if hldg_qty > 0.0001 else ccld_qty
+                if qty > 0.0001:
+                    code = str(s.get("pdno", "") or "").strip()
+                    if code:
+                        out.append(
+                            {
+                                "code": code,
+                                "name": kr_name_dict.get(code, s.get("prdt_name", "")),
+                                "qty": qty,
+                            }
+                        )
+            if out:
+                return out
+            return _fallback_from_ledger_or_empty(reason="API 보유 0건")
+        return _fallback_from_ledger_or_empty(reason="잔고 응답 없음 또는 output1 없음")
     except Exception as e:
-        print(f"  ⚠️ [조회 facade KR info] 예외 — 빈 리스트: {type(e).__name__}: {e}")
-        return []
+        return _fallback_from_ledger_or_empty(reason=f"예외({type(e).__name__})")
 
 
 def get_held_stocks_us_info(

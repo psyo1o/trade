@@ -37,7 +37,7 @@ def build_rows_data(
                 prdt = (item.get("prdt_name") or item.get("prdt_name1") or "").strip()
                 name = prdt or kr_name_dict.get(code) or get_kr_company_name(code) or code
                 rows_data.append(process_row_data("🇰🇷 국장", name, str(qty_num), price, "KR", code, current_p))
-    # 스냅샷 output1이 비었는데 장중이면 위 분기를 안 타서 국장 행이 사라지는 버그 방지 → 재조회 소스(get_held_stocks_kr_info)로 폴백
+    # 스냅샷 output1이 비었을 때 — get_held_stocks_kr_info 는 잔고 TTL 캐시를 공유(중복 API 방지)
     elif is_weekend_suppress() or not is_market_open("KR") or not kr_list_ok:
         try:
             st_row = load_state(state_path)

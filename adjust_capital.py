@@ -63,6 +63,9 @@ def _refresh_aux_snapshot() -> None:
         import run_bot as rb
 
         st = load_state(STATE_PATH)
+        from execution.balance_policy import mark_balance_live_sync
+
+        mark_balance_live_sync(st, STATE_PATH)
         info = rb.refresh_circuit_aux_from_brokers(st, STATE_PATH)
         t = info.get("totals") or {}
         kr = float(t.get("kr_krw", 0) or 0)
@@ -159,6 +162,14 @@ def apply_capital_peak_adjustment(
         state[CAPITAL_ADJUSTMENTS_KEY] = [entry]
 
     save_state(path, state)
+
+    try:
+        from execution.balance_policy import mark_capital_label_refresh, mark_balance_live_sync
+
+        mark_balance_live_sync(state, path)
+        mark_capital_label_refresh(state, path)
+    except Exception:
+        pass
 
     lines = []
     if peak_was_missing:

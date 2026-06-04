@@ -79,6 +79,71 @@ def resolve_display_current_price(
     return float(cp if cp > 0 else bp)
 
 
+# 비장중 강제 새로고침: KIS 응답 누락·이중 합산 시 총평이 직전과 크게 어긋날 수 있음
+# (예수는 총평에 포함되므로 방어 기준은 총평만 — 매수 직후 예수↓·총평 유지 오탐 방지)
+_OFF_HOURS_FORCE_MIN_PREV: dict[str, float] = {"KR": 10_000.0, "US": 10.0}
+_OFF_HOURS_FORCE_TOL: dict[str, float] = {"KR": 1.0, "US": 0.01}
+# 직전 대비 허용 초과 비율(초과 시 급변으로 보고 직전 라벨 유지) — US 장중 급락 45%와 대칭
+_OFF_HOURS_FORCE_MAX_TOTAL_SPIKE = 1.12
+
+
+def _maybe_reject_off_hours_force_label_anomaly(
+    *,
+    market: str,
+    force_kis_labels: bool,
+    is_market_open_now: bool,
+    prev_part: dict | None,
+    new_cash: float,
+    new_total: float,
+    new_roi,
+    safe_num: Callable[[Any, float], float],
+    trust_live_labels: bool = False,
+) -> tuple[float, float, Any]:
+    """비장중 ``force_kis_labels`` 조회 결과가 직전 **총평** 대비 비정상이면 덮어쓰지 않는다.
+
+    예수 단독 변동(매수 직후 등)은 총평이 안정이면 허용한다.
+    ``trust_live_labels`` — 입출금(고점 보정) 직후 1회 등 의도적 실조회는 방어 생략.
+    """
+    if trust_live_labels or not force_kis_labels or is_market_open_now:
+        return new_cash, new_total, new_roi
+
+    part = prev_part if isinstance(prev_part, dict) else {}
+    prev_cash = float(safe_num(part.get("cash", 0), 0.0))
+    prev_total = float(safe_num(part.get("total", prev_cash), prev_cash))
+    prev_roi = part.get("roi")
+
+    m = str(market or "").strip().upper()
+    min_prev = float(_OFF_HOURS_FORCE_MIN_PREV.get(m, 10.0))
+    tol = float(_OFF_HOURS_FORCE_TOL.get(m, 0.01))
+    max_total_spike = float(_OFF_HOURS_FORCE_MAX_TOTAL_SPIKE)
+
+    if prev_total < min_prev:
+        return new_cash, new_total, new_roi
+
+    nt = float(new_total)
+    nc = float(new_cash)
+    total_dropped = prev_total >= min_prev and nt < prev_total - tol
+    total_spiked = prev_total >= min_prev and nt > prev_total * max_total_spike + tol
+    if not (total_dropped or total_spiked):
+        return new_cash, new_total, new_roi
+
+    reason = (
+        "총평 직전보다 급증(이중 합산·API 이상 추정)"
+        if total_spiked
+        else "총평 직전보다 감소(누락 가능)"
+    )
+    print(
+        f"  ⚠️ [KIS 강제 새로고침·{m}] 비장중 — {reason} — "
+        f"직전 라벨 유지 (new cash={nc}, total={nt} / "
+        f"prev cash={prev_cash}, total={prev_total})"
+    )
+    return prev_cash, prev_total, prev_roi
+
+
+# 하위 호환(테스트·import)
+_maybe_reject_off_hours_force_label_decrease = _maybe_reject_off_hours_force_label_anomaly
+
+
 def build_account_snapshot_for_report(
     *,
     deps: dict,
@@ -91,7 +156,8 @@ def build_account_snapshot_for_report(
     흐름
         1. ``is_weekend_suppress`` 이면 API 없이 ``last_kis_display_snapshot`` 만 사용.
            단, ``force_kis_labels=True`` (GUI KIS 강제 새로고침) 이면 억제를 무시하고 KIS 재조회.
-        2. 평일이면 ``allow_kis_fetch`` 가 참인 시장만 KIS/브로커 재조회 후 스냅샷 갱신 시도.
+        2. ``allow_kis_fetch`` 가 참이고 (장중 또는 ``force_kis_labels``) 인 시장만 KIS 재조회.
+           강제 새로고침은 비장중에도 실조회하되, **직전 라벨 대비 총평 급감·급증** 만 덮어쓰지 않는다(입출금 직후 1회 제외).
         3. 코인은 항상 업비트 잔고로 라벨·metrics 계산.
 
     ``deps`` 키는 ``run_bot`` / ``run_gui`` 가 주입하는 콜백·상태 로더 집합이다.
@@ -100,6 +166,8 @@ def build_account_snapshot_for_report(
         allow_kis_fetch = lambda _m: True
     if with_backoff is None:
         with_backoff = lambda fn, _label: fn()
+
+    trust_live_labels = bool(deps.get("trust_off_hours_live_labels"))
 
     weather = deps["get_real_weather"](deps["broker_kr"], deps["broker_us"])
     snap = deps["load_last_kis_display_snapshot"]()
@@ -140,12 +208,14 @@ def build_account_snapshot_for_report(
             print("  ⚠️ [snapshot US] 주말 스냅샷에 total 없음 — 미장 라벨 0·ROI 없음")
     else:
         if deps["is_weekend_suppress"]() and force_kis_labels:
-            print("  📌 [snapshot] force_kis_labels — 주말·점검 창에서도 KIS 국·미 라벨 재조회 후 스냅샷 저장 시도")
+            print("  📌 [KIS 강제 새로고침] 주말·점검 창 — 억제 무시하고 KIS 국·미 라벨 재조회")
+        elif force_kis_labels:
+            print("  🔁 [KIS 강제 새로고침] 국·미 예수·총평 라벨 KIS 조회 시작")
 
         kr_part = snap.get("kr") or {}
         us_part = snap.get("us") or {}
 
-        if allow_kis_fetch("KR") and _is_open("KR"):
+        if allow_kis_fetch("KR") and (_is_open("KR") or force_kis_labels):
             try:
                 kr_bal = with_backoff(deps["get_balance_with_retry"], "KR 잔고") or {}
                 out2 = kr_bal.get("output2", []) if isinstance(kr_bal, dict) else []
@@ -153,6 +223,19 @@ def build_account_snapshot_for_report(
                 kr_m = deps["calc_kr_holdings_metrics"](kr_bal)
                 kr_total = int(kr_cash + float(kr_m.get("current", 0.0)))
                 kr_roi = kr_m.get("roi")
+                kr_cash_f, kr_total_f, kr_roi = _maybe_reject_off_hours_force_label_anomaly(
+                    market="KR",
+                    force_kis_labels=force_kis_labels,
+                    is_market_open_now=_is_open("KR"),
+                    prev_part=kr_part,
+                    new_cash=float(kr_cash),
+                    new_total=float(kr_total),
+                    new_roi=kr_roi,
+                    safe_num=deps["safe_num"],
+                    trust_live_labels=trust_live_labels,
+                )
+                kr_cash = int(kr_cash_f)
+                kr_total = int(kr_total_f)
             except Exception as e:
                 print(
                     f"  ⚠️ [snapshot KR] 라벨용 잔고 조회 실패 — 직전 스냅샷으로 폴백: {type(e).__name__}: {e}"
@@ -162,16 +245,18 @@ def build_account_snapshot_for_report(
                     kr_total = int(deps["safe_num"](kr_part.get("total", 0), 0.0))
                     kr_roi = kr_part.get("roi")
         else:
-            if not _is_open("KR"):
+            if not allow_kis_fetch("KR"):
+                print("  📌 [snapshot KR] allow_kis_fetch=False — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
+            elif not _is_open("KR") and not force_kis_labels:
                 print("  📌 [snapshot KR] 비장중 — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
             else:
-                print("  📌 [snapshot KR] allow_kis_fetch=False — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
+                print("  📌 [snapshot KR] KIS 재조회 생략, 직전 스냅샷 라벨 사용")
             if isinstance(kr_part, dict):
                 kr_cash = int(deps["safe_num"](kr_part.get("cash", 0), 0.0))
                 kr_total = int(deps["safe_num"](kr_part.get("total", 0), 0.0))
                 kr_roi = kr_part.get("roi")
 
-        if allow_kis_fetch("US") and _is_open("US"):
+        if allow_kis_fetch("US") and (_is_open("US") or force_kis_labels):
             try:
                 us_cash = deps["safe_num"](deps["get_us_cash_real"](deps["broker_us"]), 0.0)
                 us_bal = with_backoff(deps["get_us_positions_with_retry"], "US 잔고") or {}
@@ -192,7 +277,12 @@ def build_account_snapshot_for_report(
                     prev_us_total > 0.0 and has_us_rows and us_total > 0.0 and us_total < prev_us_total * 0.45
                 )
                 suspicious_cash_glitch = prev_us_cash > 50.0 and us_cash <= 0.0 and has_us_rows
-                if suspicious_zero or suspicious_drop or suspicious_cash_glitch:
+                suspicious_spike = (
+                    not trust_live_labels
+                    and prev_us_total > 0.0
+                    and us_total > prev_us_total * _OFF_HOURS_FORCE_MAX_TOTAL_SPIKE
+                )
+                if suspicious_zero or suspicious_drop or suspicious_cash_glitch or suspicious_spike:
                     print(
                         "  ⚠️ [snapshot US] 미장 라벨 값 급변 감지(일시 API 이상 추정) — "
                         f"직전 스냅샷 유지 (new cash=${us_cash:.2f}, total=${us_total:.2f} / "
@@ -202,6 +292,18 @@ def build_account_snapshot_for_report(
                         us_cash = float(deps["safe_num"](us_part.get("cash", 0.0), 0.0))
                         us_total = float(deps["safe_num"](us_part.get("total", us_cash), us_cash))
                         us_roi = us_part.get("roi")
+                else:
+                    us_cash, us_total, us_roi = _maybe_reject_off_hours_force_label_anomaly(
+                        market="US",
+                        force_kis_labels=force_kis_labels,
+                        is_market_open_now=_is_open("US"),
+                        prev_part=us_part,
+                        new_cash=float(us_cash),
+                        new_total=float(us_total),
+                        new_roi=us_roi,
+                        safe_num=deps["safe_num"],
+                        trust_live_labels=trust_live_labels,
+                    )
             except Exception as e:
                 print(
                     f"  ⚠️ [snapshot US] 라벨용 잔고 조회 실패 — 직전 스냅샷으로 폴백: {type(e).__name__}: {e}"
@@ -211,10 +313,12 @@ def build_account_snapshot_for_report(
                     us_total = float(deps["safe_num"](us_part.get("total", us_cash), us_cash))
                     us_roi = us_part.get("roi")
         else:
-            if not _is_open("US"):
+            if not allow_kis_fetch("US"):
+                print("  📌 [snapshot US] allow_kis_fetch=False — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
+            elif not _is_open("US") and not force_kis_labels:
                 print("  📌 [snapshot US] 비장중 — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
             else:
-                print("  📌 [snapshot US] allow_kis_fetch=False — KIS 재조회 생략, 직전 스냅샷 라벨 사용")
+                print("  📌 [snapshot US] KIS 재조회 생략, 직전 스냅샷 라벨 사용")
             if isinstance(us_part, dict):
                 us_cash = float(deps["safe_num"](us_part.get("cash", 0.0), 0.0))
                 us_total = float(deps["safe_num"](us_part.get("total", us_cash), us_cash))
@@ -230,6 +334,12 @@ def build_account_snapshot_for_report(
                 us_roi,
                 force=force_kis_labels,
             )
+            if force_kis_labels:
+                print(
+                    "  ✅ [KIS 강제 새로고침] last_kis_display_snapshot 저장 — "
+                    f"KR 예수 {int(kr_cash):,}원 · 총평 {int(kr_total):,}원 / "
+                    f"US 예수 ${float(us_cash):,.2f} · 총평 ${float(us_total):,.2f}"
+                )
         except Exception as e:
             print(f"  ⚠️ [snapshot] last_kis_display_snapshot 저장 실패(라벨은 메모리 값 유지): {type(e).__name__}: {e}")
 
