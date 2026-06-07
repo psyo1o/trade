@@ -109,10 +109,10 @@ Phase5 청산 직후 로그 ` [쿨다운 적용] 379810 | 사유: Phase5 서킷 
 
 | 상황 | KIS 국·미 잔고 API |
 |------|-------------------|
-| GUI 일반 새로고침 / 15분 사이클(매도만) | **안 함** — 장부 `qty` × 현재가 + `last_*_cash_*` |
+| GUI 일반 새로고침 / 15분 사이클(매도만) | **안 함** — 장부 `qty` × 현재가 + `last_kis_display_snapshot` 예수 |
 | 매수 창 직전 | **1회** (`kr_balance_raw(refresh=True)`) |
 | 체결 직후 | **1회** + `balance_live_sync_required` |
-| GUI **강제 KIS 새로고침** | **1회** — 비장중 포함, 감소 시 라벨 유지, 스냅샷 저장 |
+| GUI **강제 KIS 새로고침** | **1회** — 비장중 포함, 급변 시 확인창·스냅샷 저장 |
 | `adjust_capital.py` 입출금 보정 | **1회** (`refresh_circuit_aux_from_brokers`) |
 | 코인 | KIS 아님 — 업비트/바이낸스 잔고는 별도 |
 
@@ -137,14 +137,15 @@ Phase5 청산 직후 로그 ` [쿨다운 적용] 379810 | 사유: Phase5 서킷 
 
 | 키 | 용도 |
 |----|------|
-| `circuit_aux_last_kr_krw` | 국장 총평가(원) — 마지막 실조회 또는 장부 추정 |
-| `circuit_aux_last_usd_total` | 미장 총자산(USD) |
-| `circuit_aux_last_coin_krw` | 코인 총평가(원) |
-| `last_kr_cash_krw` / `last_us_cash_usd` | 예수 — 실조회 시 갱신 |
+| `last_kis_display_snapshot` | 국·미 예수·총평 **영구 저장** (KIS 실조회 시 갱신) |
+| `circuit_aux_last_coin_krw` | 코인 총평(원) |
+| `last_kr_cash_krw` / `last_us_cash_usd` | 레거시 예수 폴백 (`display_cash_from_state`) |
 | `phase5_share_anchor` | 주차별 시장 비중 앵커 |
-| `_phase5_aux_sync` | 루프마다 kr_ok / us_ok / coin_ok (로그·판정용) |
+| `_phase5_aux_sync` | 루프마다 `kr_ok` / `us_ok` / `coin_ok`; **장부+시세** 루프 시 `ledger_only: true` 와 `kr_krw` / `usd_total` (Phase5 비중 판정용 추정 총평) |
 
-`on_trade` 모드: `refresh_circuit_aux_from_brokers` 대신 `update_circuit_aux_from_ledger` 로 **장부+시세 추정** 가능 (코인은 거래소 조회 병행).
+`on_trade` 모드: `refresh_circuit_aux_from_brokers` 대신 `update_circuit_aux_from_ledger` 로 **장부+시세 추정** (코인은 거래소 조회 병행).
+
+Phase5 비중 계산은 `ledger_valuation.kis_display_total()` 을 사용한다. `ledger_only` 루프에서는 `_phase5_aux_sync` 의 추정 총평을 우선해 **스냅샷 총평이 낡아도** 보유 시세 변동을 반영한다. KIS 실조회·강제 새로고침 후에는 스냅샷과 추정값이 다시 맞춰진다.
 
 ---
 
@@ -200,7 +201,8 @@ tests/test_phase5_share_circuit.py
 | 비중 정상인데 청산됨 | `phase5_pending_liquidation*` · 레거시 boolean — 봇 재시작 후 prune 로그 확인 |
 | `output1 없음` / EGW00201 | `on_trade`·캐시 동작 여부, 출동+새로고침 동시 클릭 줄이기 |
 | 한 시장만 막혀야 하는데 전 시장 매수 불가 | `account_circuit_use_total` 이 true 인지, `account_circuit_cooldown_until` 존재 여부 |
-| 예수금 표시 어긋남 | 강제 KIS 새로고침 1회 또는 `adjust_capital` 로 `circuit_aux` 갱신 |
+| 예수금 표시 어긋남 | 강제 KIS 새로고침 1회 또는 `adjust_capital` 로 live sync |
+| Phase5 비중 %가 GUI와 다름 | `ledger_only` 루프 — `_phase5_aux_sync` 추정값 사용 여부 확인; KIS 강제 새로고침으로 스냅샷 정렬 |
 
 수동으로 대기 큐 비우기 (`bot_state.json`):
 
@@ -219,3 +221,4 @@ tests/test_phase5_share_circuit.py
 | 2026-06 | **시장별 비중 서킷** 기본, 합산은 옵션 |
 | 2026-06 | KIS 잔고 **on_trade** + TTL 캐시 |
 | 2026-06 | 대기 청산 **stale prune** · 레거시 pending 플래그 정리 |
+| 2026-06 | 국·미 표시 **단일 스냅샷** · Phase5 `ledger_only` 추정 총평 · US force_kis 급증 가드 정리 |

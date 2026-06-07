@@ -8,7 +8,7 @@ account_read_facade — 국·미 보유 조회의 **단일 진입점**.
 로그 정책
     * API 실패·필드 누락은 ``❌`` 로 즉시 출력(기존 유지).
     * 장부 폴백·빈 응답도 **조용히 빈 리스트를 반환하지 않고** 이유를 한 줄 남긴다(2026-04-22).
-    * 국·미 **info** — API 실패·보유 0건 시 장부 ``positions`` 폴백(미장과 동일). 장부도 비면 ``[]``·로그 없음.
+    * 국·미 **보유 조회** — API 실패·보유 0건 시 장부 ``positions`` 폴백. (내부 함수명 ``*_info`` / ``*_detail`` 은 반환 필드 차이만.)
     * 주말·점검 창 또는 **비장중**에는 KIS 실보유 API를 호출하지 않고 장부만 사용.
 """
 from __future__ import annotations
@@ -18,6 +18,22 @@ from typing import Any
 
 from api.kis_parsers import kis_response_rate_limited, parse_us_qty
 from utils.helpers import is_coin_ticker
+
+# GUI·워커가 같은 조회를 반복 호출할 때 📌 안내 로그 스팸 방지 (내용 같으면 1회만)
+_last_facade_notes: dict[str, str] = {}
+
+# 로그 태그 — 함수명(info/detail)과 무관하게 시장별로 통일
+_FACADE_LOG_KR = "KR 보유"
+_FACADE_LOG_US = "US 보유"
+
+
+def _note_once(kind: str, text: str) -> None:
+    """``📌 [조회 facade {kind}]`` — 동일 문구는 프로세스당 1회만."""
+    prev = _last_facade_notes.get(kind)
+    if prev == text:
+        return
+    _last_facade_notes[kind] = text
+    print(f"  📌 [조회 facade {kind}] {text}")
 
 
 def _skip_kis_equities_live(
@@ -45,6 +61,13 @@ def _ledger_kr_codes(pos: dict[str, Any]) -> list[str]:
     return [t for t in pos if str(t).isdigit()]
 
 
+def _ledger_display_current_p(pos: dict[str, Any], buy_p: float, to_float) -> float:
+    """장부 ``curr_p`` 우선 — GUI ``resolve_holding_display_price``·국장 폴백과 동일."""
+    bp = float(to_float(buy_p, 0.0))
+    cp = float(to_float(pos.get("curr_p", 0), 0.0))
+    return cp if cp > 0 else bp
+
+
 def get_held_stocks_kr(
     *,
     is_weekend,
@@ -60,7 +83,7 @@ def get_held_stocks_kr(
             st = load_state(state_path)
             pos = st.get("positions") or {}
             codes = [t for t in pos if str(t).isdigit()]
-            print(f"  📌 [조회 facade KR] 비장·점검 억제 — 장부 기반 보유 {len(codes)}종 (API 미호출)")
+            _note_once(_FACADE_LOG_KR, f"비장·점검 억제 — 장부 기반 보유 {len(codes)}종 (API 미호출)")
             return codes
         except Exception as e:
             print(f"  ⚠️ [조회 facade KR] 비장·점검 장부 로드 실패 — 빈 보유: {type(e).__name__}: {e}")
@@ -72,7 +95,7 @@ def get_held_stocks_kr(
             return None
         if "output1" not in bal:
             if kis_response_rate_limited(bal):
-                print("  📌 [조회 facade KR] KIS 호출 한도 — 장부 보유 목록 사용")
+                _note_once(_FACADE_LOG_KR, "KIS 호출 한도 — 장부 보유 목록 사용")
                 try:
                     st = load_state(state_path)
                     pos = st.get("positions") or {}
@@ -110,7 +133,7 @@ def get_held_stocks_us(
             st = load_state(state_path)
             pos = st.get("positions") or {}
             codes = _ledger_us_codes(pos)
-            print(f"  📌 [조회 facade US] 비장·점검 억제 — 장부 기반 보유 {len(codes)}종 (API 미호출)")
+            _note_once(_FACADE_LOG_US, f"비장·점검 억제 — 장부 기반 보유 {len(codes)}종 (API 미호출)")
             return codes
         except Exception as e:
             print(f"  ⚠️ [조회 facade US] 비장·점검 장부 로드 실패 — 빈 보유: {type(e).__name__}: {e}")
@@ -152,18 +175,18 @@ def get_held_stocks_kr_info(
                 for t in _ledger_kr_codes(pos)
             ]
         except Exception as e:
-            print(f"  ⚠️ [조회 facade KR info] 장부 폴백 실패: {type(e).__name__}: {e}")
+            print(f"  ⚠️ [조회 facade {_FACADE_LOG_KR}] 장부 폴백 실패: {type(e).__name__}: {e}")
             return []
 
     def _fallback_from_ledger_or_empty(*, reason: str) -> list:
         rows = _from_ledger()
         if rows:
-            print(f"  📌 [조회 facade KR info] {reason} — 장부 {len(rows)}행 사용")
+            _note_once(_FACADE_LOG_KR, f"{reason} — 장부 {len(rows)}행 사용")
         return rows
 
     if _skip_kis_equities_live("KR", is_weekend=is_weekend, is_market_open=is_market_open):
         rows = _from_ledger()
-        print(f"  📌 [조회 facade KR info] 비장·점검 억제 — 장부 기반 {len(rows)}행 (API 미호출)")
+        _note_once(_FACADE_LOG_KR, f"비장·점검 억제 — 장부 기반 {len(rows)}행 (API 미호출)")
         return rows
     try:
         bal = get_balance_with_retry()
@@ -213,18 +236,18 @@ def get_held_stocks_us_info(
                 for t in _ledger_us_codes(pos)
             ]
         except Exception as e:
-            print(f"  ⚠️ [조회 facade US info] 장부 폴백 실패: {type(e).__name__}: {e}")
+            print(f"  ⚠️ [조회 facade {_FACADE_LOG_US}] 장부 폴백 실패: {type(e).__name__}: {e}")
             return []
 
     def _fallback_from_ledger_or_empty(*, reason: str) -> list:
         rows = _from_ledger()
         if rows:
-            print(f"  📌 [조회 facade US info] {reason} — 장부 {len(rows)}행 사용")
+            _note_once(_FACADE_LOG_US, f"{reason} — 장부 {len(rows)}행 사용")
         return rows
 
     if _skip_kis_equities_live("US", is_weekend=is_weekend, is_market_open=is_market_open):
         rows = _from_ledger()
-        print(f"  📌 [조회 facade US info] 비장·점검 억제 — 장부 기반 {len(rows)}행 (API 미호출)")
+        _note_once(_FACADE_LOG_US, f"비장·점검 억제 — 장부 기반 {len(rows)}행 (API 미호출)")
         return rows
     try:
         bal = get_us_positions_with_retry()
@@ -260,21 +283,28 @@ def get_held_stocks_us_detail(
             for code in _ledger_us_codes(pos):
                 p = pos.get(code) or {}
                 bp = to_float(p.get("buy_p", 0), 0.0)
-                out.append({"code": code, "qty": ledger_qty_for_ui(p, 1.0), "avg_p": bp, "current_p": bp})
+                out.append(
+                    {
+                        "code": code,
+                        "qty": ledger_qty_for_ui(p, 1.0),
+                        "avg_p": bp,
+                        "current_p": _ledger_display_current_p(p, bp, to_float),
+                    }
+                )
             return out
         except Exception as e:
-            print(f"  ⚠️ [조회 facade US detail] 장부 폴백 실패: {type(e).__name__}: {e}")
+            print(f"  ⚠️ [조회 facade {_FACADE_LOG_US}] 장부 폴백 실패: {type(e).__name__}: {e}")
             return []
 
     def _fallback_from_ledger_or_empty(*, reason: str) -> list:
         rows = _from_ledger_detail()
         if rows:
-            print(f"  📌 [조회 facade US detail] {reason} — 장부 {len(rows)}행 사용 (현재가=평단)")
+            _note_once(_FACADE_LOG_US, f"{reason} — 장부 {len(rows)}행 사용")
         return rows
 
     if _skip_kis_equities_live("US", is_weekend=is_weekend, is_market_open=is_market_open):
         rows = _from_ledger_detail()
-        print(f"  📌 [조회 facade US detail] 비장·점검 억제 — 장부 기반 {len(rows)}행 (현재가=평단, API 미호출)")
+        _note_once(_FACADE_LOG_US, f"비장·점검 억제 — 장부 기반 {len(rows)}행 (API 미호출)")
         return rows
     try:
         bal = get_us_positions_with_retry()

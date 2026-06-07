@@ -14,6 +14,35 @@ from typing import Any, Callable
 from execution.guard import load_state, save_state
 
 
+def _trade_count(stats: dict | None) -> int:
+    if not isinstance(stats, dict):
+        return 0
+    return int(stats.get("wins", 0) or 0) + int(stats.get("losses", 0) or 0)
+
+
+def merge_stats_monotonic(state: dict, disk: dict) -> None:
+    """``stats`` 는 승/패·누적 수익률이 **역행하지 않도록** 병합한다.
+
+    GUI ``max_p`` 저장 등으로 ``state_gen`` 만 올라간 디스크가 봇의 청산 stats 를 덮어쓰지 않게 한다.
+    """
+    mem = state.get("stats") if isinstance(state.get("stats"), dict) else {}
+    dsk = disk.get("stats") if isinstance(disk.get("stats"), dict) else {}
+    mc, dc = _trade_count(mem), _trade_count(dsk)
+    if dc > mc:
+        merged = dict(dsk)
+    elif mc > dc:
+        merged = dict(mem)
+    else:
+        merged = dict(dsk)
+        for key in ("wins", "losses", "total_profit"):
+            if key in mem:
+                merged[key] = mem[key]
+        mp = float(mem.get("manual_partial_total_profit_pct", 0.0) or 0.0)
+        dp = float(dsk.get("manual_partial_total_profit_pct", 0.0) or 0.0)
+        merged["manual_partial_total_profit_pct"] = max(mp, dp)
+    state["stats"] = merged
+
+
 def merge_disk_if_newer(state: dict, state_path: str | Path) -> bool:
     """
     디스크 ``state_gen`` 이 메모리보다 크면 GUI 등 외부 저장분을 병합.
@@ -38,7 +67,6 @@ def merge_disk_if_newer(state: dict, state_path: str | Path) -> bool:
         "positions",
         "cooldown",
         "ticker_cooldowns",
-        "stats",
         "peak_equity_KR",
         "peak_equity_US",
         "peak_equity_COIN",
@@ -46,6 +74,7 @@ def merge_disk_if_newer(state: dict, state_path: str | Path) -> bool:
     ):
         if k in disk:
             state[k] = disk[k]
+    merge_stats_monotonic(state, disk)
     state["state_gen"] = dg
     print(f"  📎 [장부 병합] 디스크 state_gen={dg} > 메모리 {mg} — GUI·외부 저장 반영")
     return True

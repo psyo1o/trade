@@ -1,7 +1,7 @@
 ================================================================================
-  c-bot 프로젝트 구조 / 파일 설명 (2026-06-04)
+  c-bot 프로젝트 구조 / 파일 설명 (2026-06-06)
   — 처음 보는 분도 따라갈 수 있게: 무엇이 어디에 있고, 무엇을 Git에 올리지 않는지까지 정리
-  — 멱등·장부정합·매매내역 복구·balance_read 반영 (상세: docs/idempotency/LEDGER_RECONCILE.md)
+  — 멱등·장부정합·매매내역 복구·balance_read·매매 로직(사이클 순서·SWING/V8) 반영
 ================================================================================
 
 [이 저장소는?]
@@ -17,6 +17,7 @@
 [Git에 없을 수 있는 파일 — 반드시 로컬에서 준비]
   config.json              API 키·계좌·텔레그램 (비밀, .gitignore)
   bot_state.json           장부·쿨다운·Phase5 등 런타임 상태 (.gitignore)
+  bot_state.bak            save_state 직전 자동 백업(positions 있을 때). 유실 시 bot_state.json 으로 수동 복구
   trade_history.json       매매 이력 append (.gitignore)
   us_universe_cache.json   미장 감시 유니버스 캐시 (.gitignore)
   kr_targets.json          국장 스크리너 출력(매번 변함, .gitignore)
@@ -32,10 +33,11 @@
   git_push.bat … git add -A → commit → push -u origin main (origin 없으면 안내)
   api/           … KIS·업비트·바이낸스(CCXT)·거시지표 래퍼, coin_config/coin_broker, KIS 파서(kis_parsers.py)
   strategy/      … 진입·청산 규칙(rules.py, indicators.py), 섹터·AI·거시
-  execution/     … 장부·동기화·TWAP·멱등·ledger_apply·balance_read·분할익절·서킷
+  execution/     … 장부·동기화·TWAP·order_executor·state_schema·멱등·ledger_apply·balance_read·market_cycles·분할익절·서킷
   docs/idempotency/ … 멱등·장부정합 설계·운영 스모크 체크리스트
   services/      … 잔고 facade, 스냅샷, trade_history_ledger, GUI 테이블 어댑터
   scripts/       … restore_positions_from_trade_history.py (매매내역→장부 수동 복구)
+                 archive/ … B-1 1회성 마이그레이션 스크립트 (재실행 금지, README 참고)
   utils/         … 로그, 텔레그램, ohlcv_store, yfinance_guard, 공통 헬퍼
   data/ohlcv_cache/ … 일봉 디스크 캐시(JSON, Git 제외)
   tests/         … test_lab.py, test_ohlcv_pipeline.py, test_kis_parsers.py 등
@@ -64,21 +66,24 @@ run_bot.py
     (macro_snap: PCR·고래·환율 모멘텀·market_buy_allowed / market_buy_block_reason; macro_mult=1.0)
   - 매수 전 RS: _sort_buy_targets_by_rs → alpha_sizing. 비중: _position_ratio_with_vol_target
     (min(1/N, alpha_target_vol/ATR%), config alpha_target_vol 기본 0.02)
-  - 본문: helper 2차 분리 + 시장별 3차 분리 완료 → execution/market_cycles/ (run_kr_cycle·run_us_cycle·run_coin_cycle).
-  - run_trading_bot: TradingCycleContext → 위 3함수 → save_state (순서·태그 동일).
+  - 본문: helper 2차 + 시장별 3차 → execution/market_cycles/ (매도·매수). run_bot._run_*_buy_cycle / _execute_*_market_buy_twap 은 **위임 래퍼** — 구현은 *_buy_cycle.py·order_executor.py.
+  - run_trading_bot: prepare → sync → context → **load 재로드** → reconcile → KR RS → run_kr/us/coin_cycle → save_state.
   - Phase5: 비중 판정 circuit_break.py · 루프 연동 execution/phase5_ops.py (run_bot 위임).
     합산 MDD는 account_circuit_use_total. docs/PHASE5_ACCOUNT_CIRCUIT.md
-  - circuit_aux_last_* / phase5_share_anchor / phase5_pending_liquidation_markets
+  - circuit_aux_last_coin_krw / phase5_share_anchor / phase5_pending_liquidation_markets
+  - last_kis_display_snapshot (국·미 예수·총평 단일 저장소) · _phase5_aux_sync (ledger_only 시 장부+시세 추정 총평)
   - kis_balance_sync_mode on_trade: 평상시 장부+시세, 매매·강제새로고침·입출금 시 KIS 실조회
-  - refresh_circuit_aux_from_brokers … adjust_capital·live sync 시
+  - refresh_circuit_aux_from_brokers … adjust_capital·live sync 시 (KR/US → last_kis_display_snapshot, 코인 → circuit_aux_last_coin_krw)
   - 관측성: [KR …], [US …], [COIN …] 태그. 매수 스캔은 rules.calculate_pro_signals 안에서 [V8],
     스윙 보조는 check_swing_entry 실패 시 [스윙] 한 줄(run_bot에서 출력).
   - 매수 시간창: 국 ``_is_kr_buy_window_now`` (KRX 15:30 KST 직전 N분), 미 ``_is_us_buy_window_now`` (NYSE 16:00 ET 직전 N분),
     코인 ``_is_coin_buy_window_now`` (일봉 KST 09:00 직전 N분, 업비트·바이낸스 공통). 창 안에서 V8→스윙·스캔·주문.
     코인 스캔 유니버스: 업비트 KRW·바이낸스 USDT **24h 거래대금 상위 N**(기본 **10**, ``config.json`` ``upbit_universe_top`` / ``binance_universe_top``).
   - Phase4 글로벌: 사이클 시작 ``🛡️ [Phase4 거시]`` / ``🛡️ [Phase4 글로벌]`` / ``🚫 [Phase4 글로벌] MK …`` 는 매 사이클.
-    ``-> 🚨 국장|미장|코인 Phase4 글로벌 방어막`` 은 **해당 시장 매수 창 안**에서만(창 밖은 ``[KR|US|COIN 매수 대기]``만).
-    Phase4 예산 축소(VIX/FGI) 제거 — ``macro_mult`` 항상 1.0. 시장별 글로벌만 ``-> 🚨 … 글로벌 방어막`` (매수 창 안).
+    Phase4+헷지(매수 창 안): ``🚨 [Phase 4 발동] … 헷지 자산만`` / ``🛡️ [헷지 유니버스 KR|US]`` (티커: strategy/hedge_universe.py, grep HEDGE_UNIVERSE).
+    Phase4 예산 축소(VIX/FGI) 제거 — ``macro_mult`` 항상 1.0.
+  - 하락장 헷지: strategy/hedge_universe.py (단일 출처) → run_bot _merge/_apply_phase4/_run_*_buy_cycle.
+    MAX_POSITIONS·AI 예외. docs/HEDGE_UNIVERSE.md
   - 동기화: ``fetch_equity_held_lists_for_position_sync`` — 국·미 비정규장이면 KIS 보유 목록 조회 생략. ``sync_all_positions`` 에서 비장중 held 보강 등.
   - 일봉 OHLCV: ``get_cached_ohlcv`` — 메모리·``ohlcv_store`` 디스크(3일, ``d``+정렬+꼬리검증) → 국 KIS+pykrx 교차검증 → 미 KIS+yfinance 교차검증 → Stooq→yfinance 보강.
     목표 200봉; 텔레·GUI·매도선도 동일 일봉. ``OHLCV_MIN_BARS``; ``yfinance_guard`` 티커별 백오프.
@@ -87,6 +92,7 @@ run_bot.py
   - 텔레 heartbeat: ``heartbeat_report`` → ``get_*_holdings_with_roi`` → ``_format_holding_line``
     (``전략:V8|스윙 | 매수가 | 현재가 | 최고가 | 매도선 | 보유기간``).
     ``_heartbeat_strategy_label`` — 장부 strategy_type·tier; 없으면 ``_strategy_from_trade_history_buy``(trade_history 최근 BUY reason).
+    비장·주말 장부 폴백: ``_equity_ledger_source_tag`` — KR/US 동일 (주말·마지막현재가 / 주말·장부평단 / 장외·…). ``curr_p`` 우선.
     스윙 매도선은 ``_heartbeat_resolve_sl_p`` + ``get_swing_exit_display_price``.
   - 사이클 말: 매수 존에 들었으나 신규 체결 0건이면 텔레그램 ``[매수 패스]`` — 본문에 이번 존 시장만 ``KR`` / ``US`` / ``COIN`` 표기(복수 시 ``KR·US`` 등).
 
@@ -97,12 +103,12 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
     바이낸스일 때 코인 칸·보유표·장부 탭 코인 가격은 USDT로 표시(스냅샷·서킷·Phase5는 내부 KRW 환산 유지).
     텔레 생존신고 코인 요약 USDT는 binance_display_cash_and_total_usdt()(원화 왕복 없음). TWAP 알림도 동일 규칙.
     잔고 API 실패 시 코인 상단 라벨은 bot_state last_coin_display_snapshot 폴백(성공 시 저장).
-  - "예수금 새로고침" = 장부+시세([표시] 로그) / "KIS 강제 새로고침" = 실조회(🔁 로그, 스냅샷 저장). docs/KIS_GUI_DISPLAY.md
+  - "예수금 새로고침" = 장부+시세([표시] 로그, 동일 문구 1회) / "KIS 강제 새로고침" = 실조회(🔁 로그, 스냅샷 저장, 급변 시 확인창). docs/KIS_GUI_DISPLAY.md
   - 스핀: 국·미·코인 max_positions + "설정 실시간 적용" → run_bot.MAX_* 즉시 + bot_state settings 저장.
-  - 실시간 현황 보유표: **전략** 열(V8/스윙) 다음 **수동매도** 열 — 수량 QLineEdit(기본=행 보유 전량, 비우면 전량) + 매도 버튼 → _on_manual_sell_click
+  - 실시간 현황 보유표: **전략** 열(V8/스윙/헷지, hedge_universe 등록 종목) 다음 **수동매도** 열 — 수량 QLineEdit …
     (보유 초과·정수 주/코인 소수 검증) → run_bot.manual_sell.
   - 탭: 실시간 현황(7열: 시장·종목·수량·매수가·현재가·전략·수동매도), 매매 내역, 장부(텔레 동일 보유 한 줄+상세),
-    매매·전략 안내(타임스탑·매도선·러너 5MA), 고점 보정(CapitalAdjustThread).
+    매매·전략 안내(V8·SWING·헷지·Phase1~5, _build_strategy_guide_text + hedge_universe), 고점 보정.
     실시간: 최고가·매도선·보유시간 없음 — 장부·heartbeat·15분 매매 로그에 ``format_holding_display_line`` 공용.
     보유 로그: 기동·잔고 갱신만으로 찍지 않음 — ``heartbeat_report``·매매 사이클 시.
     종목명 열 Interactive(약 절반 cap), 수량·가격·전략·매도 열 Stretch(_configure_holding_table).
@@ -110,7 +116,7 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
     봇 브리핑 로그는 탭 아래 공통 영역(QSplitter, run_gui.py setSizes).
     GUI 타이포: 전역 15pt/15px (_dashboard_stylesheet + QFont 15). 로그·표·버튼·탭·상단 라벨 동일.
   - KIS 강제 새로고침: refresh_balance(sync_first=True, force_kis=True) — KIS 보유→sync_all_positions(force_equity_sync).
-    비장중 라벨 방어는 총평 급변만(account_snapshot._maybe_reject_off_hours_force_label_anomaly).
+    비장중: 미장 0/급감/예수0 1겹 + force 시 _maybe_reject(급증·급감). GUI는 kis_label_anomaly_prompt 확인창.
   - 매매: 기동 직후 즉시 1회 없음 → KST :00/:15/:30/:45 정렬 타이머만 (중복 실행 가드).
   - 기동 직후 약 150ms에 refresh_balance(sync_first=False) 1회로 화면만 선채움.
   - 매매 직전 refresh_balance로 max_p 맞춤 후 WorkerThread에서 엔진.
@@ -122,7 +128,7 @@ run_gui.py  (일상 운영용 대시보드 — 화면 상세는 README.md 「GUI
     + gui_table_adapter.build_rows_data (잔고 API = execution/balance_read.py).
   - update_max_price_if_higher: 저장 전 ledger_apply.merge_disk_if_newer (state_gen 병합).
   - 매매 스케줄: GUI 시작 즉시 1회 실행 없이 KST :00/:15/:30/:45 정렬 타이머에서만 run_trading_bot 호출.
-  - US/KR 현재가: 장부 폴백(current=avg)·비장중 구간에서 정규화 후 yfinance 경로를 유도해 표시 안정화.
+  - US/KR 현재가: 비장·주말은 장부 ``curr_p``(없으면 평단) + ``resolve_holding_display_price``. facade 로그 ``[조회 facade KR 보유]`` / ``[US 보유]`` (info/detail 함수명과 무관, 동일 문구 1회).
 
 screener.py
   - 국장 HTS 조건검색(kis_hts_id 계정에 등록된 식 전부) 합쳐 kr_targets.json (로컬, Git 무시).
@@ -159,10 +165,12 @@ bot_state.json
     manual_partial_total_profit_pct=수동 부분 매도 가중 누적)
   - Phase5: peak_total_equity, last_reset_week(예 2026-W16),
     account_circuit_peak_reset_pending, account_circuit_cooldown_until,
-    circuit_aux_last_*  (레거시 peak_equity_total_krw는 로드시 자동 이관/정리)
-  - last_kis_display_snapshot, last_coin_display_snapshot, capital_adjustments(선택)
+    circuit_aux_last_coin_krw  (레거시 circuit_aux_last_kr/usd·peak_equity_total_krw는 폴백만)
+  - last_kis_display_snapshot, last_coin_display_snapshot, _phase5_aux_sync, capital_adjustments(선택)
   - order_idempotency, buy_inflight, sell_inflight (주문 멱등 — positions 와 분리)
   - state_gen (저장 버전; GUI·봇 동시 저장 시 merge_disk_if_newer)
+
+  (같은 폴더, 별도 파일) bot_state.bak — save_state 직전 자동 백업(positions 있을 때; C-1 state_schema 경고와 별도)
 
 trade_history.json
   - 매매 이벤트 append. BUY ``reason``(예 SWING_FIB) + (2026-06~) ``strategy_type``·``entry_fib_level``·``sl_p``·``buy_time`` 등.
@@ -194,6 +202,8 @@ api/
   kis_parsers.py … output2·output1 파싱(KR/US 예수·보유지표·held코드·US평가금 보정); run_bot 위임
 
 strategy/
+  entry_router.py · exit_router.py … B-2 진입/청산 라우터 (market_cycles/*_buy_cycle·coin_cycle 경유)
+  hedge_universe.py … 하락장 헷지 티커 (grep HEDGE_UNIVERSE)
   rules.py … ``get_ohlcv_pykrx``(국장 백업), ``get_ohlcv_stooq``(키 필요), ``get_ohlcv_yfinance``(stderr·티커 백오프),
     calculate_pro_signals(V8: Hurst<0.45·120MA 위(20일 최고 거래량 갱신 시 예외)·20MA 우상향·MACD·RSI 등, 최소 120봉),
     check_swing_entry(Pullback: 60MA 위·시장별 이격 US+15/KR+20/COIN+30·Dry-up·갭3%·양봉·윗꼬리5%·RSI≥35·피보),
@@ -223,13 +233,15 @@ strategy/
   sector_lock.py … Phase1 섹터 과다 방지
   ai_filter.py … Phase3 뉴스 LLM 0~100, 듀얼 프롬프트(v8_strict / swing_terminal_risk), Gemini→OpenAI 폴백
   macro_guard.py … Phase4 시장별 글로벌 매수 차단(US PCR / COIN 고래 / KR 환율 모멘텀).
+  hedge_universe.py … 하락장 헷지 티커 하드코딩(HEDGE_ASSETS_KR/US, grep HEDGE_UNIVERSE).
     market_buy_allowed만 사용 — V8·SWING 전략 예외 없음.
     macro_buy_allowed_for_strategy(호환 래퍼), is_us_put_call_macro_block — run_bot _macro_market_buy_allowed
 
 execution/
-  guard.py … load/save_state(+state_gen 증가·RLock), cooldown, MDD, Phase5, can_open_new,
-    compute_ticker_cooldown_hours / set_ticker_cooldown_after_sell (Layer2 ticker_cooldowns:
-    매도 사유별 1h(익절·트레일·Scale-Out) / 24h(손절·타임스탑), 분할 잔량 시 미부여)
+  guard.py … load/save_state(+state_gen·RLock·bot_state.bak), cooldown, MDD, Phase5, can_open_new,
+    load 시 execution/state_schema.log_load_summary (중복 로그 억제), save 시 positions 급감 경고
+  state_schema.py … validate_state(읽기 전용), count_positions, warn_positions_drop (C-1)
+  order_executor.py … TWAP 매수 본문 (run_bot._execute_*_market_buy_twap 위임)
   ledger_apply.py … persist_position_set/remove, save_state_verified(3회·reload 검증),
     merge_disk_if_newer; 병합 후 verify_ticker pending 재적용(GUI state_gen 레이스 방지)
   sync_positions.py … 실계좌↔장부. KR/US 휴장이면 KIS 시드·유령·주식 자동복구 생략(코인 계속).
@@ -237,7 +249,7 @@ execution/
     신규 복구: trade_history BUY 우선 [매매내역 복구] → 없으면 ATR 자동복구.
     기존 장부: position_needs_history_enrich → [매매내역 보강](buy_time·SWING·1R·sl_p).
     바이낸스 코인 평단 API 없음 → buy_p 덮지 않음. held∪live_seeds 유령 판단 보강 등
-  order_twap.py … Phase2 TWAP
+  order_twap.py … Phase2 TWAP slice 계획
   idempotency.py … 매수·매도 TWAP 멱등(order_key·buy/sell_inflight·lane·persist_idempotency),
     aggregate_filled_sells_cycle, lane_has_filled_sell,
     reconcile_positions_for_cycle / reconcile_ticker_lane (filled ↔ positions)
@@ -249,20 +261,22 @@ execution/
     수동 부분 매도는 False로 자동 분할익절 플래그와 분리
   circuit_break.py … 합산·시장별 비중 드로다운 판정
   phase5_ops.py … 대기청산·시장별 청산·maybe_run_account_circuit
-  market_cycles/ … run_kr_cycle·run_us_cycle·run_coin_cycle (TradingCycleContext, run_bot rb. 위임)
-  services/account_display.py … GUI·heartbeat 스냅샷 진입점
-  services/heartbeat_report.py · report_formatter.py … 생존신고
+  market_cycles/ … run_{kr,us,coin}_cycle + run_{kr,us,coin}_buy_cycle (TradingCycleContext, rb. 위임)
+    매도는 *_cycle, 매수는 *_buy_cycle; TWAP는 order_executor
 
 services/
-  account_read_facade.py … KR/US 보유 조회 통합, 폴백 시 한 줄 로그
-  account_snapshot.py … GUI/heartbeat 스냅샷·현재가·보유 한 줄.
-    잔고 fetch는 run_bot.build_account_snapshot_for_report 가 주입한 balance_read 래퍼 사용
-    비장중 KIS 강제 새로고침: 총평 급변만 라벨 유지(_maybe_reject_off_hours_force_label_anomaly)
+  account_read_facade.py … KR/US 보유 조회 단일 진입(get_held_stocks_* / *_info / *_detail).
+    비장·주말: 장부 폴백, US detail도 curr_p 우선. 로그 태그 ``KR 보유`` / ``US 보유`` (동일 문구 1회).
+  account_display.py … GUI·heartbeat 스냅샷 단일 진입 (display_note_once — [표시] 중복 억제)
+  account_snapshot.py … 라벨 조립·KIS force_kis·스냅샷 저장·현재가
+  ledger_valuation.py … 장부+시세 synthetic·coalesce·kis_display_total·Phase5 ledger_only 추정
+  heartbeat_report.py · report_formatter.py … 생존신고·텔레 문구
   trade_history_ledger.py … trade_history 최근 BUY → positions 보강·자동복구 행 생성
-  gui_table_adapter.py … 실시간 테이블 행 조립(전략 열 포함)
+  gui_table_adapter.py … 실시간 테이블 행(비장 KR→kr_info, US→us_detail; 현재가는 resolve_holding_display_price)
 
 scripts/
   restore_positions_from_trade_history.py … 장부 SWING·buy_time·entry_fib 수동 복구 (--dry-run)
+  archive/ … 1회성 마이그레이션 (_extract_*, _wrap_order_executor 등). 재실행 금지
 
 utils/
   math_utils.py … calculate_hurst_exponent (R/S)
@@ -277,48 +291,54 @@ tests/
   test_idempotency.py … order_key·buy/sell 멱등·lane·reconcile 집계
   test_balance_read.py … TTL 캐시·refresh·report 헬퍼
   test_trade_history_ledger.py · test_ledger_apply_merge.py · test_account_snapshot_force_kis.py
+  test_state_schema.py · test_account_read_facade_log.py · test_equity_ledger_source_tag.py
+  test_market_cycles_smoke.py · test_modularization_wiring.py
   test_ohlcv_pipeline.py · test_ohlcv_series.py … 일봉 계약·교차검증·HALF scale_out_done
   test_lab.py, test_kis_parsers.py, test_news_fetch.py, test_alt_data_research.py
 
 
 --------------------------------------------------------------------------------
-4) 한 사이클(run_trading_bot) 순서 (텍스트 흐름도)
+4) 한 사이클(run_trading_bot) 순서 — 코드 그대로
 --------------------------------------------------------------------------------
 
-  1) _prepare_cycle_state … load·키 정규화·prune order_idempotency·bal_read.invalidate
-  2) _sync_positions_for_cycle … sync_all_positions (API 전부 성공 시)
-  3) load_state · reconcile_positions_for_cycle(이번 15분 filled 매도 ↔ positions)
-  4) 리스크 … 시장별 MDD, Phase5 합산 서킷, Phase4 글로벌 알파 스냅샷, 섹터·(매수 전) AI(TREND_V8만)·Hurst 등
-  5) 매도 … KR → US → COIN
-       - 보유 로그: SWING_FIB → 매도선(스윙)=get_swing_exit_display_price, sl_p·max_p 매 사이클 갱신(기존 포지션 포함)
-       - strategy_type==SWING_FIB → check_swing_exit(reference_price, trading_hours_held)
-         HALF=50% 익절(≥1.5R) / FULL=피보·구름+시간가중·RSI — 1차익절은 매도선 아님
-         HALF·FULL이면 continue, HOLD면 아래로 (V8 Scale-Out 스킵)
-       - 분할익절(Scale-Out): strategy_type==TREND_V8 만 → 타임스탑 → SWING: _check_swing_trailing_exit
-         (비러너 본절락 / 러너 5MA 이탈; FULL 5MA는 check_swing_exit 동시);
-         피보/구름 FULL은 check_swing_exit, 손실구간 V8 hard_stop 스킵), TREND_V8: hard_stop·샹들리에
-       - 타임스탑: V8 주식 72h/+4%, V8 코인 48h/+4%, SWING 주식 48h/+2%, SWING 코인 24h/+2%
-         (KR/US: 거래일 24h 누적·휴장 0 — ``_time_stop_hours_elapsed``; COIN 연속)
-       - 하드·매도선: V8 get_final_exit_price(샹들리에+20MA/ATR+본절락≥4%, 고정% 캡 없음).
-         SWING get_swing_hard_stop_floor(피보·구름+영업24h후 시간가중 10%/24h)
-       - V8 매수 초기 sl_p: calculate_pro_signals 기술 ATR선
-         SWING 표시 get_swing_exit_display_price(하드+본절락; 러너+5MA)
-       - 타임스탑 reason 태그: [V8_TIME_STOP_*], [SWING_TIME_STOP_*] — ticker_cooldowns는 guard.py
-       - 타임스탑/하드스탑/샹들리에 전량 청산: 멱등 exit lane 단일 주문(♻️ 재사용).
-         체결 후 ledger_apply.persist_position_remove. TWAP는 매수·Scale-Out 전용.
-       - HALF/Scale-Out: lane filled 시 reconcile_ticker_lane 후 게이트; 체결 후 ledger_apply.persist_set
-  6) 매수 … KR → US → COIN (시간창·필터 통과 시)
-       - Phase4: market_buy_allowed false → 해당 시장 매수 창 전체 중단(V8·SWING 공통, US PCR 스윙 예외 없음)
-       - BEAR 날씨: V8 신규 매수만 차단(_v8_trend_buy_allowed_in_weather), SWING_FIB 스윙 매수·스캔은 계속(Phase4 통과 시)
-       - 후보 RS 정렬(alpha_sizing) → V8 calculate_pro_signals(Hurst<0.45) 우선, 실패 시 check_swing_entry
-         (국장 갭+5%·KR/US/COIN reference_close 실시간 양봉; V8 필터 없음)
-       - Portfolio Heat: 시장별 Σ(비중×ATR%) ≥ portfolio_heat_max_pct(기본 0.06) → 해당 시장 신규 매수 차단
-       - Phase3 AI: _ai_false_breakout_buy_gate → strategy_type 전달·듀얼 프롬프트
-       - 이미 보유(held_*) 종목은 신규 매수 스킵 (Holding Lock)
-       - 비중: min(1/N, alpha_target_vol/ATR%) 후 예수금·최소주문 (macro_mult=1.0)
-       - SWING 체결 후 register_swing_entry_risk_fields (1R·entry_initial_hard_floor)
-  7) (선택) 매수 존·조건 충족인데 신규 체결 0건 → 텔레그램 [매수 패스]
-  8) trade_history / bot_state 저장 (멱등·장부 변경 시 persist_idempotency / ledger_apply)
+  (개요만 보면 "동기화→리스크→매도→매수" 이지만, context·재로드·KR RS 가 끼어 있음)
+
+  1) _prepare_cycle_state … load·키 정규화·prune order_idempotency·(조건부) bal_read.invalidate
+  2) _sync_positions_for_cycle … KR/US 정규장일 때만 KIS 보유 조회; API 전부 성공 시 sync_all_positions
+  3) _build_market_context … 날씨·Phase4 macro_snap·Phase5 (state 저장 가능)
+  4) load_state 재로드 … 3) 직후 disk 장부 다시 읽음 (순서 혼동 주의)
+  5) reconcile_positions_for_cycle … 이번 15분 cycle_tag filled 매도 ↔ positions
+  6) KR 타겟 … kr_targets + 시총200 + 거래대금50 → hedge merge → RS 정렬 (KR만 여기서)
+  7) run_kr_cycle → run_us_cycle → run_coin_cycle (각 cycle 내부: 7a 매도 → 7b 매수 게이트)
+  8) [매수 패스] 텔레 … buy_zone_* 이고 buy_fills==0
+  9) save_state (+ bot_state.bak)
+
+  7a) run_*_cycle — 장 개장 시 **매도 루프 항상** (Phase4·매수창 무관)
+       - 브로커 보유·장부 없음 → 매도 루프 ``자동등록(보유종목)`` (sync 자동복구와 별개)
+       - SWING: check_swing_exit HALF/FULL → continue. HOLD면 **V8 Scale-Out 절대 안 탐**
+       - V8만: _try_v8_scale_out_* (entry_atr×3·×6; ATR 없을 때 +30% fallback)
+       - EXIT: 타임스탑 → (손실·V8만) hard_stop → (수익) 스윙 트레일 / V8 샹들리에
+       - 전량 청산: LANE_EXIT·LANE_SWING_FULL — 시장가 1회 (TWAP 아님)
+  7b) run_*_cycle — 매수 게이트: MDD → macro_mult(현재 1.0) → Phase5 → 매수 시간창
+       - KR 15:00~15:29 KST · US 15:30~15:59 ET · COIN 08:30~08:59 KST (기본 N=30)
+       - 통과 시 run_*_buy_cycle (본문: market_cycles/*_buy_cycle.py; run_bot._run_* = 래퍼)
+
+  RS: KR=6번 · US=us_buy_cycle 내부 · COIN=coin_buy_cycle 내부
+  TWAP: order_twap=계획 · order_executor=매수 · scale_out=조건·장부(주문은 _try_v8_scale_out_*)
+  buy_cycle: Phase4·BEAR(V8만)·V8→스윙·Heat·AI·order_executor TWAP · Holding Lock
+  buy_zone_coin: coin_cycle 에서만 (KR/US 동일) — Phase4·매수창·MDD·Phase5 통과 후 buy_cycle 호출 직전
+
+  manual_sell: _idempotent_*_sell → persist_idempotency → _apply_manual_sell_state_update
+    → ledger_apply → _run_manual_sell_position_sync (전 API 성공 시 sync)
+
+--------------------------------------------------------------------------------
+4-1) 자주 헷갈리는 이름
+--------------------------------------------------------------------------------
+
+  _run_kr_buy_cycle        → kr_buy_cycle.run_kr_buy_cycle (래퍼)
+  _execute_*_market_buy_twap → order_executor.execute_* (래퍼)
+  SWING scale_out_done     → 1.5R HALF 러너 플래그 (V8 Scale-Out과 무관)
+  macro_mult <= 0          → 레거시; 실질 Phase4는 market_buy_allowed
 
 
 --------------------------------------------------------------------------------
@@ -326,9 +346,10 @@ tests/
 --------------------------------------------------------------------------------
 
   Phase 1 … sector_lock.py (동일 섹터 과다 보유 방지)
-  Phase 2 … order_twap.py, scale_out.py, run_bot 매수·분할익절 매도
+  Phase 2 … order_twap.py, order_executor.py, scale_out.py, run_bot._execute_* 위임
   Phase 3 … ai_filter.py + run_bot._ai_false_breakout_buy_gate (뉴스 LLM, 전략별 듀얼 프롬프트)
-  Phase 4 … macro_guard.py, macro_data.py (US PCR / COIN 고래 / KR 환율 모멘텀; 글로벌 ``-> 🚨`` 는 매수 창 안)
+  Phase 4 … macro_guard.py, macro_data.py (US PCR / COIN 고래 / KR 환율 모멘텀)
+    + hedge_universe.py (Phase4 시 헷지 ETF만; docs/HEDGE_UNIVERSE.md)
   Phase 5 … circuit_break.py, guard.py, run_bot circuit_aux_*, adjust_capital.py
   (별도 번호 없음) ticker_cooldowns … 매도 사유별 1h/24h 재진입 쿨다운 (분할 익절 잔량 시 미부여 / guard.py + run_bot 매도 루프)
 
@@ -337,13 +358,14 @@ tests/
 6) 수정 시 같이 볼 파일 (실수 방지)
 --------------------------------------------------------------------------------
 
-  장부 스키마·기본값 … execution/guard.py, execution/sync_positions.py, run_bot.py
+  장부 스키마·기본값 … execution/guard.py, execution/state_schema.py, execution/sync_positions.py
   멱등·정합·검증 저장 … execution/idempotency.py, execution/ledger_apply.py, docs/idempotency/
   잔고 TTL·GUI/heartbeat … execution/balance_read.py, run_bot.build_account_snapshot_for_report
   분할 익절 상수·로직 … execution/scale_out.py + run_bot 매도 루프
-  TWAP 임계 … config.json twap_* + run_bot TWAP 연동
-  RS·변동성 비중 … strategy/alpha_sizing.py, run_bot _sort_buy_targets_by_rs / _position_ratio_with_vol_target
+  TWAP 임계·매수 본문 … config.json twap_* + execution/order_executor.py (run_bot._execute_* 위임)
+  RS·변동성 비중 … strategy/alpha_sizing.py; KR RS=run_bot._sort_buy_targets_by_rs, US RS=us_buy_cycle 내부
   Phase4 글로벌·Hurst … api/macro_data.py, strategy/macro_guard.py, strategy/rules.py, utils/math_utils.py
+  하락장 헷지 티커 … strategy/hedge_universe.py, execution/market_cycles/*_buy_cycle.py (run_bot._run_* 는 래퍼)
   코인 먼지·최소 주문 … utils/helpers.py, run_bot UPBIT_* 상수
 
 
@@ -351,10 +373,10 @@ tests/
 7) 추가 문서
 --------------------------------------------------------------------------------
 
+  docs/HEDGE_UNIVERSE.md … 하락장 헷지 티커·Phase4 예외 (grep: HEDGE_UNIVERSE)
   docs/idempotency/README.md … 멱등 작업 공간 목차·검증 명령
-  MODULARIZATION_ROADMAP_2026-04-22.md … 이후 모듈화 우선순위
-  MODULARIZATION_REVIEW_2026-04-21.md … 완료된 모듈화 정리
-  MODULARIZATION_NEXT_STEPS_2026-04-21.md … 다음 모듈화 우선순위(2026-05-28 갱신)
+  docs/MODULARIZATION.md … 모듈화 통합 가이드 (Single Source of Truth)
+  docs/KIS_GUI_DISPLAY.md · docs/PHASE5_ACCOUNT_CIRCUIT.md
 
 ================================================================================
   끝. 상세 운영·config 템플릿·트러블슈팅은 README.md 를 함께 보세요.

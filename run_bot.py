@@ -26,6 +26,7 @@ run_bot — V5.0 통합 자동매매 엔진 (국장 / 미장 / 코인)
     * ``execution.order_twap`` — 대액 시장가 분할 매수(TWAP).
     * ``strategy.rules`` — 진입/청산 시그널·OHLCV.
     * ``strategy.sector_lock`` / ``strategy.ai_filter`` / ``strategy.macro_guard`` — 섹터·휩쏘·거시.
+    * ``strategy.hedge_universe`` — **하락장 헷지 티커 하드코딩 단일 출처** (grep: ``HEDGE_UNIVERSE``).
 
 코드 맵
     * 상단 유틸 — 지수 변화율, 미장 유니버스(고베타 NDX+S&P RR 150, ``us_universe_cache.json``) 등.
@@ -123,14 +124,18 @@ from strategy.ai_filter import (
     evaluate_false_breakout_filter,
     summarize_ai_rationale,
 )
+from strategy.hedge_universe import (
+    HEDGE_TICKERS_KR,
+    HEDGE_TICKERS_US,
+    HEDGE_TICKERS_COIN,
+    format_hedge_universe_summary,
+    hedge_tickers_for_market,
+    is_coin_hedge_internal_ticker,
+)
 from strategy.entry_router import decide_entry_signals
 from strategy.exit_router import decide_swing_exit, decide_v8_exit
 from strategy.rules import (
-    calculate_pro_signals,
-    check_swing_entry,
-    check_swing_exit,
     check_swing_profit_lock_trailing_exit,
-    check_pro_exit,
     get_final_exit_price,
     get_swing_exit_display_price,
     get_swing_scale_out_target_price,
@@ -149,7 +154,6 @@ from strategy.market_hours import trading_hours_elapsed
 from strategy.indicators import get_safe_atr
 from services.account_snapshot import (
     resolve_display_current_price as _resolve_display_current_price,
-    build_account_snapshot_for_report as _build_account_snapshot_for_report,
 )
 from services import account_read_facade
 from strategy.sector_lock import allow_kr_sector_entry, allow_us_sector_entry, seed_us_sector_cache
@@ -398,6 +402,9 @@ _saved_settings = _tmp_state.get("settings", {})
 MAX_POSITIONS_KR = _saved_settings.get("max_pos_kr", 3)      # 기본값 3
 MAX_POSITIONS_US = _saved_settings.get("max_pos_us", 3)      # 기본값 3
 MAX_POSITIONS_COIN = _saved_settings.get("max_pos_coin", 5)  # 기본값 5
+
+# 하락장 헷지 티커 — 정의·한글명은 strategy/hedge_universe.py (grep: HEDGE_UNIVERSE)
+# HEDGE_TICKERS_KR / HEDGE_TICKERS_US / HEDGE_TICKERS_COIN 는 위 모듈에서 re-export.
 
 # Phase 3: AI False Breakout filter
 AI_FALSE_BREAKOUT_ENABLED = bool(config.get("ai_false_breakout_enabled", True))
@@ -978,12 +985,28 @@ def save_last_kis_display_snapshot(
     """
     if kis_equities_weekend_suppress_window_kst() and not force:
         return
+    from services import ledger_valuation as _lv
+
     st = load_state(STATE_PATH)
-    st["last_kis_display_snapshot"] = {
-        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "kr": {"cash": int(d2_kr), "total": int(kr_total), "roi": kr_hold_roi},
-        "us": {"cash": float(us_cash), "total": float(us_total), "roi": us_hold_roi},
-    }
+    saved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _lv.write_kis_display_snapshot_part(
+        st,
+        "KR",
+        cash=float(d2_kr),
+        total=float(kr_total),
+        roi=kr_hold_roi,
+        saved_at=saved_at,
+        force=bool(force),
+    )
+    _lv.write_kis_display_snapshot_part(
+        st,
+        "US",
+        cash=float(us_cash),
+        total=float(us_total),
+        roi=us_hold_roi,
+        saved_at=saved_at,
+        force=bool(force),
+    )
     save_state(STATE_PATH, st)
 
 
@@ -1641,11 +1664,13 @@ def manual_sell(market, code, quantity, *, idem_lane: str | None = None):
 
 
 def _portfolio_total_krw_from_aux(state: dict) -> float:
-    """직전 루프에서 저장한 시장별 합산 스냅샷 + 현재 환율로 원화 합산."""
+    """직전 루프 시장별 합산 + 현재 환율로 원화 합산 (국·미는 스냅샷)."""
+    from services.ledger_valuation import kis_display_total
+
     rate = estimate_usdkrw()
-    kr = float(state.get("circuit_aux_last_kr_krw", 0) or 0)
+    kr = kis_display_total(state, "KR")
     coin = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
-    usd = float(state.get("circuit_aux_last_usd_total", 0) or 0)
+    usd = kis_display_total(state, "US")
     return kr + coin + usd * rate
 
 
@@ -1672,12 +1697,16 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
         pass
 
     path = Path(path)
-    prev_kr_equity = float(state.get("circuit_aux_last_kr_krw", 0) or 0)
-    prev_us_equity = float(state.get("circuit_aux_last_usd_total", 0) or 0)
+    from services import ledger_valuation as lv
+
+    prev_kr_equity = lv.kis_display_total(state, "KR")
+    prev_us_equity = lv.kis_display_total(state, "US")
     prev_coin_equity = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
     total_kr_equity = prev_kr_equity
     total_us_equity = prev_us_equity
     total_coin_equity = prev_coin_equity
+    kr_cash_live = 0.0
+    us_cash_live = 0.0
 
     suppress = kis_equities_weekend_suppress_window_kst()
     if suppress:
@@ -1700,7 +1729,7 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
                 ok, why = kis_response_ok(bal, require_output2=True)
                 if ok:
                     kr_balance_data = bal.get("output2", [])
-                    _, parsed_kr = parse_kr_cash_total(kr_balance_data, _to_float)
+                    kr_cash_live, parsed_kr = parse_kr_cash_total(kr_balance_data, _to_float)
                     suspicious_kr = (
                         prev_kr_equity > 500_000.0
                         and float(parsed_kr) > 0.0
@@ -1782,6 +1811,7 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
                         )
                     else:
                         total_us_equity = float(parsed_us)
+                        us_cash_live = float(us_cash)
                         result["us_ok"] = True
             else:
                 snap = load_last_kis_display_snapshot()
@@ -1843,9 +1873,17 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
         pass
 
     if result["kr_ok"]:
-        state["circuit_aux_last_kr_krw"] = float(total_kr_equity)
+        kr_part = lv._kis_snap_bucket(state, "KR")
+        cash_kr = float(kr_cash_live) if kr_cash_live > 0 else float(kr_part.get("cash", 0) or 0)
+        lv.write_kis_display_snapshot_part(
+            state, "KR", cash=cash_kr, total=float(total_kr_equity)
+        )
     if result["us_ok"]:
-        state["circuit_aux_last_usd_total"] = float(total_us_equity)
+        us_part = lv._kis_snap_bucket(state, "US")
+        cash_us = float(us_cash_live) if us_cash_live > 0 else float(us_part.get("cash", 0) or 0)
+        lv.write_kis_display_snapshot_part(
+            state, "US", cash=cash_us, total=float(total_us_equity)
+        )
     if result["coin_ok"]:
         state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
     save_state(path, state)
@@ -2608,16 +2646,15 @@ def _try_v8_scale_out_coin(
     return False, pos
 
 
+
 def _twap_krw_budget_slices(total_krw: float) -> list:
-    if not TWAP_ENABLED:
-        return [float(total_krw)]
-    return plan_krw_slices(float(total_krw), threshold_krw=TWAP_KRW_THRESHOLD)
+    from execution import order_executor as oe
+    return oe.twap_krw_budget_slices(total_krw)
 
 
 def _twap_usd_budget_slices(total_usd: float) -> list:
-    if not TWAP_ENABLED:
-        return [float(total_usd)]
-    return plan_usd_slices(float(total_usd), threshold_usd=TWAP_USD_THRESHOLD)
+    from execution import order_executor as oe
+    return oe.twap_usd_budget_slices(total_usd)
 
 
 def _execute_kr_market_buy_twap(
@@ -2635,150 +2672,21 @@ def _execute_kr_market_buy_twap(
     strategy_type: str = "TREND_V8",
     entry_fib_level: float = 0.0,
 ) -> bool:
-    """시장가 매수(Phase2 분할). 성공 시 장부 1회 등록. TEST_MODE 시 로그만."""
-    cycle_tag = order_idem.cycle_tag_15m_kst()
-    if not order_idem.try_acquire_buy_inflight(state, "KR", t, cycle_tag):
-        print(f"  ⏭️ [KR TWAP] {kr_name}({t}): 동일 사이클 매수 진행 중(멱등)")
-        return False
-
-    slices = _twap_krw_budget_slices(target_budget)
-    if len(slices) > 1:
-        print(
-            f"  📉 [Phase2 TWAP KR] {kr_name}({t}) 예산 {int(target_budget):,}원 → {len(slices)}분할 "
-            f"(잔여예수 추정 {int(kr_cash_holder[0]):,}원)"
-        )
-
-    total_qty = 0
-    total_cost = 0.0
-    fp = float(curr_p)
-    any_fill = False
-    qty_before = None
-    if not TEST_MODE:
-        try:
-            qty_before = bal_read.kr_stock_qty(t, refresh=False)
-        except Exception:
-            qty_before = None
-
-    try:
-        for si, krw_slice in enumerate(slices):
-            if krw_slice <= 0 or fp <= 0:
-                continue
-            q = int(float(krw_slice) / fp)
-            if q <= 0:
-                print(
-                    f"  ⏭️ [KR TWAP] 슬라이스 {si + 1}/{len(slices)} 정수주 0 — "
-                    f"액면 {int(krw_slice):,}원 < 1주 기준(~{int(fp):,}원)"
-                )
-                continue
-            est = int(q * fp)
-            if int(kr_cash_holder[0]) < est:
-                print(f"  ⏭️ [KR TWAP] 슬라이스 {si + 1}/{len(slices)} 예수 부족으로 중단")
-                break
-
-            if TEST_MODE:
-                send_telegram(f"🧪 TEST_MODE KR TWAP {t} ({kr_name}) {si + 1}/{len(slices)} qty={q}")
-
-            def _kr_place():
-                return create_market_buy_order_kis(t, q, is_us=False, curr_price=fp)
-
-            def _kr_qty_now():
-                try:
-                    return bal_read.kr_stock_qty(t, refresh=True)
-                except Exception:
-                    return None
-
-            fill = order_idem.run_kis_buy_slice_idempotent(
-                state,
-                market="KR",
-                ticker=t,
-                slice_index=si,
-                qty=q,
-                cycle_tag=cycle_tag,
-                place_order=_kr_place,
-                fallback_price=fp,
-                balance_qty_fn=None if TEST_MODE else _kr_qty_now,
-                qty_before=qty_before,
-                test_mode=TEST_MODE,
-            )
-
-            if not fill.ok and not TEST_MODE:
-                msg_l = str(fill.note or "").lower()
-                if "credentials" in msg_l or "token" in msg_l:
-                    print("  🔄 [토큰 오류] 토큰 갱신 후 TWAP 슬라이스 1회 재시도...")
-                    refresh_brokers_if_needed(force=True)
-                    time.sleep(1)
-                    order_idem.pop_order_record(
-                        state,
-                        order_idem.order_key("KR", t, "buy", cycle_tag, si),
-                    )
-                    fill = order_idem.run_kis_buy_slice_idempotent(
-                        state,
-                        market="KR",
-                        ticker=t,
-                        slice_index=si,
-                        qty=q,
-                        cycle_tag=cycle_tag,
-                        place_order=_kr_place,
-                        fallback_price=fp,
-                        balance_qty_fn=_kr_qty_now,
-                        qty_before=qty_before,
-                    )
-
-            tag = "♻️" if fill.reused else "🧾"
-            print(
-                f"  {tag} [KR BUY TWAP {si + 1}/{len(slices)}] {t} "
-                f"ok={fill.ok} qty={int(fill.qty)} note={fill.note}"
-            )
-
-            if not fill.ok:
-                print(f"  ❌ [KR TWAP] {kr_name}({t}) 슬라이스 {si + 1} 최종 실패: {fill.note}")
-                if not TEST_MODE:
-                    order_idem.persist_idempotency(state, STATE_PATH)
-                break
-
-            fp = float(fill.price) if fill.price > 0 else fp
-            total_qty += int(fill.qty)
-            total_cost += float(fill.qty) * fp
-            kr_cash_holder[0] = float(int(kr_cash_holder[0]) - int(fill.qty * fp))
-            any_fill = True
-            if not TEST_MODE:
-                qty_before = bal_read.kr_stock_qty(t, refresh=True)
-
-            if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
-                time.sleep(TWAP_SLICE_DELAY_SEC)
-    finally:
-        order_idem.release_buy_inflight(state, "KR", t, cycle_tag)
-
-    if not any_fill or total_qty <= 0:
-        return False
-
-    wavg = total_cost / total_qty if total_qty else fp
-    print(f"  ✅ [국장 매수 체결 TWAP] {kr_name}({t}) | 가중평단 ~{int(wavg):,}원 × {total_qty}주 | 손절가: {int(sl_p):,}원")
-    send_telegram(
-        f"🎯 [{t_name} 매수 TWAP] {t}({kr_name})\n가중평단: ~{int(wavg):,}원 × {total_qty}주 | 손절가: {int(sl_p):,}원\n전략: {s_name}"
+    from execution import order_executor as oe
+    return oe.execute_kr_market_buy_twap(
+        t,
+        kr_name,
+        target_budget,
+        curr_p,
+        sl_p,
+        entry_atr,
+        t_name,
+        s_name,
+        state,
+        kr_cash_holder,
+        strategy_type=strategy_type,
+        entry_fib_level=entry_fib_level,
     )
-    payload = {
-        "buy_p": wavg,
-        "sl_p": sl_p,
-        "max_p": wavg,
-        "tier": s_name,
-        "buy_time": time.time(),
-        "qty": float(total_qty),
-        "entry_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
-        "current_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
-        "strategy_type": str(strategy_type or "TREND_V8"),
-        "entry_fib_level": float(entry_fib_level or 0.0),
-        "scale_out_done": False,
-    }
-    persist_position_registration(state, t, payload, context="KR BUY TWAP")
-    try:
-        _record_trade_event(
-            "KR", t, "BUY", total_qty, price=wavg, profit_rate=None, reason=s_name, ledger=payload
-        )
-    except Exception as log_err:
-        print(f"  ⚠️ [KR BUY TWAP] 매매내역 기록 실패: {log_err}")
-    ensure_position_registered(t, state.get("positions", {}).get(t, {}), context="KR BUY TWAP")
-    return True
 
 
 def _execute_us_market_buy_twap(
@@ -2796,172 +2704,21 @@ def _execute_us_market_buy_twap(
     strategy_type: str = "TREND_V8",
     entry_fib_level: float = 0.0,
 ) -> bool:
-    cycle_tag = order_idem.cycle_tag_15m_kst()
-    if not order_idem.try_acquire_buy_inflight(state, "US", t, cycle_tag):
-        print(f"  ⏭️ [US TWAP] {us_name}({t}): 동일 사이클 매수 진행 중(멱등)")
-        return False
-
-    slices = _twap_usd_budget_slices(target_budget_usd)
-    if len(slices) > 1:
-        print(
-            f"  📉 [Phase2 TWAP US] {us_name}({t}) 예산 ${target_budget_usd:,.2f} → {len(slices)}분할 "
-            f"(현금 ${us_cash_holder[0]:.2f})"
-        )
-
-    total_qty = 0
-    total_cost = 0.0
-    fp = float(curr_p)
-    any_fill = False
-    qty_before = None
-    if not TEST_MODE:
-        try:
-            qty_before = bal_read.us_stock_qty(t, refresh=False)
-        except Exception:
-            qty_before = None
-
-    try:
-        for si, usd_slice in enumerate(slices):
-            if usd_slice <= 0 or fp <= 0:
-                continue
-            q = int(float(usd_slice) / fp)
-            if q <= 0:
-                print(
-                    f"  ⏭️ [US TWAP] 슬라이스 {si + 1}/{len(slices)} 정수주 0 — "
-                    f"${float(usd_slice):.2f} < 1주 기준(~${fp:.2f})"
-                )
-                continue
-            buy_price = round(fp * 1.01, 2)
-            est = q * fp
-            if us_cash_holder[0] < est * 0.99:
-                print(f"  ⏭️ [US TWAP] 슬라이스 {si + 1}/{len(slices)} 달러 예수 부족으로 중단")
-                break
-
-            if TEST_MODE:
-                send_telegram(f"🧪 TEST_MODE US TWAP {t} ({us_name}) {si + 1}/{len(slices)} qty={q}")
-
-            def _us_place():
-                return execute_us_order_direct(kis_api.broker_us, "buy", t, q, buy_price)
-
-            def _us_qty_now():
-                try:
-                    return bal_read.us_stock_qty(t, refresh=True)
-                except Exception:
-                    return None
-
-            fill = order_idem.run_kis_buy_slice_idempotent(
-                state,
-                market="US",
-                ticker=t,
-                slice_index=si,
-                qty=q,
-                cycle_tag=cycle_tag,
-                place_order=_us_place,
-                fallback_price=fp,
-                balance_qty_fn=None if TEST_MODE else _us_qty_now,
-                qty_before=qty_before,
-                test_mode=TEST_MODE,
-            )
-
-            if not fill.ok and not TEST_MODE:
-                msg_l = str(fill.note or "").lower()
-                if "credentials" in msg_l or "token" in msg_l:
-                    print("  🔄 [토큰 오류] 미장 TWAP 슬라이스 1회 재시도...")
-                    refresh_brokers_if_needed(force=True)
-                    time.sleep(1)
-                    order_idem.pop_order_record(
-                        state,
-                        order_idem.order_key("US", t, "buy", cycle_tag, si),
-                    )
-                    fill = order_idem.run_kis_buy_slice_idempotent(
-                        state,
-                        market="US",
-                        ticker=t,
-                        slice_index=si,
-                        qty=q,
-                        cycle_tag=cycle_tag,
-                        place_order=_us_place,
-                        fallback_price=fp,
-                        balance_qty_fn=_us_qty_now,
-                        qty_before=qty_before,
-                    )
-
-            tag = "♻️" if fill.reused else "🧾"
-            print(
-                f"  {tag} [US BUY TWAP {si + 1}/{len(slices)}] {t} "
-                f"ok={fill.ok} qty={int(fill.qty)} note={fill.note}"
-            )
-
-            if not fill.ok:
-                print(f"  ❌ [US TWAP] {us_name}({t}) 슬라이스 실패: {fill.note}")
-                if not TEST_MODE:
-                    order_idem.persist_idempotency(state, STATE_PATH)
-                break
-
-            fp = float(fill.price) if fill.price > 0 else fp
-            total_qty += int(fill.qty)
-            total_cost += float(fill.qty) * fp
-            us_cash_holder[0] = float(us_cash_holder[0] - float(fill.qty) * fp)
-            any_fill = True
-            if not TEST_MODE:
-                qty_before = bal_read.us_stock_qty(t, refresh=True)
-
-            if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
-                time.sleep(TWAP_SLICE_DELAY_SEC)
-    finally:
-        order_idem.release_buy_inflight(state, "US", t, cycle_tag)
-
-    if not any_fill or total_qty <= 0:
-        return False
-
-    wavg = total_cost / total_qty if total_qty else fp
-    print(f"  ✅ [미장 매수 체결 TWAP] {us_name}({t}) | ~${wavg:.2f} × {total_qty}주 | 손절: ${sl_p:.2f}")
-    send_telegram(f"🎯 [S&P500 매수 TWAP] {t}({us_name})\n가중평단: ~${wavg:.2f} × {total_qty}주\n전략: {s_name}")
-    payload = {
-        "buy_p": wavg,
-        "sl_p": sl_p,
-        "max_p": wavg,
-        "tier": s_name,
-        "buy_time": time.time(),
-        "qty": float(total_qty),
-        "entry_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
-        "current_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
-        "strategy_type": str(strategy_type or "TREND_V8"),
-        "entry_fib_level": float(entry_fib_level or 0.0),
-        "scale_out_done": False,
-    }
-    persist_position_registration(state, t, payload, context="US BUY TWAP")
-    try:
-        _record_trade_event(
-            "US", t, "BUY", total_qty, price=wavg, profit_rate=None, reason=s_name, ledger=payload
-        )
-    except Exception as log_err:
-        print(f"  ⚠️ [US BUY TWAP] 매매내역 기록 실패: {log_err}")
-    ensure_position_registered(t, state.get("positions", {}).get(t, {}), context="US BUY TWAP")
-    return True
-
-
-def _coin_twap_filled_base_qty(order_resp, pay_krw: float, ticker: str, unit_price: float) -> float:
-    """코인 TWAP 슬라이스 체결 수량(base). 매매내역·장부는 코인 수량 기준."""
-    px = float(_to_float(unit_price, 0.0))
-    pay = float(_to_float(pay_krw, 0.0))
-    if order_resp and coin_config.is_binance():
-        try:
-            from api import binance_api as _bn
-
-            if isinstance(order_resp, dict):
-                _avg, filled = _bn.order_avg_fill_usdt(order_resp)
-                if float(filled or 0) > 0:
-                    return float(filled)
-        except Exception:
-            pass
-    if px <= 0:
-        px = float(_to_float(coin_broker.get_current_price(ticker), 0.0))
-    if px <= 0 or pay <= 0:
-        return 0.0
-    if coin_config.is_binance():
-        kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
-        return (pay / kpx) / px
-    return pay / px
+    from execution import order_executor as oe
+    return oe.execute_us_market_buy_twap(
+        t,
+        us_name,
+        target_budget_usd,
+        curr_p,
+        sl_p,
+        entry_atr,
+        t_name,
+        s_name,
+        state,
+        us_cash_holder,
+        strategy_type=strategy_type,
+        entry_fib_level=entry_fib_level,
+    )
 
 
 def _execute_coin_market_buy_twap(
@@ -2972,228 +2729,24 @@ def _execute_coin_market_buy_twap(
     s_name: str,
     state: dict,
     krw_bal_holder: list,
-    held_coins_mut: list[str],
+    held_coins_mut: list,
     *,
     strategy_type: str = "TREND_V8",
     entry_fib_level: float = 0.0,
 ) -> bool:
-    cycle_tag = order_idem.cycle_tag_15m_kst()
-    if not order_idem.try_acquire_buy_inflight(state, "COIN", t, cycle_tag):
-        print(f"  ⏭️ [COIN TWAP] {t}: 동일 사이클 매수 진행 중(멱등)")
-        return False
-
-    slices = _twap_krw_budget_slices(budget_krw)
-    if len(slices) > 1:
-        print(f"  📉 [Phase2 TWAP COIN] {t} 예산 {int(budget_krw):,}원 → {len(slices)}분할")
-
-    spent = 0.0
-    filled_base_qty = 0.0
-    last_p = float(coin_broker.get_current_price(t) or 0.0)
-    any_fill = False
-    _min_krw = _coin_min_order_krw()
-    base_before = None
-    if not TEST_MODE:
-        try:
-            base_before = bal_read.coin_stock_qty(t, refresh=False)
-        except Exception:
-            base_before = None
-
-    def _coin_qty_now():
-        try:
-            return bal_read.coin_stock_qty(t, refresh=True)
-        except Exception:
-            return None
-
-    try:
-        for si, krw_slice in enumerate(slices):
-            if krw_slice <= 0:
-                continue
-            if krw_bal_holder[0] < float(krw_slice):
-                print(f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} 예산(원화환산) 부족으로 중단")
-                break
-
-            if last_p <= 0:
-                last_p = float(coin_broker.get_current_price(t) or 0.0)
-            if last_p <= 0:
-                print(f"  ⏭️ [COIN TWAP] {t}: 현재가 없음 — 슬라이스 중단")
-                break
-
-            target_buy_amount = float(min(float(krw_slice), float(krw_bal_holder[0])))
-            pay_krw = float(target_buy_amount)
-
-            if not TEST_MODE:
-                avail_raw = coin_broker.get_quote_balance_direct()
-                if coin_config.is_binance():
-                    kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
-                    available_krw = float(avail_raw or 0) * kpx
-                else:
-                    available_krw = (
-                        float(avail_raw) if avail_raw is not None else float(krw_bal_holder[0])
-                    )
-                safe_ceiling = available_krw * UPBIT_KRW_AVAILABLE_CAP_RATIO
-                pay_krw = float(max(0, min(target_buy_amount, safe_ceiling)))
-                if pay_krw < _min_krw:
-                    exn = "바이낸스(USDT×환율)" if coin_config.is_binance() else "업비트"
-                    print(
-                        f"  ⏭️ [COIN TWAP] 슬라이스 {si + 1}/{len(slices)} 스킵 — "
-                        f"최종주문액 {pay_krw:,.0f}원 < 최소 {int(_min_krw):,}원 ({exn}) "
-                        f"(목표 {target_buy_amount:,.0f}원, 가용·API {available_krw:,.0f}원×{UPBIT_KRW_AVAILABLE_CAP_RATIO})"
-                    )
-                    break
-                if pay_krw < int(target_buy_amount):
-                    print(
-                        f"  🛡️ [COIN TWAP] 가용 캡 적용: 목표 {target_buy_amount:,.0f}원 → 최종 {pay_krw:,.0f}원 "
-                        f"(가용 {available_krw:,.0f}원×{UPBIT_KRW_AVAILABLE_CAP_RATIO})"
-                    )
-
-            if TEST_MODE:
-                if coin_config.is_binance():
-                    kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
-                    usdt_s = float(krw_slice) / kpx
-                    send_telegram(
-                        f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {usdt_s:,.2f} USDT"
-                    )
-                else:
-                    send_telegram(
-                        f"🧪 TEST_MODE COIN TWAP {t} {si + 1}/{len(slices)} {int(krw_slice):,}KRW"
-                    )
-
-            if coin_config.is_binance():
-                kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
-                spend_usdt = pay_krw / kpx
-
-                def _bn_place(cid: str):
-                    return coin_broker.buy_market_budget_krw(
-                        t, pay_krw, new_client_order_id=cid
-                    )
-
-                fill = order_idem.run_binance_buy_idempotent(
-                    state,
-                    market="COIN",
-                    ticker=t,
-                    slice_index=si,
-                    cycle_tag=cycle_tag,
-                    spend_usdt=spend_usdt,
-                    place_order=_bn_place,
-                    fallback_price=last_p,
-                    test_mode=TEST_MODE,
-                )
-            else:
-                pay_slice = float(krw_slice) if TEST_MODE else pay_krw
-
-                def _up_place():
-                    if upbit_api.upbit is None:
-                        return None
-                    return upbit_api.upbit.buy_market_order(t, int(max(0, pay_slice)))
-
-                fill = order_idem.run_upbit_buy_slice_idempotent(
-                    state,
-                    market="COIN",
-                    ticker=t,
-                    slice_index=si,
-                    pay_krw=pay_slice,
-                    cycle_tag=cycle_tag,
-                    place_order=_up_place,
-                    fallback_price=last_p,
-                    balance_qty_fn=None if TEST_MODE else _coin_qty_now,
-                    qty_before=base_before,
-                    test_mode=TEST_MODE,
-                )
-
-            tag = "♻️" if fill.reused else "🧾"
-            print(
-                f"  {tag} [COIN BUY TWAP {si + 1}/{len(slices)}] {t} "
-                f"ok={fill.ok} qty={fill.qty:.6f} note={fill.note}"
-            )
-
-            if not fill.ok:
-                if not TEST_MODE:
-                    print(
-                        f"  ❌ [COIN TWAP] {t} 슬라이스 실패 — 거절(잔고·최소주문·수수료). "
-                        f"가용·최소주문·거래소 키를 확인하세요."
-                    )
-                    order_idem.persist_idempotency(state, STATE_PATH)
-                break
-
-            slice_spent = float(krw_slice) if TEST_MODE else pay_krw
-            spent += slice_spent
-            if float(fill.qty) > 0:
-                filled_base_qty += float(fill.qty)
-            else:
-                filled_base_qty += _coin_twap_filled_base_qty(None, slice_spent, t, last_p)
-            if float(fill.price) > 0:
-                last_p = float(fill.price)
-
-            if TEST_MODE:
-                krw_bal_holder[0] = float(krw_bal_holder[0]) - slice_spent
-            else:
-                after_raw = coin_broker.get_quote_balance_direct()
-                if coin_config.is_binance():
-                    kpx = float(coin_broker.get_krw_per_usdt() or 0.0) or 1.0
-                    krw_bal_holder[0] = float(after_raw or 0) * kpx
-                else:
-                    krw_bal_holder[0] = (
-                        float(after_raw)
-                        if after_raw is not None
-                        else float(krw_bal_holder[0]) - slice_spent
-                    )
-                qn = _coin_qty_now()
-                if qn is not None:
-                    base_before = qn
-                np = coin_broker.get_current_price(t)
-                if np:
-                    last_p = float(np)
-
-            any_fill = True
-
-            if si < len(slices) - 1 and TWAP_SLICE_DELAY_SEC > 0:
-                time.sleep(TWAP_SLICE_DELAY_SEC)
-    finally:
-        order_idem.release_buy_inflight(state, "COIN", t, cycle_tag)
-
-    if not any_fill or spent <= 0 or last_p <= 0:
-        return False
-
-    coin_qty = float(filled_base_qty) if filled_base_qty > 0 else _coin_twap_filled_base_qty(None, spent, t, last_p)
-    coin_name = get_coin_name(t)
-    if coin_config.is_binance():
-        p_fmt = _fmt_telegram_coin_unit_usdt(last_p)
-        sl_fmt = _fmt_telegram_coin_unit_usdt(sl_p)
-        print(f"  ✅ [코인 매수 체결 TWAP] {t}({coin_name}) | {p_fmt} × {coin_qty:.4f} | 손절가: {sl_fmt}")
-        send_telegram(
-            f"🎯 [코인 TWAP 매수] {t}({coin_name})\n평단: {p_fmt} × {coin_qty:.4f} | 손절: {sl_fmt}\n전략: {s_name}"
-        )
-    else:
-        p_fmt = f"{last_p:,.4f}" if last_p < 100 else f"{int(last_p):,}"
-        sl_fmt = f"{sl_p:,.4f}" if sl_p < 100 else f"{int(sl_p):,}"
-        print(f"  ✅ [코인 매수 체결 TWAP] {t}({coin_name}) | {p_fmt}원 × {coin_qty:.4f} | 손절가: {sl_fmt}원")
-        send_telegram(
-            f"🎯 [코인 TWAP 매수] {t}({coin_name})\n평단: {p_fmt}원 × {coin_qty:.4f} | 손절: {sl_fmt}원\n전략: {s_name}"
-        )
-    payload = {
-        "buy_p": last_p,
-        "sl_p": sl_p,
-        "max_p": last_p,
-        "tier": s_name,
-        "buy_time": time.time(),
-        "qty": float(coin_qty),
-        "entry_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
-        "current_atr": float(entry_atr) if float(entry_atr or 0) > 0 else 0.0,
-        "strategy_type": str(strategy_type or "TREND_V8"),
-        "entry_fib_level": float(entry_fib_level or 0.0),
-        "scale_out_done": False,
-    }
-    persist_position_registration(state, t, payload, context="COIN BUY TWAP")
-    try:
-        _record_trade_event(
-            "COIN", t, "BUY", coin_qty, price=last_p, profit_rate=None, reason=s_name, ledger=payload
-        )
-    except Exception as log_err:
-        print(f"  ⚠️ [COIN BUY TWAP] 매매내역 기록 실패: {log_err}")
-    ensure_position_registered(t, state.get("positions", {}).get(t, {}), context="COIN BUY TWAP")
-    if t not in held_coins_mut:
-        held_coins_mut.append(t)
-    return True
+    from execution import order_executor as oe
+    return oe.execute_coin_market_buy_twap(
+        t,
+        budget_krw,
+        sl_p,
+        entry_atr,
+        s_name,
+        state,
+        krw_bal_holder,
+        held_coins_mut,
+        strategy_type=strategy_type,
+        entry_fib_level=entry_fib_level,
+    )
 
 
 def _holding_duration_human(pos: dict, market: str = "") -> str:
@@ -3659,6 +3212,7 @@ def build_account_snapshot_for_report(
     force_kis_labels: bool = False,
     fresh_balances: bool = False,
     ledger_only: bool = False,
+    kis_label_anomaly_prompt=None,
 ) -> dict:
     """GUI·heartbeat 스냅샷 — ``services.account_display`` 위임."""
     from services.account_display import build_account_snapshot_for_report as _impl
@@ -3669,6 +3223,7 @@ def build_account_snapshot_for_report(
         force_kis_labels=force_kis_labels,
         fresh_balances=fresh_balances,
         ledger_only=ledger_only,
+        kis_label_anomaly_prompt=kis_label_anomaly_prompt,
     )
 
 
@@ -3698,6 +3253,23 @@ def _telegram_sl_clause(market: str, curr_p: float, pos: dict) -> str:
     return f" · 매도선 {int(sl):,}원 (vs {pct:+.1f}%p)"
 
 
+def _equity_ledger_source_tag(
+    market: str,
+    pos: dict,
+    buy_p: float,
+    curr_p: float,
+    *,
+    weekend_tag: bool,
+) -> str:
+    """텔레·스냅샷 장부 폴백 — KR/US 동일 (주말|장외)·(마지막현재가|장부평단) 태그."""
+    has_last = float(pos.get("curr_p") or 0) > 0 and abs(float(curr_p) - float(buy_p)) > 1e-9
+    if weekend_tag:
+        return "(주말·마지막현재가)" if has_last else "(주말·장부평단)"
+    if not bool(is_market_open(market)):
+        return "(장외·마지막현재가)" if has_last else "(장외·장부평단)"
+    return ""
+
+
 def _kr_holdings_lines_from_ledger(state: dict, *, weekend_tag: bool) -> list:
     """KIS 점검·장 개시 전 등 — ``gui_table_adapter`` 장부 폴백과 동일 소스로 보유 줄 생성."""
     holdings = []
@@ -3710,14 +3282,9 @@ def _kr_holdings_lines_from_ledger(state: dict, *, weekend_tag: bool) -> list:
         curr_p = _resolve_curr_price_with_gui_override(pos, float(buy_p))
         roi = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
         kr_name = get_kr_company_name(code)
-        if weekend_tag:
-            tag = "(주말·장부평단)"
-            if float(pos.get("curr_p") or 0) > 0 and abs(curr_p - buy_p) > 1e-9:
-                tag = "(주말·마지막현재가)"
-        else:
-            tag = "(장외·장부평단)"
-            if float(pos.get("curr_p") or 0) > 0 and abs(curr_p - buy_p) > 1e-9:
-                tag = "(장외·마지막현재가)"
+        tag = _equity_ledger_source_tag(
+            "KR", pos, float(buy_p), float(curr_p), weekend_tag=weekend_tag
+        )
         holdings.append(
             _format_holding_line(
                 "KR",
@@ -3749,9 +3316,9 @@ def _us_holdings_lines_from_ledger(state: dict) -> list:
         curr_p = _resolve_curr_price_with_gui_override(pos_u, float(buy_p))
         roi = ((curr_p - buy_p) / buy_p) * 100
         us_name = get_us_company_name(t)
-        tag = ""
-        if not is_weekend:
-            tag = "(장외·마지막현재가)" if float(pos_u.get("curr_p") or 0) > 0 and abs(curr_p - buy_p) > 1e-9 else "(장외·장부평단)"
+        tag = _equity_ledger_source_tag(
+            "US", pos_u, float(buy_p), float(curr_p), weekend_tag=is_weekend
+        )
         holdings.append(
             _format_holding_line(
                 "US",
@@ -3773,12 +3340,14 @@ def get_kr_holdings_with_roi():
         state = load_state(STATE_PATH)
         from execution.balance_policy import should_use_ledger_only
 
-        if kis_equities_weekend_suppress_window_kst() or should_use_ledger_only(
-            state, config, force=False
-        ):
+        if kis_equities_weekend_suppress_window_kst():
             return _kr_holdings_lines_from_ledger(
                 state, weekend_tag=bool(kis_equities_weekend_suppress_window_kst())
             )
+        if should_use_ledger_only(state, config, force=False) and not bool(
+            is_market_open("KR")
+        ):
+            return _kr_holdings_lines_from_ledger(state, weekend_tag=False)
         bal = ensure_dict(get_balance_with_retry())
         kr_output1 = bal.get('output1', []) if isinstance(bal.get('output1'), list) else []
         
@@ -3837,8 +3406,10 @@ def get_us_holdings_with_roi():
         state = load_state(STATE_PATH)
         from execution.balance_policy import should_use_ledger_only
 
-        if kis_equities_weekend_suppress_window_kst() or should_use_ledger_only(
-            state, config, force=False
+        if kis_equities_weekend_suppress_window_kst():
+            return _us_holdings_lines_from_ledger(state)
+        if should_use_ledger_only(state, config, force=False) and not bool(
+            is_market_open("US")
         ):
             return _us_holdings_lines_from_ledger(state)
         # GUI와 동일한 함수 사용
@@ -4015,6 +3586,125 @@ def _macro_market_buy_allowed(macro_snap: dict, market: str) -> bool:
     return bool(allowed.get(str(market or "").strip().upper(), True))
 
 
+def _hedge_tickers_for_market(market: str) -> list[str]:
+    """``strategy.hedge_universe`` 위임 — COIN 은 거래소 접두 티커."""
+    mk = str(market or "").strip().upper()
+    if mk == "COIN":
+        from strategy.hedge_universe import coin_hedge_internal_tickers
+
+        return coin_hedge_internal_tickers(is_binance=coin_config.is_binance())
+    return hedge_tickers_for_market(market)
+
+
+def _is_hedge_ticker(ticker: str, market: str) -> bool:
+    t = normalize_ticker(ticker)
+    mk = str(market or "").strip().upper()
+    if mk == "COIN":
+        return is_coin_hedge_internal_ticker(t)
+    hedge_set = {normalize_ticker(h) for h in _hedge_tickers_for_market(market)}
+    return bool(t) and t in hedge_set
+
+
+def _merge_hedge_into_buy_targets(buy_targets: list[str], market: str) -> list[str]:
+    """매수 후보에 헷지 티커를 무조건 포함(중복 제거, 기존 순서 유지)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in list(buy_targets or []):
+        t = normalize_ticker(raw)
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    for h in _hedge_tickers_for_market(market):
+        ht = normalize_ticker(h)
+        if ht and ht not in seen:
+            seen.add(ht)
+            out.append(ht)
+    return out
+
+
+def _apply_phase4_hedge_buy_targets(
+    buy_targets: list[str], macro_snap: dict, market: str
+) -> list[str]:
+    """Phase4(``market_buy_allowed`` false) 시 일반 종목 제거, 헷지만 남김."""
+    if _macro_market_buy_allowed(macro_snap, market):
+        return list(buy_targets or [])
+    hedge_set = {normalize_ticker(h) for h in _hedge_tickers_for_market(market)}
+    filtered = [
+        t for t in (buy_targets or []) if normalize_ticker(t) in hedge_set
+    ]
+    if filtered:
+        mk_u = str(market or "").strip().upper()
+        if mk_u == "COIN":
+            print(
+                "  🚨 [Phase 4 발동] 일반 코인 매수 차단 -> "
+                "하락장 헷지 자산(금 토큰)만 매수 검토"
+            )
+        else:
+            print(
+                "  🚨 [Phase 4 발동] 주식 매수 차단 -> 하락장 헷지 자산만 매수 검토"
+            )
+        print(
+            f"  🛡️ [헷지 유니버스 {mk_u}] "
+            f"{format_hedge_universe_summary(market)} "
+            f"(수정: strategy/hedge_universe.py)"
+        )
+    return filtered
+
+
+def _can_open_new_respecting_hedge_bypass(
+    ticker: str, state: dict, market: str, max_positions: int
+) -> bool:
+    """헷지 티커는 ``MAX_POSITIONS`` 슬롯 검사를 우회(예수금·portfolio heat는 별도)."""
+    if _is_hedge_ticker(ticker, market):
+        return True
+    return can_open_new(ticker, state, max_positions=max_positions)
+
+
+def _phase4_hedge_only_active(macro_snap: dict, market: str) -> bool:
+    """Phase4로 일반 주식 매수가 막힌 상태(헷지 전용 모드)."""
+    return not _macro_market_buy_allowed(macro_snap, market)
+
+
+def _sync_market_display_snapshot_after_sells(
+    market: str,
+    state: dict,
+    cash: float,
+    total_equity: float,
+) -> None:
+    """매도 직후 KIS 실조회값을 ``last_kis_display_snapshot``·GUI·텔레에 반영."""
+    from services import ledger_valuation as lv
+
+    mk = str(market or "").strip().upper()
+    roi = None
+    try:
+        if mk == "KR":
+            bal = ensure_dict(bal_read.kr_balance_raw(refresh=False))
+            roi = _calc_kr_holdings_metrics(bal).get("roi")
+        elif mk == "US":
+            bal = ensure_dict(bal_read.us_balance_raw(refresh=False))
+            roi = _calc_us_holdings_metrics(bal).get("roi")
+    except Exception:
+        pass
+    lv.write_kis_display_snapshot_part(
+        state,
+        mk,
+        cash=float(cash),
+        total=float(total_equity),
+        roi=roi,
+    )
+    save_state(STATE_PATH, state)
+    if mk == "KR":
+        print(
+            f"  📌 [KR] KIS 예수·총평 스냅샷 갱신 → 가용 {int(cash):,}원 · "
+            f"총평 {int(total_equity):,}원 (매도 후 GUI·텔레 반영)"
+        )
+    else:
+        print(
+            f"  📌 [US] KIS 예수·총평 스냅샷 갱신 → 가용 ${float(cash):,.2f} · "
+            f"총평 ${float(total_equity):,.2f} (매도 후 GUI·텔레 반영)"
+        )
+
+
 def _benchmark_ticker_for_rs(market: str) -> str:
     mk = str(market or "").strip().upper()
     if mk == "KR":
@@ -4136,12 +3826,19 @@ def _build_market_context(state: dict) -> tuple[dict, float, str, dict]:
             aux_info = refresh_circuit_aux_from_brokers(state, STATE_PATH)
             clear_balance_live_sync(state, STATE_PATH)
         if isinstance(aux_info, dict):
-            state["_phase5_aux_sync"] = {
+            totals = aux_info.get("totals") if isinstance(aux_info.get("totals"), dict) else {}
+            ledger_only = bool(aux_info.get("ledger_only"))
+            sync: dict = {
                 "kr_ok": bool(aux_info.get("kr_ok")),
                 "us_ok": bool(aux_info.get("us_ok")),
                 "coin_ok": bool(aux_info.get("coin_ok")),
                 "weekend_kis_skip": bool(aux_info.get("weekend_kis_skip")),
+                "ledger_only": ledger_only,
             }
+            if ledger_only and totals:
+                sync["kr_krw"] = float(totals.get("kr_krw", 0) or 0)
+                sync["usd_total"] = float(totals.get("usd_total", 0) or 0)
+            state["_phase5_aux_sync"] = sync
     except Exception as e:
         state["_phase5_aux_sync"] = {"kr_ok": False, "us_ok": False, "coin_ok": False}
         print(f"  ⚠️ [Phase5 보조값] circuit_aux 갱신 실패 — 이번 루프 서킷 판정은 건너뜀: {type(e).__name__}: {e}")
@@ -4247,7 +3944,11 @@ def _prepare_kr_market_cycle_inputs(state: dict) -> tuple[dict, int, int, list[d
     kr_balance_data = bal.get("output2", [])
     kr_cash, total_kr_equity = parse_kr_cash_total(kr_balance_data, _to_float)
 
-    state["circuit_aux_last_kr_krw"] = float(total_kr_equity)
+    from services import ledger_valuation as lv
+
+    lv.write_kis_display_snapshot_part(
+        state, "KR", cash=float(kr_cash), total=float(total_kr_equity)
+    )
     save_state(STATE_PATH, state)
 
     kr_output1 = _get_kr_output1(bal)
@@ -4852,6 +4553,11 @@ def _ai_false_breakout_buy_gate(
     """
     if not AI_FALSE_BREAKOUT_ENABLED:
         return True
+    if _is_hedge_ticker(ticker, market_tag):
+        print(
+            f"  [AI PASS] {ticker} - 헷지 자산 (Phase3 필터 생략, false_breakout_prob=0)"
+        )
+        return True
     st = str(strategy_type or "TREND_V8").upper()
     ai_eval = evaluate_false_breakout_filter(
         ticker=ticker,
@@ -4880,6 +4586,78 @@ def _ai_false_breakout_buy_gate(
         f"산출: {eng} | 사유: {summ}"
     )
     return True
+
+
+def _run_kr_buy_cycle(
+    ctx,
+    *,
+    state: dict,
+    weather: dict,
+    macro_mult: float,
+    macro_snap: dict,
+    held_kr,
+    kr_cash: int,
+    total_kr_equity: float,
+    buy_cycle_tag: str,
+    alpha_target_vol: float,
+) -> int:
+    """국장 매수 루프 — ``execution.market_cycles.kr_buy_cycle`` 위임 (하위 호환)."""
+    from execution.market_cycles.kr_buy_cycle import run_kr_buy_cycle
+
+    return run_kr_buy_cycle(
+        ctx,
+        held_kr=held_kr,
+        kr_cash=int(kr_cash),
+        total_kr_equity=float(total_kr_equity),
+        alpha_target_vol=float(alpha_target_vol),
+    )
+
+
+def _run_us_buy_cycle(
+    ctx,
+    *,
+    state: dict,
+    weather: dict,
+    macro_mult: float,
+    macro_snap: dict,
+    held_us,
+    us_cash: float,
+    total_us_equity: float,
+    buy_cycle_tag: str,
+    alpha_target_vol: float,
+) -> float:
+    """미장 매수 루프 — ``execution.market_cycles.us_buy_cycle`` 위임 (하위 호환)."""
+    from execution.market_cycles.us_buy_cycle import run_us_buy_cycle
+
+    return run_us_buy_cycle(
+        ctx,
+        held_us=held_us,
+        us_cash=float(us_cash),
+        total_us_equity=float(total_us_equity),
+        alpha_target_vol=float(alpha_target_vol),
+    )
+
+
+def _run_coin_buy_cycle(
+    ctx,
+    *,
+    coin_weather: str,
+    held_coins,
+    krw_bal: float,
+    total_coin_equity: float,
+    alpha_target_vol: float,
+) -> float:
+    """코인 매수 루프 — ``execution.market_cycles.coin_buy_cycle`` 위임 (하위 호환)."""
+    from execution.market_cycles.coin_buy_cycle import run_coin_buy_cycle
+
+    return run_coin_buy_cycle(
+        ctx,
+        coin_weather=str(coin_weather),
+        held_coins=held_coins,
+        krw_bal=float(krw_bal),
+        total_coin_equity=float(total_coin_equity),
+        alpha_target_vol=float(alpha_target_vol),
+    )
 
 
 def run_trading_bot():
@@ -4936,6 +4714,7 @@ def run_trading_bot():
     top_vol_50 = realtime_trade_all[:50] 
 
     final_targets = _build_kr_targets(scanned_targets, market_cap_200, top_vol_50)
+    final_targets = _merge_hedge_into_buy_targets(final_targets, "KR")
     final_targets = _sort_buy_targets_by_rs(final_targets, "KR")
 
     # -------------------------------------------------------------------------

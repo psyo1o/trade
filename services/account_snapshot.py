@@ -85,6 +85,52 @@ _OFF_HOURS_FORCE_MIN_PREV: dict[str, float] = {"KR": 10_000.0, "US": 10.0}
 _OFF_HOURS_FORCE_TOL: dict[str, float] = {"KR": 1.0, "US": 0.01}
 # 직전 대비 허용 초과 비율(초과 시 급변으로 보고 직전 라벨 유지) — US 장중 급락 45%와 대칭
 _OFF_HOURS_FORCE_MAX_TOTAL_SPIKE = 1.12
+# force_kis 시 급증 거부는 직전 총평이 이미 충분히 클 때만 (낡은 저가 스냅샷 → 실조회 catch-up 허용)
+_OFF_HOURS_FORCE_SPIKE_GUARD_MIN_PREV: dict[str, float] = {"KR": 500_000.0, "US": 500.0}
+
+
+def _resolve_kis_label_anomaly(
+    *,
+    market: str,
+    force_kis_labels: bool,
+    prev_cash: float,
+    prev_total: float,
+    prev_roi,
+    new_cash: float,
+    new_total: float,
+    new_roi,
+    reason: str,
+    prompt: Callable[..., bool] | None,
+) -> tuple[float, float, Any]:
+    """급변 시 자동 거부 또는 ``prompt`` 로 사용자 선택(GUI KIS 강제 새로고침)."""
+    m = str(market or "").strip().upper()
+    pc, pt = float(prev_cash), float(prev_total)
+    nc, nt = float(new_cash), float(new_total)
+
+    if prompt is not None and force_kis_labels:
+        accept = bool(
+            prompt(
+                market=m,
+                prev={"cash": pc, "total": pt, "roi": prev_roi},
+                new={"cash": nc, "total": nt, "roi": new_roi},
+                reason=reason,
+            )
+        )
+        if accept:
+            print(f"  ✅ [KIS 강제 새로고침·{m}] 사용자 확인 — KIS 새 값 적용")
+            return nc, nt, new_roi
+        print(
+            f"  📌 [KIS 강제 새로고침·{m}] 사용자 선택 — 직전 라벨 유지 "
+            f"(new cash={nc}, total={nt} / prev cash={pc}, total={pt})"
+        )
+        return pc, pt, prev_roi
+
+    print(
+        f"  ⚠️ [KIS 강제 새로고침·{m}] 비장중 — {reason} — "
+        f"직전 라벨 유지 (new cash={nc}, total={nt} / "
+        f"prev cash={pc}, total={pt})"
+    )
+    return pc, pt, prev_roi
 
 
 def _maybe_reject_off_hours_force_label_anomaly(
@@ -98,11 +144,13 @@ def _maybe_reject_off_hours_force_label_anomaly(
     new_roi,
     safe_num: Callable[[Any, float], float],
     trust_live_labels: bool = False,
+    anomaly_prompt: Callable[..., bool] | None = None,
 ) -> tuple[float, float, Any]:
     """비장중 ``force_kis_labels`` 조회 결과가 직전 **총평** 대비 비정상이면 덮어쓰지 않는다.
 
     예수 단독 변동(매수 직후 등)은 총평이 안정이면 허용한다.
     ``trust_live_labels`` — 입출금(고점 보정) 직후 1회 등 의도적 실조회는 방어 생략.
+    ``anomaly_prompt`` — GUI 강제 새로고침 시 급변이면 사용자에게 적용 여부를 묻는다.
     """
     if trust_live_labels or not force_kis_labels or is_market_open_now:
         return new_cash, new_total, new_roi
@@ -122,8 +170,18 @@ def _maybe_reject_off_hours_force_label_anomaly(
 
     nt = float(new_total)
     nc = float(new_cash)
+    prev_cash_eq_total = (
+        prev_total >= min_prev and prev_cash >= prev_total * 0.95
+    )
+    new_looks_split = nc > 0 and nt > nc + tol
+    if prev_cash_eq_total and new_looks_split and nc < prev_cash * 0.9:
+        return new_cash, new_total, new_roi
+
     total_dropped = prev_total >= min_prev and nt < prev_total - tol
-    total_spiked = prev_total >= min_prev and nt > prev_total * max_total_spike + tol
+    spike_guard_prev = float(_OFF_HOURS_FORCE_SPIKE_GUARD_MIN_PREV.get(m, min_prev))
+    total_spiked = (
+        prev_total >= spike_guard_prev and nt > prev_total * max_total_spike + tol
+    )
     if not (total_dropped or total_spiked):
         return new_cash, new_total, new_roi
 
@@ -132,12 +190,18 @@ def _maybe_reject_off_hours_force_label_anomaly(
         if total_spiked
         else "총평 직전보다 감소(누락 가능)"
     )
-    print(
-        f"  ⚠️ [KIS 강제 새로고침·{m}] 비장중 — {reason} — "
-        f"직전 라벨 유지 (new cash={nc}, total={nt} / "
-        f"prev cash={prev_cash}, total={prev_total})"
+    return _resolve_kis_label_anomaly(
+        market=m,
+        force_kis_labels=force_kis_labels,
+        prev_cash=prev_cash,
+        prev_total=prev_total,
+        prev_roi=prev_roi,
+        new_cash=nc,
+        new_total=nt,
+        new_roi=new_roi,
+        reason=reason,
+        prompt=anomaly_prompt,
     )
-    return prev_cash, prev_total, prev_roi
 
 
 # 하위 호환(테스트·import)
@@ -150,6 +214,7 @@ def build_account_snapshot_for_report(
     allow_kis_fetch: Callable[[str], bool] | None = None,
     with_backoff: Callable[[Callable[[], Any], str], Any] | None = None,
     force_kis_labels: bool = False,
+    kis_label_anomaly_prompt: Callable[..., bool] | None = None,
 ) -> dict:
     """heartbeat / GUI 상단 라벨·보유 테이블 입력용 스냅샷.
 
@@ -168,6 +233,7 @@ def build_account_snapshot_for_report(
         with_backoff = lambda fn, _label: fn()
 
     trust_live_labels = bool(deps.get("trust_off_hours_live_labels"))
+    anomaly_prompt = kis_label_anomaly_prompt or deps.get("kis_label_anomaly_prompt")
 
     weather = deps["get_real_weather"](deps["broker_kr"], deps["broker_us"])
     snap = deps["load_last_kis_display_snapshot"]()
@@ -233,6 +299,7 @@ def build_account_snapshot_for_report(
                     new_roi=kr_roi,
                     safe_num=deps["safe_num"],
                     trust_live_labels=trust_live_labels,
+                    anomaly_prompt=anomaly_prompt,
                 )
                 kr_cash = int(kr_cash_f)
                 kr_total = int(kr_total_f)
@@ -282,16 +349,47 @@ def build_account_snapshot_for_report(
                     and prev_us_total > 0.0
                     and us_total > prev_us_total * _OFF_HOURS_FORCE_MAX_TOTAL_SPIKE
                 )
-                if suspicious_zero or suspicious_drop or suspicious_cash_glitch or suspicious_spike:
-                    print(
-                        "  ⚠️ [snapshot US] 미장 라벨 값 급변 감지(일시 API 이상 추정) — "
-                        f"직전 스냅샷 유지 (new cash=${us_cash:.2f}, total=${us_total:.2f} / "
-                        f"prev cash=${prev_us_cash:.2f}, total=${prev_us_total:.2f})"
-                    )
-                    if isinstance(us_part, dict):
-                        us_cash = float(deps["safe_num"](us_part.get("cash", 0.0), 0.0))
-                        us_total = float(deps["safe_num"](us_part.get("total", us_cash), us_cash))
-                        us_roi = us_part.get("roi")
+                # heartbeat: 급증 포함 자동 거부. force_kis: 0/급감/예수0만 1겹, 급증은 _maybe_reject
+                hard_reject = (
+                    suspicious_zero
+                    or suspicious_drop
+                    or suspicious_cash_glitch
+                    or (suspicious_spike and not force_kis_labels)
+                )
+                if hard_reject:
+                    _us_reasons = []
+                    if suspicious_zero:
+                        _us_reasons.append("총평 0 또는 누락")
+                    if suspicious_drop:
+                        _us_reasons.append("총평 45% 이상 급감")
+                    if suspicious_cash_glitch:
+                        _us_reasons.append("예수 0·보유 있음")
+                    if suspicious_spike and not force_kis_labels:
+                        _us_reasons.append("총평 12% 이상 급증")
+                    _us_reason = " · ".join(_us_reasons) or "미장 라벨 급변"
+                    if force_kis_labels and anomaly_prompt is not None:
+                        us_cash, us_total, us_roi = _resolve_kis_label_anomaly(
+                            market="US",
+                            force_kis_labels=True,
+                            prev_cash=prev_us_cash,
+                            prev_total=prev_us_total,
+                            prev_roi=(us_part or {}).get("roi") if isinstance(us_part, dict) else None,
+                            new_cash=float(us_cash),
+                            new_total=float(us_total),
+                            new_roi=us_roi,
+                            reason=_us_reason,
+                            prompt=anomaly_prompt,
+                        )
+                    else:
+                        print(
+                            "  ⚠️ [snapshot US] 미장 라벨 값 급변 감지(일시 API 이상 추정) — "
+                            f"직전 스냅샷 유지 (new cash=${us_cash:.2f}, total=${us_total:.2f} / "
+                            f"prev cash=${prev_us_cash:.2f}, total=${prev_us_total:.2f})"
+                        )
+                        if isinstance(us_part, dict):
+                            us_cash = float(deps["safe_num"](us_part.get("cash", 0.0), 0.0))
+                            us_total = float(deps["safe_num"](us_part.get("total", us_cash), us_cash))
+                            us_roi = us_part.get("roi")
                 else:
                     us_cash, us_total, us_roi = _maybe_reject_off_hours_force_label_anomaly(
                         market="US",
@@ -303,6 +401,7 @@ def build_account_snapshot_for_report(
                         new_roi=us_roi,
                         safe_num=deps["safe_num"],
                         trust_live_labels=trust_live_labels,
+                        anomaly_prompt=anomaly_prompt,
                     )
             except Exception as e:
                 print(

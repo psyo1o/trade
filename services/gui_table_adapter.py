@@ -54,7 +54,7 @@ def build_rows_data(
         except Exception as e:
             print(f"⚠️ 국장(주말 스냅샷) 테이블 행 구성 실패: {e}")
 
-    # 미장 파싱: 장중/장외 모두 상세 경로 우선(텔레그램과 현재가 기준 통일)
+    # 장중/장외 모두 상세(평단·현재가) 경로 우선 — 텔레그램·현재가 기준 통일
     try:
         us_data = get_held_stocks_us_detail()
         if us_data:

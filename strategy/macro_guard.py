@@ -12,6 +12,10 @@ Phase 4 — 거시 방어막 (시장별 글로벌 알파).
 
 전략별 예외(SWING_FIB PCR 우회 등) 없음 — ``market_buy_allowed[market]`` 만 사용.
 
+하락장 **헷지 ETF** 예외(Phase4 시 일반 주식만 차단·헷지는 매수 검토)는
+``strategy.hedge_universe`` + ``run_bot._apply_phase4_hedge_buy_targets`` 에서 처리합니다.
+티커 수정: ``strategy/hedge_universe.py`` (grep: ``HEDGE_UNIVERSE``), 문서: ``docs/HEDGE_UNIVERSE.md``.
+
 VIX·Crypto Fear&Greed 및 환율 절대값(1500원) 차단은 제거됨.
 Phase5 MDD·계좌 서킷 등은 이 모듈 밖에서 전략 무관하게 적용.
 """

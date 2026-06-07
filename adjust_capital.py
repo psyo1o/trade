@@ -34,11 +34,13 @@ CAPITAL_ADJUSTMENTS_KEY = "capital_adjustments"
 
 
 def portfolio_total_krw_estimated(state: dict) -> float:
-    """봇이 마지막으로 장부에 남긴 시장별 스냅샷으로 합산 평가(원화) 추정."""
+    """봇이 마지막으로 저장한 스냅샷으로 합산 평가(원화) 추정."""
+    from services.ledger_valuation import kis_display_total
+
     rate = estimate_usdkrw()
-    kr = float(state.get("circuit_aux_last_kr_krw", 0) or 0)
+    kr = kis_display_total(state, "KR")
     coin = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
-    usd = float(state.get("circuit_aux_last_usd_total", 0) or 0)
+    usd = kis_display_total(state, "US")
     return kr + coin + usd * rate
 
 
@@ -141,6 +143,8 @@ def apply_capital_peak_adjustment(
     state[PEAK_TOTAL_EQUITY_KEY] = float(new_peak)
     state.pop("peak_equity_total_krw", None)
 
+    from services import ledger_valuation as lv
+
     entry = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "kind": kind,
@@ -149,8 +153,8 @@ def apply_capital_peak_adjustment(
         "peak_after_krw": float(new_peak),
         "estimated_total_krw_at_adjust": float(current_total),
         "circuit_aux_after_refresh": {
-            "kr_krw": float(state.get("circuit_aux_last_kr_krw", 0) or 0),
-            "usd_total": float(state.get("circuit_aux_last_usd_total", 0) or 0),
+            "kr_krw": float(lv.kis_display_total(state, "KR")),
+            "usd_total": float(lv.kis_display_total(state, "US")),
             "coin_krw": float(state.get("circuit_aux_last_coin_krw", 0) or 0),
         },
         "source": str(source_label),

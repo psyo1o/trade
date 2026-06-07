@@ -6,6 +6,7 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
     * 잔고·성적표·수동 매도·로그 뷰 등은 ``run_bot`` / ``execution`` / ``utils`` API를 그대로 호출.
     * **실시간 작동 로그(봇 브리핑)** 는 탭 위젯 **아래**에 두어, 탭을 바꿔도 같은 자리에 보이게 한다(세로 ``QSplitter``).
     * ``import run_bot`` 시점에 ``config.json`` 이 로드되므로 **설정 변경 후 GUI 재시작** 필요.
+    * **매매·전략 안내** 탭: V8·스윙·**하락장 헷지**(``strategy/hedge_universe.py``)·Phase 1~5 요약.
     * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_total_equity``·``capital_adjustments`` 반영 (백그라운드 스레드).
     * 바이낸스 코인 상단 **예수금·총평가** 숫자는 ``binance_display_cash_and_total_usdt()`` 등. 보유/장부 단가는 USDT. 스냅샷·서킷은 엔진과 동일 원화 환산.
     * 매매는 시작 즉시 실행하지 않고, **KST :00 / :15 / :30 / :45** 정렬 스케줄에만 맞춰 `run_trading_bot`을 실행한다.
@@ -39,6 +40,11 @@ from PyQt5.QtGui import QFont
 from pathlib import Path
 import traceback
 import run_bot
+from strategy.hedge_universe import (
+    format_hedge_universe_summary,
+    hedge_asset_label,
+    hedge_assets_for_market,
+)
 from utils.logger import get_quant_logger
 from utils.telegram import send_telegram
 from utils.helpers import (
@@ -51,6 +57,7 @@ from utils.helpers import (
     seconds_until_next_half_hour,
 )
 from execution.sync_positions import sync_all_positions, _last_buy_price_from_trade_history
+from execution.guard import load_state
 from services.gui_table_adapter import build_rows_data
 from run_bot import (
     get_us_cash_real,
@@ -166,8 +173,14 @@ def _gui_coin_unit_price_str(usdt: float) -> str:
     return f"{s} USDT" if s else "0 USDT"
 
 
-def _position_strategy_label(pos_info: dict) -> str:
+def _position_strategy_label(
+    pos_info: dict, ticker: str = "", market: str = ""
+) -> str:
     """장부 전략 열: 사이징 라벨(1/N) 대신 매수 전략명을 표시."""
+    mk = str(market or "").strip().upper()
+    t = normalize_ticker(ticker) if ticker else ""
+    if mk and t and run_bot._is_hedge_ticker(t, mk):
+        return f"헷지 · {hedge_asset_label(t, mk)}"
     tier = str((pos_info or {}).get("tier") or "").strip()
     sizing_labels = {"1/N 고정", "1/N"}
     if tier and tier not in sizing_labels:
@@ -178,8 +191,14 @@ def _position_strategy_label(pos_info: dict) -> str:
     return "V6 스나이퍼(수급+MACD+RSI+상투방지)"
 
 
-def _dashboard_strategy_short(pos_info: dict) -> str:
-    """실시간 보유 표 — V8 / 스윙."""
+def _dashboard_strategy_short(
+    pos_info: dict, ticker: str = "", market: str = ""
+) -> str:
+    """실시간 보유 표 — V8 / 스윙 / 헷지."""
+    mk = str(market or "").strip().upper()
+    t = normalize_ticker(ticker) if ticker else ""
+    if mk and t and run_bot._is_hedge_ticker(t, mk):
+        return "헷지"
     tier = str((pos_info or {}).get("tier") or "").strip().upper()
     st = str((pos_info or {}).get("strategy_type") or "TREND_V8").strip().upper()
     if st == "SWING_FIB" or tier in ("SWING_FIB", "SWING") or "SWING" in tier:
@@ -213,10 +232,17 @@ def _build_strategy_guide_text() -> str:
     max_us = int(getattr(run_bot, "MAX_POSITIONS_US", 3))
     max_coin = int(getattr(run_bot, "MAX_POSITIONS_COIN", 5))
     buy_win = int(getattr(run_bot, "config", {}).get("buy_window_minutes_before_close", 30))
+    kr_hedge_detail = "\n".join(
+        f"  · {a.code} — {a.name_ko}" for a in hedge_assets_for_market("KR")
+    )
+    us_hedge_detail = "\n".join(
+        f"  · {a.code} — {a.name_ko}" for a in hedge_assets_for_market("US")
+    )
     return (
-        "📘 매매·전략 안내 (V8 · SWING_FIB · Phase 1~5)\n"
+        "📘 매매·전략 안내 (V8 · SWING_FIB · 헷지 · Phase 1~5)\n"
         "==========================================\n"
-        "README.md §8·run_bot.py 와 동일한 운영 요약입니다.\n\n"
+        "README.md §8·docs/HEDGE_UNIVERSE.md·run_bot.py 와 동일한 운영 요약입니다.\n"
+        "헷지 티커 수정: strategy/hedge_universe.py (grep: HEDGE_UNIVERSE)\n\n"
         "■ 0) 한 사이클·시장\n"
         "- KST :00/:15/:30/:45 매매 사이클 (GUI·봇 동일 엔진)\n"
         "- 시장: KR(국장) · US(미장) · COIN(업비트 KRW / 바이낸스 USDT)\n"
@@ -231,11 +257,21 @@ def _build_strategy_guide_text() -> str:
         "  · 스테이블·페그 코인 자동 제외\n\n"
         "■ 2) 매수 전 공통 게이트 (V8·스윙 공통)\n"
         "- Phase5: 합산 계좌 MDD 서킷 (peak_total_equity, 월요일 주차 고점)\n"
-        "- Phase4: 시장별 신규 매수 차단 (macro_mult=1.0, 예산 축소 없음)\n"
-        "  · US: SPY Put/Call ≥1.2 → US 전면 차단\n"
-        "  · COIN: BTC 고래 롱숏 ≤0.8 → COIN 차단\n"
-        "  · KR: 원/달러 모멘텀 ≥1.015 → KR 차단\n"
-        "- Phase3: AI 뉴스 LLM (V8=엄격 / 스윙=Terminal Risk만)\n"
+        "- Phase4: 시장별 일반 주식 신규 매수 차단 (macro_mult=1.0, 예산 축소 없음)\n"
+        "  · US: SPY Put/Call ≥1.2 → US 일반 종목 차단 (헷지 3종은 예외)\n"
+        "  · COIN: BTC 고래 롱숏 ≤0.8 → COIN 전면 차단 (헷지 유니버스 없음)\n"
+        "  · KR: 원/달러 모멘텀 ≥1.015 → KR 일반 종목 차단 (헷지 3종은 예외)\n"
+        "  · Phase4 발동 시 로그: 🚨 [Phase 4 발동] … 헷지 자산만 매수 검토\n"
+        "- 하락장 헷지 (안전자산 ETF, strategy/hedge_universe.py)\n"
+        f"  · KR: {format_hedge_universe_summary('KR')}\n"
+        f"{kr_hedge_detail}\n"
+        f"  · US: {format_hedge_universe_summary('US')}\n"
+        f"{us_hedge_detail}\n"
+        "  · 스캔/유니버스 후보에 위 티커 항상 병합 (_merge_hedge_into_buy_targets)\n"
+        "  · MAX_POSITIONS 슬롯 우회(프리패스) — 예수금·Portfolio Heat 는 동일\n"
+        "  · Phase3 AI 필터 생략 (false_breakout_prob=0)\n"
+        "  · V8/스윙 진입 시그널·지수 급락·BEAR·섹터락 등은 헷지도 동일 적용\n"
+        "- Phase3: AI 뉴스 LLM (V8=엄격 / 스윙=Terminal Risk만, 헷지 제외)\n"
         "- Phase1: GICS 섹터 과다 보유 방지 (sector_lock)\n"
         "- Phase2: 매수·분할익절 TWAP (전량 청산은 시장가 1회)\n"
         "  · 매수 멱등: 15분 사이클·슬라이스별 order_key, buy_inflight 중복 차단\n"
@@ -247,6 +283,7 @@ def _build_strategy_guide_text() -> str:
         "  · 상세: docs/idempotency/ (PROGRESS·BALANCE_READS·SMOKE_TEST)\n"
         f"- Portfolio Heat: 시장별 Σ(비중×ATR%) < {heat_pct:.1f}% (기본 6%)\n"
         f"- 비중: min(1/N, alpha_target_vol/ATR%) — KR {max_kr} / US {max_us} / COIN {max_coin} 슬롯\n"
+        "  (헷지 티커만 MAX 슬롯 초과 시에도 매수 검토 계속)\n"
         "- BEAR 날씨: V8 신규만 차단, 스윙(SWING_FIB)은 허용\n"
         "- 이미 보유·쿨다운·최소주문·예수금 부족 시 패스\n\n"
         "■ 3) V8 추세 매수 — calculate_pro_signals (strategy_type=TREND_V8)\n"
@@ -303,7 +340,7 @@ def _build_strategy_guide_text() -> str:
         "■ 8) 데이터·GUI 탭\n"
         "- OHLCV: 메모리·data/ohlcv_cache(3일) → KIS→pykrx/Stooq→yfinance\n"
         "- 매도선·sl_p: 15분마다 재계산 (장부 탭·생존신고 동일)\n"
-        "- 실시간 현황: 현재가·수량·전략(V8/스윙)\n"
+        "- 실시간 현황: 현재가·수량·전략(V8/스윙/헷지)\n"
         "- 장부: 최고가(max_p)·매도선·보유시간(영업시간)\n"
         "- 수동 매도: 수량 입력+버튼 (전량/부분, 부분은 stats 별도 누적)\n"
     )
@@ -629,6 +666,46 @@ def _build_live_qty_lookup() -> dict[str, float]:
     return out
 
 
+def _build_live_avg_lookup() -> dict[str, float]:
+    """실계좌 평단 — 장부 탭 매수가 표시용 (미·국 KIS, 코인 거래소)."""
+    out: dict[str, float] = {}
+    try:
+        from api import coin_broker
+
+        for b in coin_broker.get_balances() or []:
+            t = coin_broker.held_ticker_row(b)
+            if not t:
+                continue
+            ap = float(_to_float(b.get("avg_buy_price"), 0.0))
+            if ap > 0:
+                out[str(t).strip().upper()] = ap
+    except Exception:
+        pass
+    try:
+        from execution import balance_read as bal_read_module
+
+        kr_bal = bal_read_module.kr_balance_raw(refresh=False)
+        if isinstance(kr_bal, dict):
+            for item in kr_bal.get("output1") or []:
+                code = normalize_ticker(str(item.get("pdno") or ""))
+                ap = float(
+                    _to_float(item.get("pchs_avg_prc", item.get("pchs_avg_pric", 0)), 0.0)
+                )
+                if code and ap > 0:
+                    out[code] = ap
+    except Exception:
+        pass
+    try:
+        for item in get_held_stocks_us_detail() or []:
+            code = normalize_ticker(str(item.get("code") or ""))
+            ap = float(_to_float(item.get("avg_p"), 0.0))
+            if code and ap > 0:
+                out[code] = ap
+    except Exception:
+        pass
+    return out
+
+
 def _format_position_qty_for_table(market_label: str, qty: float) -> str:
     q = float(_to_float(qty, 0.0))
     if market_label == "🇰🇷 국장":
@@ -657,17 +734,24 @@ def get_current_stats(state_file: Path, roi_info=None):
 
     if state_file.exists():
         try:
-            state = json.loads(state_file.read_text(encoding="utf-8"))
+            state = load_state(state_file)
             if isinstance(state, dict):
                 stats = state.get("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                 wins = int(stats.get("wins", 0) or 0)
                 losses = int(stats.get("losses", 0) or 0)
                 total_profit = float(stats.get("total_profit", 0.0) or 0.0)
+                partial_pct = float(stats.get("manual_partial_total_profit_pct", 0.0) or 0.0)
                 total_trades = wins + losses
                 win_rate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+                partial_text = (
+                    f"   |   📊 부분매도 누적: {partial_pct:+.2f}%"
+                    if abs(partial_pct) > 0.0001
+                    else ""
+                )
                 return (
                     f"🏆 승률: {win_rate:.1f}% ({wins}승 {losses}패)"
                     f"   |   💸 누적 수익률 합: {total_profit:.2f}%"
+                    f"{partial_text}"
                     f"{roi_text}"
                 )
         except Exception:
@@ -739,12 +823,32 @@ class BalanceUpdaterThread(QThread):
     update_table = pyqtSignal(list)   # 표에 들어갈 행 데이터 리스트
     finished = pyqtSignal()           # 작업 끝남 신호
     error = pyqtSignal(str)           # 에러 신호
+    kis_anomaly_prompt = pyqtSignal(dict)  # KIS 급변 — 메인 스레드 확인창
 
     def __init__(self, sync_first=True, dashboard=None, force_kis=False):
         super().__init__()
         self.sync_first = sync_first
         self.dashboard = dashboard  # max_p 업데이트 함수를 쓰기 위해 참조
         self.force_kis = bool(force_kis)
+        import threading as _threading
+
+        self._anomaly_event = _threading.Event()
+        self._anomaly_accept = False
+
+    def _prompt_kis_label_anomaly(self, *, market, prev, new, reason):
+        """워커 스레드 → 메인 스레드 확인창(급변 시 적용 여부)."""
+        self._anomaly_accept = False
+        self._anomaly_event.clear()
+        self.kis_anomaly_prompt.emit(
+            {
+                "market": str(market or "").strip().upper(),
+                "prev": prev if isinstance(prev, dict) else {},
+                "new": new if isinstance(new, dict) else {},
+                "reason": str(reason or "").strip(),
+            }
+        )
+        self._anomaly_event.wait(timeout=300.0)
+        return bool(self._anomaly_accept)
 
     def run(self):
         try:
@@ -823,7 +927,7 @@ class BalanceUpdaterThread(QThread):
                     f"장부동기화={'KIS 보유·자동복구' if self.sync_first else '생략(비권장)'}"
                 )
             elif ledger_only:
-                print("  [표시] 장부+시세 — 국·미 KIS 잔고 API 생략 (코인만 거래소 조회)")
+                pass  # [표시] 장부+시세 — build_account_snapshot_for_report 에서 1회만
 
             # 1. 장부 동기화 — on_trade 평상시는 장부 보유 목록만( KIS 생략 )
             if self.sync_first:
@@ -861,6 +965,9 @@ class BalanceUpdaterThread(QThread):
                 force_kis_labels=self.force_kis,
                 fresh_balances=not ledger_only,
                 ledger_only=ledger_only,
+                kis_label_anomaly_prompt=(
+                    self._prompt_kis_label_anomaly if self.force_kis else None
+                ),
             )
             labels = snap.get("labels", {})
             d2_kr = int(_safe_num((labels.get("kr") or {}).get("cash", 0), 0))
@@ -961,7 +1068,7 @@ class BalanceUpdaterThread(QThread):
             "buy_p_float": buy_p,
             "current_price": current_price,
             "roi": roi,
-            "strategy": _dashboard_strategy_short(pos),
+            "strategy": _dashboard_strategy_short(pos, ledger_key or ticker_code, market_code),
             "m_code": market_code,
             "t_code": ledger_key or str(ticker_code).strip().upper(),
             "pos_info": pos,
@@ -1295,7 +1402,7 @@ class BotDashboard(QMainWindow):
         # 4. 매매·전략 안내 (타임스탑·매도선·러너 5MA)
         guide_tab = QWidget()
         guide_layout = QVBoxLayout(guide_tab)
-        guide_title = QLabel("📘 매매·전략 안내 (V8 · SWING · Phase 1~5)")
+        guide_title = QLabel("📘 매매·전략 안내 (V8 · SWING · 헷지 · Phase 1~5)")
         guide_title.setObjectName("SectionTitle")
         self.guide_console = QTextEdit()
         self.guide_console.setReadOnly(True)
@@ -1503,6 +1610,7 @@ class BotDashboard(QMainWindow):
                 QMessageBox.warning(self, "매도 실패", "매도 주문에 실패했습니다.")
 
         self.refresh_balance()
+        self.update_stats_ui()
 
     def refresh_trade_history(self):
         """trade_history.json을 읽어 매매 내역 탭을 업데이트합니다."""
@@ -1591,6 +1699,7 @@ class BotDashboard(QMainWindow):
         state = load_state(STATE_PATH)
         positions = state.get("positions", {})
         live_qty_by_key = _build_live_qty_lookup()
+        live_avg_by_key = _build_live_avg_lookup()
 
         for ticker, pos_info in positions.items():
             if not ticker or not isinstance(pos_info, dict):
@@ -1621,20 +1730,23 @@ class BotDashboard(QMainWindow):
                     except:
                         name = ticker
             
-            buy_p = float(pos_info.get('buy_p', 0.0))
-            max_p = float(pos_info.get('max_p', 0.0))
-
-            strategy_label = _position_strategy_label(pos_info)
-            buy_time = pos_info.get('buy_time', '')
             row_key = _ledger_row_key(ticker)
-            qty_val = float(_to_float(live_qty_by_key.get(row_key), _to_float(pos_info.get("qty"), 0.0)))
-            qty_text = _format_position_qty_for_table(market, qty_val)
+            buy_p = float(pos_info.get('buy_p', 0.0))
+            live_bp = float(live_avg_by_key.get(row_key, 0.0) or 0.0)
+            if live_bp > 0:
+                buy_p = live_bp
+            max_p = float(pos_info.get('max_p', 0.0))
 
             m_led = (
                 "KR"
                 if market == "🇰🇷 국장"
                 else ("US" if market == "🇺🇸 미장" else "COIN")
             )
+            strategy_label = _position_strategy_label(pos_info, ticker, m_led)
+            buy_time = pos_info.get('buy_time', '')
+            qty_val = float(_to_float(live_qty_by_key.get(row_key), _to_float(pos_info.get("qty"), 0.0)))
+            qty_text = _format_position_qty_for_table(market, qty_val)
+
             curr_p = float(
                 resolve_holding_display_price(m_led, ticker, buy_p, None, pos_info)
             )
@@ -1736,6 +1848,7 @@ class BotDashboard(QMainWindow):
         self._flush_pending_heartbeat()
         # 매매 종료 후 최신 장부·내역을 화면에 즉시 반영
         QTimer.singleShot(500, lambda: self.refresh_balance(sync_first=False))
+        self.update_stats_ui()
 
     def do_trade(self):
         if self._trade_worker_busy:
@@ -1770,11 +1883,49 @@ class BotDashboard(QMainWindow):
 
         print(
             "🔁 [KIS 강제 새로고침] 국·미 예수·총평 KIS 실조회 "
-            "(비장중·쿨다운 무시, 총평 직전보다 급변 시만 라벨 유지 · 장부 KIS 동기화)"
+            "(비장중·쿨다운 무시 · 직전과 크게 다르면 적용 여부 확인)"
         )
         st = load_state(STATE_PATH)
         mark_balance_live_sync(st, STATE_PATH)
         self.refresh_balance(sync_first=True, force_kis=True)
+
+    def _on_kis_anomaly_prompt(self, payload: dict):
+        """KIS 강제 새로고침 중 급변 값 — 새 KIS 값 적용 여부."""
+        market = str((payload or {}).get("market") or "").strip().upper()
+        prev = (payload or {}).get("prev") if isinstance((payload or {}).get("prev"), dict) else {}
+        new = (payload or {}).get("new") if isinstance((payload or {}).get("new"), dict) else {}
+        reason = str((payload or {}).get("reason") or "직전 스냅샷과 차이가 큽니다.").strip()
+        if market == "KR":
+            body = (
+                f"직전 저장값\n"
+                f"  예수 {int(prev.get('cash', 0) or 0):,}원 · 총평 {int(prev.get('total', 0) or 0):,}원\n\n"
+                f"KIS 실조회\n"
+                f"  예수 {int(new.get('cash', 0) or 0):,}원 · 총평 {int(new.get('total', 0) or 0):,}원\n\n"
+                f"사유: {reason}\n\n"
+                f"KIS 새 값을 적용할까요?"
+            )
+            title = "국장 KIS 라벨 확인"
+        else:
+            body = (
+                f"직전 저장값\n"
+                f"  예수 ${float(prev.get('cash', 0) or 0):,.2f} · 총평 ${float(prev.get('total', 0) or 0):,.2f}\n\n"
+                f"KIS 실조회\n"
+                f"  예수 ${float(new.get('cash', 0) or 0):,.2f} · 총평 ${float(new.get('total', 0) or 0):,.2f}\n\n"
+                f"사유: {reason}\n\n"
+                f"KIS 새 값을 적용할까요?"
+            )
+            title = "미장 KIS 라벨 확인"
+        reply = QMessageBox.question(
+            self,
+            title,
+            body,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        thread = getattr(self, "updater_thread", None)
+        if thread is not None:
+            thread._anomaly_accept = reply == QMessageBox.Yes
+            thread._anomaly_event.set()
 
     def refresh_balance(self, sync_first=True, force_kis=False, on_finished=None):
         """비동기 스레드를 가동하여 화면 멈춤 없이 잔고를 갱신합니다."""
@@ -1795,6 +1946,8 @@ class BotDashboard(QMainWindow):
         self.updater_thread = BalanceUpdaterThread(sync_first=sync_first, dashboard=self, force_kis=force_kis)
         self.updater_thread.update_labels.connect(self._apply_labels_ui)
         self.updater_thread.update_table.connect(self._apply_table_ui)
+        if force_kis:
+            self.updater_thread.kis_anomaly_prompt.connect(self._on_kis_anomaly_prompt)
         
         # 완료 시 장부 업데이트 등 마무리 작업 연결
         self.updater_thread.finished.connect(self._on_refresh_finished)
@@ -1917,6 +2070,7 @@ class BotDashboard(QMainWindow):
         self._refresh_inflight = False
         self.refresh_trade_history()
         self.refresh_ledger()
+        self.update_stats_ui()
         if getattr(self, "_refresh_was_force_kis", False):
             print("✅ [KIS 강제 새로고침] 완료 — 국·미 예수·총평·보유 표 반영 (last_kis_display_snapshot 갱신)")
             self._refresh_was_force_kis = False

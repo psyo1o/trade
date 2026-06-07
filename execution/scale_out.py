@@ -162,14 +162,21 @@ def post_partial_ledger(
     new_bp = (inv - cost_out) / rem if rem > 1e-12 else bp
     if not math.isfinite(new_bp) or new_bp <= 0:
         new_bp = bp
-    out["buy_p"] = float(new_bp)
+    # 스윙 HALF·V8 1차: KIS 평단(한투)과 다르게 (매도가−평단) 회계식으로 buy_p 를 깎지 않음 → sync 가 실계좌 평단 맞춤
+    if set_scale_out_done and not set_second_scale_out_done:
+        out["buy_p"] = float(bp)
+    else:
+        out["buy_p"] = float(new_bp)
     if abs(rem - round(rem)) < 1e-9:
         out["qty"] = int(round(rem))
     else:
         out["qty"] = float(rem)
     old_sl = float(out.get("sl_p") or 0)
-    if bp > 0 and old_sl > 0 and new_bp > 0:
-        out["sl_p"] = float(new_bp * (old_sl / bp))
+    avg_for_sl = float(out["buy_p"])
+    if bp > 0 and old_sl > 0 and avg_for_sl > 0 and not (
+        set_scale_out_done and not set_second_scale_out_done
+    ):
+        out["sl_p"] = float(avg_for_sl * (old_sl / bp))
     old_max = float(out.get("max_p") or px)
     out["max_p"] = max(old_max, px)
     if set_scale_out_done:

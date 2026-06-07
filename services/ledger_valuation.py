@@ -6,9 +6,125 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Callable
 
 from utils.helpers import is_coin_ticker, normalize_ticker
+
+_LEGACY_CASH_KEYS = {"KR": "last_kr_cash_krw", "US": "last_us_cash_usd"}
+
+
+def _market_norm(market: str) -> str:
+    return str(market or "").strip().upper()
+
+
+def _kis_snap_bucket(state: dict, market: str) -> dict:
+    snap = state.get("last_kis_display_snapshot")
+    if not isinstance(snap, dict):
+        return {}
+    key = "kr" if _market_norm(market) == "KR" else "us"
+    part = snap.get(key)
+    return part if isinstance(part, dict) else {}
+
+
+def kis_display_total(state: dict, market: str) -> float:
+    """국·미 총평 — KIS 스냅샷. 장부+시세 루프는 ``_phase5_aux_sync`` 추정값 우선."""
+    m = _market_norm(market)
+    aux = state.get("_phase5_aux_sync")
+    if isinstance(aux, dict) and aux.get("ledger_only"):
+        key = "kr_krw" if m == "KR" else "usd_total"
+        raw = aux.get(key)
+        if raw is not None:
+            v = float(raw or 0)
+            if v > 0:
+                return v
+    part = _kis_snap_bucket(state, market)
+    t = float(part.get("total", 0) or 0)
+    if t > 0:
+        return t
+    m = _market_norm(market)
+    if m == "KR":
+        return float(state.get("circuit_aux_last_kr_krw", 0) or state.get("last_kr_cash_krw", 0) or 0)
+    return float(state.get("circuit_aux_last_usd_total", 0) or state.get("last_us_cash_usd", 0) or 0)
+
+
+def _cash_looks_like_total_as_cash(cash: float, total: float) -> bool:
+    return cash > 0 and total > 0 and cash >= total * 0.95
+
+
+def display_cash_from_state(
+    state: dict,
+    market: str,
+    snap_part: dict | None = None,
+) -> float:
+    """예수 — ``last_kis_display_snapshot`` 만 (옛 키는 스냅샷 비었을 때만 읽기)."""
+    m = _market_norm(market)
+    part = snap_part if isinstance(snap_part, dict) else _kis_snap_bucket(state, m)
+    snap_cash = float(part.get("cash", 0) or 0)
+    snap_total = float(part.get("total", 0) or 0)
+    stale = _cash_looks_like_total_as_cash(snap_cash, snap_total)
+    if snap_cash > 0 and not stale:
+        return snap_cash
+    if stale:
+        legacy = float(state.get(_LEGACY_CASH_KEYS.get(m, ""), 0) or 0)
+        if legacy > 0 and legacy < snap_cash * 0.9:
+            return legacy
+        return 0.0
+    if not part:
+        legacy = float(state.get(_LEGACY_CASH_KEYS.get(m, ""), 0) or 0)
+        if legacy > 0:
+            return legacy
+    return snap_cash
+
+
+def write_kis_display_snapshot_part(
+    state: dict,
+    market: str,
+    *,
+    cash: float,
+    total: float,
+    roi: Any = None,
+    saved_at: str | None = None,
+    force: bool = False,
+) -> None:
+    """국·미 예수·총평 — ``last_kis_display_snapshot`` 에만 저장 (단일 저장소)."""
+    m = _market_norm(market)
+    if m not in ("KR", "US"):
+        return
+    snap = state.get("last_kis_display_snapshot")
+    if not isinstance(snap, dict):
+        snap = {}
+    bucket_key = "kr" if m == "KR" else "us"
+    prev = snap.get(bucket_key)
+    entry: dict[str, Any] = dict(prev) if isinstance(prev, dict) else {}
+    nc = float(cash)
+    nt = float(total)
+    if not force and isinstance(prev, dict):
+        pc = float(prev.get("cash", 0) or 0)
+        pt = float(prev.get("total", 0) or 0)
+        min_pt = 10_000.0 if m == "KR" else 50.0
+        if (
+            pt >= min_pt
+            and pc > 0
+            and nc > 0
+            and nc < pc * 0.55
+            and nt < pt * 0.85
+        ):
+            print(
+                f"  📌 [snapshot {m}] 잔고 API 예수·총평 급감(일시/점검 추정) — "
+                f"저장 스냅샷 유지 (new cash={nc}, total={nt} / prev cash={pc}, total={pt})"
+            )
+            return
+    entry["cash"] = int(nc) if m == "KR" else float(nc)
+    entry["total"] = int(nt) if m == "KR" else float(nt)
+    if roi is not None:
+        entry["roi"] = roi
+    snap[bucket_key] = entry
+    if saved_at:
+        snap["saved_at"] = saved_at
+    elif not snap.get("saved_at"):
+        snap["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    state["last_kis_display_snapshot"] = snap
 
 
 def _ledger_qty(pos: dict | None, fallback: float = 0.0) -> float:
@@ -76,10 +192,11 @@ def synthetic_kr_balance_dict(
         holdings_value += qty * curr_p
         output1.append(_kr_row_from_position(c, pos, curr_p))
 
-    cash = float(state.get("last_kr_cash_krw", 0) or 0)
+    cash = display_cash_from_state(state, "KR")
     total = cash + holdings_value
-    if total <= 0 and float(state.get("circuit_aux_last_kr_krw", 0) or 0) > 0:
-        total = float(state["circuit_aux_last_kr_krw"])
+    snap_total = kis_display_total(state, "KR")
+    if total <= 0 and snap_total > 0:
+        total = snap_total
         if cash <= 0:
             cash = max(0.0, total - holdings_value)
 
@@ -121,10 +238,11 @@ def synthetic_us_balance_dict(
             }
         )
 
-    cash = float(state.get("last_us_cash_usd", 0) or 0)
+    cash = display_cash_from_state(state, "US")
     total = cash + holdings_value
-    if total <= 0 and float(state.get("circuit_aux_last_usd_total", 0) or 0) > 0:
-        total = float(state["circuit_aux_last_usd_total"])
+    snap_total = kis_display_total(state, "US")
+    if total <= 0 and snap_total > 0:
+        total = snap_total
         if cash <= 0:
             cash = max(0.0, total - holdings_value)
 
@@ -143,18 +261,14 @@ def coalesce_ledger_kis_labels(
 ) -> tuple[float, float]:
     """장부+시세 GUI 라벨 — 예수에 총평이 섞여 있으면 ``cash+보유`` 이중 합산을 막는다.
 
-  * 예수: ``last_kis_display_snapshot`` → ``last_*_cash_*`` → synthetic 파싱 순
+  * 예수: ``display_cash_from_state`` (``last_kis_display_snapshot`` 단일 소스)
   * 총평: 정리된 예수 + 장부 보유 평가(표시 시세)
-  """
+    """
     part = kis_snap_part if isinstance(kis_snap_part, dict) else {}
-    snap_cash = float(part.get("cash", 0) or 0)
     snap_total = float(part.get("total", 0) or 0)
     hc = float(holdings_current or 0.0)
-    m = str(market or "").strip().upper()
-    state_key = "last_kr_cash_krw" if m == "KR" else "last_us_cash_usd"
-    state_cash = float(state.get(state_key, 0) or 0.0)
-
-    cash = snap_cash if snap_cash > 0 else state_cash
+    m = _market_norm(market)
+    cash = display_cash_from_state(state, m, part)
     if cash <= 0:
         cash = float(cash_guess or 0.0)
 
@@ -177,36 +291,13 @@ def coalesce_ledger_kis_labels(
 
 
 def persist_kr_cash_from_balance(bal: dict, state: dict) -> None:
-    from api.kis_parsers import parse_kr_cash_total
-
-    try:
-        from run_bot import _to_float
-
-        out2 = bal.get("output2", [])
-        cash, total = parse_kr_cash_total(out2, _to_float)
-        state["last_kr_cash_krw"] = float(cash)
-        state["circuit_aux_last_kr_krw"] = float(total)
-    except Exception:
-        pass
+    """레거시 — 국·미 표시는 ``last_kis_display_snapshot`` 만 갱신한다 (잔고 API로 덮어쓰지 않음)."""
+    del bal, state
 
 
 def persist_us_cash_from_balance(bal: dict, state: dict) -> None:
-    try:
-        from run_bot import _to_float, safe_get
-        from api.kis_parsers import parse_us_cash_fallback
-
-        out2 = safe_get(bal, "output2", {})
-        cash = float(_to_float(parse_us_cash_fallback(out2, _to_float), 0.0))
-        rows = bal.get("output1", []) if isinstance(bal.get("output1"), list) else []
-        stock_v = 0.0
-        for s in rows:
-            q = float(_to_float(s.get("ovrs_cblc_qty", 0)))
-            p = float(_to_float(s.get("ovrs_now_prc2", s.get("ovrs_avg_unpr", 0))))
-            stock_v += q * p
-        state["last_us_cash_usd"] = cash
-        state["circuit_aux_last_usd_total"] = float(cash + stock_v)
-    except Exception:
-        pass
+    """레거시 — 국·미 표시는 ``last_kis_display_snapshot`` 만 갱신한다 (잔고 API로 덮어쓰지 않음)."""
+    del bal, state
 
 
 def update_circuit_aux_from_ledger(
@@ -227,15 +318,17 @@ def update_circuit_aux_from_ledger(
 
         _, kr_total = parse_kr_cash_total(kr_bal.get("output2", []), _to_float)
     except Exception:
-        kr_total = float(state.get("circuit_aux_last_kr_krw", 0) or 0)
+        kr_total = kis_display_total(state, "KR")
 
-    us_total = float(state.get("circuit_aux_last_usd_total", 0) or 0)
+    us_total = kis_display_total(state, "US")
     try:
         out2 = us_bal.get("output2", {})
         if isinstance(out2, dict):
             cash_u = float(out2.get("frcr_dncl_amt_2", 0) or 0)
             stock_u = float(out2.get("ovrs_stck_evlu_amt", 0) or 0)
-            us_total = cash_u + stock_u
+            est = cash_u + stock_u
+            if est > 0:
+                us_total = est
     except Exception:
         pass
 
@@ -245,11 +338,7 @@ def update_circuit_aux_from_ledger(
         else float(state.get("circuit_aux_last_coin_krw", 0) or 0)
     )
 
-    state["circuit_aux_last_kr_krw"] = float(kr_total)
-    state["circuit_aux_last_usd_total"] = float(us_total)
     state["circuit_aux_last_coin_krw"] = float(coin_k)
-    persist_kr_cash_from_balance(kr_bal, state)
-    persist_us_cash_from_balance(us_bal, state)
 
     rate = float(estimate_usdkrw())
     return {

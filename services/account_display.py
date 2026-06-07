@@ -15,6 +15,53 @@ def _rb():
     return rb
 
 
+# GUI·워커 반복 호출 시 동일 📌/[표시] 안내 스팸 방지
+_last_display_notes: dict[str, str] = {}
+
+
+def display_note_once(key: str, text: str) -> None:
+    """``[표시]`` / 표시 모드 안내 — 동일 key·문구는 1회만."""
+    if _last_display_notes.get(key) == text:
+        return
+    _last_display_notes[key] = text
+    print(f"  [표시] {text}")
+
+
+def _fill_missing_equity_roi_from_ledger(snap: dict) -> None:
+    """스냅샷 ``roi`` 가 ``persist_*`` 등으로 비었을 때 장부+시세로 보유수익률만 복구."""
+    if not isinstance(snap, dict):
+        return
+    labels = snap.get("labels")
+    if not isinstance(labels, dict):
+        return
+    rb = _rb()
+    from services import ledger_valuation as lv
+
+    st = rb.load_state(rb.STATE_PATH)
+
+    def _kr_p(c, p, b):
+        return float(rb.resolve_holding_display_price("KR", c, b, None, p))
+
+    def _us_p(t, p, b):
+        return float(rb.resolve_holding_display_price("US", t, b, None, p))
+
+    for market, synth_fn, calc_fn in (
+        ("KR", lambda: lv.synthetic_kr_balance_dict(st, resolve_kr_price=_kr_p), rb._calc_kr_holdings_metrics),
+        ("US", lambda: lv.synthetic_us_balance_dict(st, resolve_us_price=_us_p), rb._calc_us_holdings_metrics),
+    ):
+        key = market.lower()
+        part = labels.get(key)
+        if not isinstance(part, dict) or part.get("roi") is not None:
+            continue
+        try:
+            bal = synth_fn()
+            roi = calc_fn(bal).get("roi")
+            if roi is not None:
+                part["roi"] = roi
+        except Exception:
+            pass
+
+
 def build_ledger_display_snapshot(
     *,
     allow_kis_fetch=None,
@@ -50,7 +97,7 @@ def build_ledger_display_snapshot(
         cash_guess=float(kr_cash_p),
         total_guess=float(kr_total_p),
     )
-    us_cash_g = float(st.get("last_us_cash_usd", 0) or 0)
+    us_cash_g = float(lv.display_cash_from_state(st, "US"))
     us_hold = float(us_m.get("current", 0.0) or 0.0)
     us_cash, us_total = lv.coalesce_ledger_kis_labels(
         "US",
@@ -84,8 +131,20 @@ def build_ledger_display_snapshot(
     return {
         "weather": weather,
         "labels": {
-            "kr": {"cash": int(kr_cash), "total": int(kr_total), "roi": kr_m.get("roi")},
-            "us": {"cash": float(us_cash), "total": float(us_total), "roi": us_m.get("roi")},
+            "kr": {
+                "cash": int(kr_cash),
+                "total": int(kr_total),
+                "roi": kr_m.get("roi")
+                if kr_m.get("roi") is not None
+                else (kr_part.get("roi") if isinstance(kr_part, dict) else None),
+            },
+            "us": {
+                "cash": float(us_cash),
+                "total": float(us_total),
+                "roi": us_m.get("roi")
+                if us_m.get("roi") is not None
+                else (us_part.get("roi") if isinstance(us_part, dict) else None),
+            },
             "coin": {"cash": int(krw_bal), "total": int(coin_total), "roi": coin_roi},
         },
         "holdings": {
@@ -105,6 +164,7 @@ def build_account_snapshot_for_report(
     force_kis_labels: bool = False,
     fresh_balances: bool = False,
     ledger_only: bool = False,
+    kis_label_anomaly_prompt=None,
 ) -> dict:
     """GUI·heartbeat 상단 라벨·보유 스냅샷."""
     rb = _rb()
@@ -117,14 +177,17 @@ def build_account_snapshot_for_report(
 
     st = rb.load_state(rb.STATE_PATH)
     if ledger_only or should_use_ledger_only(st, rb.config, force=bool(force_kis_labels)):
-        print(
-            "  [표시] 장부+시세 — KIS 국·미 잔고 API 생략 "
-            "(상단 라벨: last_kis_display_snapshot + 장부 보유평가)"
+        display_note_once(
+            "ledger_only",
+            "장부+시세 — 국·미 KIS 잔고 API 생략, 코인만 거래소 조회 "
+            "(상단 라벨: last_kis_display_snapshot 예수·총평 + 장부 보유평가)",
         )
-        return build_ledger_display_snapshot(
+        snap = build_ledger_display_snapshot(
             allow_kis_fetch=allow_kis_fetch,
             force_kis_labels=force_kis_labels,
         )
+        _fill_missing_equity_roi_from_ledger(snap)
+        return snap
 
     if force_kis_labels:
         print(
@@ -132,7 +195,7 @@ def build_account_snapshot_for_report(
             "예수·총평 라벨·last_kis_display_snapshot 저장 (비장중 포함)"
         )
     elif fresh_balances:
-        print("  [표시] KIS·거래소 실조회 — 체결·입출금·always 모드 등")
+        display_note_once("fresh_balances", "KIS·거래소 실조회 — 체결·입출금·always 모드 등")
 
     bal_refresh = bool(fresh_balances or force_kis_labels)
 
@@ -179,30 +242,20 @@ def build_account_snapshot_for_report(
         allow_kis_fetch=allow_kis_fetch,
         with_backoff=with_backoff,
         force_kis_labels=force_kis_labels,
+        kis_label_anomaly_prompt=kis_label_anomaly_prompt,
     )
+    _fill_missing_equity_roi_from_ledger(snap)
     try:
-        bal_map = snap.get("balances") if isinstance(snap, dict) else {}
-        st_cash = rb.load_state(rb.STATE_PATH)
-        touched = False
-        if isinstance(bal_map, dict):
-            kr_b = bal_map.get("kr")
-            us_b = bal_map.get("us")
-            if isinstance(kr_b, dict) and kr_b.get("output2") is not None:
-                _lv.persist_kr_cash_from_balance(kr_b, st_cash)
-                touched = True
-            if isinstance(us_b, dict) and (
-                us_b.get("output1") is not None or us_b.get("output2") is not None
-            ):
-                _lv.persist_us_cash_from_balance(us_b, st_cash)
-                touched = True
-        if touched:
-            rb.save_state(rb.STATE_PATH, st_cash)
-            if force_kis_labels:
-                print(
-                    "  🔁 [KIS 강제 새로고침] 장부 예수 캐시 갱신 "
-                    f"(KR {int(st_cash.get('last_kr_cash_krw', 0) or 0):,}원 · "
-                    f"US ${float(st_cash.get('last_us_cash_usd', 0) or 0):,.2f})"
-                )
+        labels = snap.get("labels") if isinstance(snap, dict) else {}
+        if force_kis_labels and isinstance(labels, dict):
+            st_cash = rb.load_state(rb.STATE_PATH)
+            print(
+                "  🔁 [KIS 강제 새로고침] 표시 스냅샷 저장 완료 — "
+                f"KR {int(_lv.display_cash_from_state(st_cash, 'KR')):,}원 · "
+                f"US ${float(_lv.display_cash_from_state(st_cash, 'US')):,.2f}"
+            )
+        elif not force_kis_labels:
+            pass
     except Exception as e:
         print(f"  ⚠️ [snapshot] 장부 예수 캐시 갱신 실패: {type(e).__name__}: {e}")
     if force_kis_labels or fresh_balances:

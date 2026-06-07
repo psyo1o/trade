@@ -242,13 +242,15 @@ def maybe_run_account_circuit(state: dict) -> None:
         return
 
     aux_meta = state.get("_phase5_aux_sync") if isinstance(state.get("_phase5_aux_sync"), dict) else {}
-    kr_ok = bool(aux_meta.get("kr_ok")) if aux_meta else bool(state.get("circuit_aux_last_kr_krw"))
-    us_ok = bool(aux_meta.get("us_ok")) if aux_meta else bool(state.get("circuit_aux_last_usd_total"))
+    from services import ledger_valuation as lv
+
+    kr_ok = bool(aux_meta.get("kr_ok")) if aux_meta else bool(lv.kis_display_total(state, "KR"))
+    us_ok = bool(aux_meta.get("us_ok")) if aux_meta else bool(lv.kis_display_total(state, "US"))
     coin_ok = bool(aux_meta.get("coin_ok")) if aux_meta else bool(state.get("circuit_aux_last_coin_krw"))
     market_ok = {"KR": kr_ok, "US": us_ok, "COIN": coin_ok}
 
-    kr_krw = float(state.get("circuit_aux_last_kr_krw", 0) or 0)
-    us_usd = float(state.get("circuit_aux_last_usd_total", 0) or 0)
+    kr_krw = lv.kis_display_total(state, "KR")
+    us_usd = lv.kis_display_total(state, "US")
     coin_krw = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
     usdkrw = estimate_usdkrw()
     us_krw = us_usd * usdkrw
