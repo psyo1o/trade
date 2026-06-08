@@ -43,7 +43,7 @@ def cache_ttl_sec() -> float:
 
 
 def min_api_interval_sec() -> float:
-    return max(1.0, _env_float("BOT_KIS_BALANCE_MIN_INTERVAL_SEC", 2.5))
+    return max(1.5, _env_float("BOT_KIS_BALANCE_MIN_INTERVAL_SEC", 4.0))
 
 
 def stale_ok_sec() -> float:
@@ -55,10 +55,23 @@ def invalidate(market: str | None = None) -> None:
     if market is None:
         _cache.clear()
         _last_api_mono.clear()
+        _clear_us_cash_cache()
         return
     key = str(market).strip().upper()
     _cache.pop(key, None)
     _last_api_mono.pop(key, None)
+    if key == "US":
+        _clear_us_cash_cache()
+
+
+def _clear_us_cash_cache() -> None:
+    try:
+        from api.kis_api import get_us_cash_real
+
+        if hasattr(get_us_cash_real, "_us_cash_cache"):
+            delattr(get_us_cash_real, "_us_cash_cache")
+    except Exception:
+        pass
 
 
 def _kis_balance_cacheable(raw: Any, market: str) -> bool:
@@ -170,13 +183,16 @@ def _get_raw(
     min_iv = min_api_interval_sec()
     now = time.monotonic()
 
+    if refresh:
+        _cache.pop(key, None)
+
     if not refresh and key in _cache:
         ts, raw = _cache[key]
         if (now - ts) < ttl and _kis_balance_cacheable(raw, key):
             return raw
 
     last_fetch = float(_last_api_mono.get(key, 0.0))
-    if (now - last_fetch) < min_iv:
+    if not refresh and (now - last_fetch) < min_iv:
         ent = _cache.get(key)
         if ent and _kis_balance_cacheable(ent[1], key):
             return ent[1]

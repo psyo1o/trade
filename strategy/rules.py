@@ -5,7 +5,7 @@ V5 전략 코어 — OHLCV 수집, 프로 시그널, 청산 가격.
 역할 분리
     * **데이터** — ``get_ohlcv_yfinance`` / ``get_ohlcv_kis_domestic_daily`` / ``get_ohlcv_upbit`` / ``get_ohlcv_realtime`` 등.
     * **시그널** — ``calculate_pro_signals`` (V8 진입), ``check_swing_entry`` / ``check_swing_exit`` (SWING_FIB).
-    * **청산** — ``check_pro_exit``, ``get_final_exit_price`` (V8, 샹들리에·20MA/ATR), ``get_swing_exit_display_price`` (SWING_FIB 매도선).
+    * **청산** — ``check_pro_exit``, ``get_final_exit_price`` (V8, 샹들리에·20MA/ATR·1차 익절 후 본절락), ``get_swing_exit_display_price`` (SWING_FIB 매도선).
 
 스윙 요약은 README.md §8. 진입: ``check_swing_entry`` (60MA·이격·갭·양봉·윗꼬리·RSI≥35·피보).
 청산 HALF: 1.5R 스케일아웃. 하드바닥: 피보·구름 + 시간가중 손절(영업 24h 후).
@@ -340,6 +340,9 @@ def get_ohlcv_kis_domestic_daily(broker, ticker):
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                from api.kis_rate_limit import wait_for_slot
+
+                wait_for_slot(label=f"kr_ohlcv:{ticker}")
                 res = requests.get(url, headers=headers, params=params, timeout=10)
                 data = res.json() if res is not None else {}
             except Exception as req_err:
@@ -678,7 +681,7 @@ def _v8_technical_stop_floor_from_ohlcv(ohlcv, reference_price: float) -> float:
 
 
 def get_final_exit_price(ticker, curr_p, pos_info, ohlcv):
-    """V8 최종 매도선 — 샹들리에·20MA/ATR·본절 락(최고수익≥4%) 중 높은 값."""
+    """V8 최종 매도선 — 샹들리에·20MA/ATR·본절 락(1차 분할 익절 후) 중 높은 값."""
     if not ohlcv:
         return _finite_price(pos_info.get("sl_p"), 0.0)
 
@@ -693,8 +696,7 @@ def get_final_exit_price(ticker, curr_p, pos_info, ohlcv):
     locked_chandelier = max(_finite_price(raw_chandelier, sl_fb), sl_fb)
 
     buy_price = _finite_price(pos_info.get("buy_p", cp), cp)
-    max_price = max(_finite_price(pos_info.get("max_p", cp), cp), cp)
-    profit_floor = get_v8_profit_lock_floor(buy_price, max_price)
+    profit_floor = get_v8_profit_lock_floor(buy_price, pos_info)
 
     candidates = [locked_chandelier]
     technical = _v8_technical_stop_floor_from_ohlcv(ohlcv, cp)
@@ -724,12 +726,7 @@ def check_pro_exit(ticker, curr_p, pos_info, ohlcv):
     if current_price <= final_stop_loss:
         print(f"🚨 [익절/손절 트리거 발동] {ticker} 매도 실행! (수익 방어 성공)")
         buy_f = float(buy_price) if buy_price else 0.0
-        max_p = max(
-            float(pos_info.get("max_p", current_price) or current_price),
-            float(current_price),
-        )
-        max_profit_rate = _max_profit_rate_pct(buy_f, max_p)
-        lock_floor = get_v8_profit_lock_floor(buy_f, max_p)
+        lock_floor = get_v8_profit_lock_floor(buy_f, pos_info)
         chandelier = get_chandelier_exit(current_price, pos_info, ohlcv)
         if (
             lock_floor > 0
@@ -738,7 +735,7 @@ def check_pro_exit(ticker, curr_p, pos_info, ohlcv):
         ):
             reason = (
                 f"이익 보존 락(Lock) 발동 (본절+{(BREAKEVEN_LOCK_MULT - 1) * 100:.1f}%, "
-                f"최고+{max_profit_rate:.1f}%)"
+                f"1차 분할 익절 후 Free Ride)"
             )
         else:
             reason = "V5.0 샹들리에 라인 붕괴 (추세 종료)"
@@ -1024,8 +1021,6 @@ SWING_RSI_FULL_MAX_PROFIT_PCT = 10.0
 BREAKEVEN_LOCK_MULT = 1.005
 # 스윙 수익 락: max_p 기준 최고 수익률이 이 값(%) **초과** 시에만 본절 락 활성화
 SWING_PROFIT_LOCK_ACTIVATE_PCT = 3.0
-# V8 수익 락: max_p 기준 최고 수익률이 이 값(%) **이상** 도달 시 본절 락 활성화
-V8_PROFIT_LOCK_ACTIVATE_PCT = 4.0
 
 
 def _max_profit_rate_pct(buy_p: float, max_p: float) -> float:
@@ -1037,14 +1032,14 @@ def _max_profit_rate_pct(buy_p: float, max_p: float) -> float:
     return (mp - bp) / bp * 100.0
 
 
-def get_v8_profit_lock_floor(buy_p: float, max_p: float) -> float:
-    """V8 본절 락 — 최고 수익 ≥ ``V8_PROFIT_LOCK_ACTIVATE_PCT`` 일 때만 ``BREAKEVEN_LOCK_MULT``."""
+def get_v8_profit_lock_floor(buy_p: float, pos_info: dict) -> float:
+    """V8 본절 락 — 1차 분할 익절(``scale_out_done``) 완료 후에만 ``BREAKEVEN_LOCK_MULT``."""
     bp = float(buy_p)
     if bp <= 0:
         return 0.0
-    if _max_profit_rate_pct(bp, max_p) >= V8_PROFIT_LOCK_ACTIVATE_PCT:
-        return bp * BREAKEVEN_LOCK_MULT
-    return 0.0
+    if not bool((pos_info or {}).get("scale_out_done", False)):
+        return 0.0
+    return bp * BREAKEVEN_LOCK_MULT
 
 
 def _append_swing_indicators(w: pd.DataFrame) -> pd.DataFrame:
@@ -1641,7 +1636,7 @@ def check_swing_exit(
         floor_lbl = _format_swing_price_label(hard_floor, market=market, ticker=ticker)
         return (
             "FULL",
-            f"스윙 하드스탑 이탈 (현재가: {cur_lbl} < 기준 {floor_lbl})",
+            f"스윙 기술바닥 이탈 (현재가: {cur_lbl} < 기준 {floor_lbl})",
         )
 
     # 2) HALF — 1.5R 스케일아웃

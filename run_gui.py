@@ -98,7 +98,6 @@ from strategy.rules import (
     SWING_TIME_DECAY_GAP_CLOSE_PER_24H,
     SWING_TIME_DECAY_START_TRADING_HOURS,
     SWING_UPPER_WICK_DROP_PCT,
-    V8_PROFIT_LOCK_ACTIVATE_PCT,
 )
 
 TRADE_HISTORY_PATH = Path(__file__).resolve().parent / "trade_history.json"
@@ -307,7 +306,7 @@ def _build_strategy_guide_text() -> str:
         f"- 타임스탑: 주식 {v8_eq:.0f}h / 코인 {v8_coin:.0f}h, 유예 수익 +{v8_ex:.1f}% 이상이면 유예\n"
         "- 매도선 = max(샹들리에, 20MA−ATR·종가−2ATR 기술선, 본절락, 장부 sl_p)\n"
         "  · 샹들리에: max_p − ATR×2.5\n"
-        f"  · 본절락: max_p 최고수익 ≥{V8_PROFIT_LOCK_ACTIVATE_PCT:.0f}% → 평단×1.005\n"
+        "  · 본절락: 1차 분할 익절(scale_out_done) 후 → 평단×1.005 (Free Ride)\n"
         "- 수익 구간: 현재가 ≤ 매도선 → 전량 (락·샹들리에 사유 로그)\n"
         "- 스윙 포지션에는 V8 샹들리에·check_pro_exit 미적용\n\n"
         "■ 5) 스윙 매수 — check_swing_entry (V8 실패 후, SWING_FIB)\n"

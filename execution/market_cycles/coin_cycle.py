@@ -145,9 +145,15 @@ def run_coin_cycle(ctx: TradingCycleContext) -> None:
 
             # 손절가 체크 로그
             if profit_rate_now < 0:
-                print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: {curr_fmt} / 손절가: {hard_fmt})")
+                _stop_lbl = rb._v8_loss_stop_log_label(buy_p, pos_info, hard_stop)
+                print(
+                    f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% "
+                    f"(현재가: {curr_fmt} / {_stop_lbl}: {hard_fmt})"
+                )
                 if curr_p <= hard_stop:
-                    print(f"     ➜ 손절 체크: 현재가 {curr_fmt} ≤ 손절가 {hard_fmt} = 🔴 매도 신호!")
+                    print(
+                        f"     ➜ {_stop_lbl} 체크: 현재가 {curr_fmt} ≤ 기준 {hard_fmt} = 🔴 매도 신호!"
+                    )
 
             # 수익률 +1% 미만·매수 후 15분: 매도 보류 (손실 구간 포함)
             buy_time = pos_info.get('buy_time', 0)
@@ -335,8 +341,10 @@ def run_coin_cycle(ctx: TradingCycleContext) -> None:
             if not is_exit and profit_rate_now < 0 and strategy_type != "SWING_FIB":
                 if curr_p <= hard_stop:
                     is_exit = True
-                    reason = "하드스탑 이탈 (손실구간 방어)"
-                    print(f"🔴 [하드스탑 발동] {t} - 현재가: {curr_p:,.0f}원 <= 손절가: {hard_stop:,.0f}원. 강제 청산! (is_exit={is_exit})")
+                    reason, _exit_log = rb._v8_loss_zone_exit_meta(
+                        buy_p, pos_info, hard_stop, curr_p, market="COIN"
+                    )
+                    print(f"{_exit_log} (is_exit={is_exit})")
 
             # 3. 수익 구간 트레일링 (스윙: 수익 락만 / V8: 샹들리에)
             if not is_exit and profit_rate_now >= 0:
@@ -413,6 +421,13 @@ def run_coin_cycle(ctx: TradingCycleContext) -> None:
         held_coins = rb._extract_held_coins_from_balances(balances)
         total_coin_equity = rb._compute_total_coin_equity_from_balances(balances, float(krw_on_book))
         state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
+        try:
+            coin_m = rb._calc_coin_holdings_metrics(balances, state.get("positions"))
+            rb.save_last_coin_display_snapshot(
+                int(krw_bal), int(total_coin_equity), coin_m.get("roi")
+            )
+        except Exception:
+            pass
         rb.save_state(rb.STATE_PATH, state)
         if (
             abs(float(krw_bal) - krw_bal_snap) >= 100.0

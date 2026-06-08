@@ -223,9 +223,11 @@ strategy/
     SWING_SCALE_OUT_R_MULT=1.5, SWING_RUNNER_TRAIL_MA_DAYS=5,
     SWING_TIME_DECAY_START_TRADING_HOURS=24, SWING_TIME_DECAY_GAP_CLOSE_PER_24H=0.40,
     SWING_UPPER_WICK_DROP_PCT=5.0,
-    SWING_PROFIT_LOCK_ACTIVATE_PCT=3, V8_PROFIT_LOCK_ACTIVATE_PCT=4, BREAKEVEN_LOCK_MULT=1.005,
-    get_final_exit_price/get_chandelier_exit(V8: 샹들리에+20MA/ATR+본절락≥4%, 고정% 캡 없음),
-    get_v8_profit_lock_floor, get_swing_profit_lock_floor(본절락>3%) 등
+    SWING_PROFIT_LOCK_ACTIVATE_PCT=3, BREAKEVEN_LOCK_MULT=1.005,
+    get_v8_profit_lock_floor(scale_out_done 후 본절락), get_swing_profit_lock_floor(max_p>3%),
+    get_final_exit_price/get_chandelier_exit(V8: 샹들리에+20MA/ATR+1차익절 후 본절락, 고정% 캡 없음) 등
+  api/kis_rate_limit.py … KIS Open API 전역 호출 간격(EGW00201 완화)
+  api/kis_parsers.py … parse_kr_live_price / parse_us_live_price (매도 루프 잔고 현재가)
   market_hours.py … trading_hours_elapsed(KR/US 영업시간, COIN 24/7) — 타임스탑·스윙 시간가중용
   alpha_sizing.py … 10일 RS, volatility_target_ratio, Portfolio Heat
     (compute_market_portfolio_heat, portfolio_heat_blocks_entry, atr_pct_from_ohlcv)
@@ -253,7 +255,8 @@ execution/
   idempotency.py … 매수·매도 TWAP 멱등(order_key·buy/sell_inflight·lane·persist_idempotency),
     aggregate_filled_sells_cycle, lane_has_filled_sell,
     reconcile_positions_for_cycle / reconcile_ticker_lane (filled ↔ positions)
-  balance_read.py … kr/us/coin_balance_raw·*_for_report, stock_qty, invalidate(12s TTL).
+  balance_read.py … kr/us/coin_balance_raw·*_for_report, stock_qty, invalidate(TTL 20s·min 4s).
+  api/kis_rate_limit.py … KIS 전역 wait_for_slot (EGW00201 완화)
     TWAP 체결검증·build_account_snapshot·get_safe_balance·GUI fresh_balances=True
   (설계 문서) docs/idempotency/ … README·PROGRESS·SELL_LANES·ANALYSIS·BALANCE_READS·
     LEDGER_RECONCILE·SMOKE_TEST

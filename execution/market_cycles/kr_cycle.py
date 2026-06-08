@@ -74,16 +74,12 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
                 atr_val = rb.get_safe_atr(t, ohlcv)
                 rb._update_position_current_atr_if_changed(state, t, pos_info, atr_val)
             
-                # GUI 가격이 없을 때 직접 조회한 값을 쓰고, 있으면 GUI 공유값을 우선 적용
+                from api.kis_parsers import parse_kr_live_price
+
                 curr_p = float(ohlcv[-1]['c'])
-                try:
-                    _price_resp = rb.kis_api.broker_kr.fetch_price(t)
-                    if _price_resp and _price_resp.get('rt_cd') == '0':
-                        _realtime_p = float(_price_resp.get('output', {}).get('stck_prpr', 0))
-                        if _realtime_p > 0:
-                            curr_p = _realtime_p
-                except Exception:
-                    pass
+                _balance_px = parse_kr_live_price(stock, rb._to_float)
+                if _balance_px > 0:
+                    curr_p = _balance_px
                 curr_p = rb._resolve_curr_price_with_gui_override(pos_info, float(curr_p))
 
                 strategy_type = rb._resolve_sell_loop_strategy_type(pos_info)
@@ -130,9 +126,15 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
 
                 # 손절가 체크 로그
                 if profit_rate_now < 0:
-                    print(f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% (현재가: {curr_p:,.0f} / 손절가: {hard_stop:,.0f})")
+                    _stop_lbl = rb._v8_loss_stop_log_label(buy_p, pos_info, hard_stop)
+                    print(
+                        f"  ⚠️  [{t}] 손실 구간: 수익률 {profit_rate_now:.2f}% "
+                        f"(현재가: {curr_p:,.0f} / {_stop_lbl}: {hard_stop:,.0f})"
+                    )
                     if curr_p <= hard_stop:
-                        print(f"     ➜ 손절 체크: 현재가 {curr_p:,.0f} ≤ 손절가 {hard_stop:,.0f} = 🔴 매도 신호!")
+                        print(
+                            f"     ➜ {_stop_lbl} 체크: 현재가 {curr_p:,.0f} ≤ 기준 {hard_stop:,.0f} = 🔴 매도 신호!"
+                        )
 
                 # 수익률 +1% 미만·매수 후 15분: 매도 보류 (손실 구간 포함)
                 buy_time = pos_info.get('buy_time', time.time() - 900)
@@ -333,8 +335,10 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
                 if not is_exit and profit_rate_now < 0 and strategy_type != "SWING_FIB":
                     if curr_p <= hard_stop:
                         is_exit = True
-                        reason = "하드스탑 이탈 (손실구간 방어)"
-                        print(f"🔴 [하드스탑 발동] {t} - 현재가: {curr_p:,.0f}원 <= 손절가: {hard_stop:,.0f}원. 강제 청산! (is_exit={is_exit})")
+                        reason, _exit_log = rb._v8_loss_zone_exit_meta(
+                            buy_p, pos_info, hard_stop, curr_p, market="KR"
+                        )
+                        print(f"{_exit_log} (is_exit={is_exit})")
 
                 # 3. 수익 구간 트레일링 (스윙: 수익 락만 / V8: 샹들리에)
                 if not is_exit and profit_rate_now >= 0:

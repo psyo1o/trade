@@ -648,7 +648,7 @@ def _is_stop_loss_exit(reason: str, profit_rate: float | None) -> bool:
     if _is_time_stop_exit(reason):
         return False
     r = reason or ""
-    if "하드스탑" in r or "손절" in r:
+    if "하드스탑" in r or "본절락" in r or "손절" in r:
         return True
     if "지하실" in r or "좀비" in r:
         return True

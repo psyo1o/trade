@@ -134,6 +134,52 @@ def test_off_hours_force_rejects_us_spike():
     assert roi == 1.0
 
 
+def test_force_kis_prompt_accepts_us_spike():
+    """GUI 강제 새로고침 — 사용자가 새 값 적용을 선택하면 급증도 반영."""
+    deps, calls = _minimal_deps(us_cash=895.08, us_total_current=539.45)
+    deps["load_last_kis_display_snapshot"] = lambda: {
+        "kr": {"cash": 1, "total": 2},
+        "us": {"cash": 37.91, "total": 576.69, "roi": 1.0},
+    }
+    deps["is_market_open"] = lambda _m: False
+
+    def _accept(**_kw):
+        return True
+
+    out = build_account_snapshot_for_report(
+        deps=deps,
+        allow_kis_fetch=lambda _m: True,
+        force_kis_labels=True,
+        kis_label_anomaly_prompt=_accept,
+    )
+    us = out["labels"]["us"]
+    assert us["cash"] == 895.08
+    assert abs(us["total"] - 1434.53) < 0.02
+
+
+def test_force_kis_prompt_rejects_us_spike():
+    deps, _calls = _minimal_deps(us_cash=895.08, us_total_current=539.45)
+    deps["load_last_kis_display_snapshot"] = lambda: {
+        "kr": {"cash": 1, "total": 2},
+        "us": {"cash": 37.91, "total": 576.69, "roi": 2.0},
+    }
+    deps["is_market_open"] = lambda _m: False
+
+    def _reject(**_kw):
+        return False
+
+    out = build_account_snapshot_for_report(
+        deps=deps,
+        allow_kis_fetch=lambda _m: True,
+        force_kis_labels=True,
+        kis_label_anomaly_prompt=_reject,
+    )
+    us = out["labels"]["us"]
+    assert us["cash"] == 37.91
+    assert us["total"] == 576.69
+    assert us["roi"] == 2.0
+
+
 def test_trust_live_labels_allows_off_hours_spike():
     prev = {"cash": 100.0, "total": 1000.0}
     cash, total, _roi = _maybe_reject_off_hours_force_label_anomaly(

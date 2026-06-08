@@ -104,6 +104,21 @@ def parse_kr_qty(item: dict, to_float) -> float:
     return float(to_float(item.get("hldg_qty", item.get("ccld_qty_smtl1", 0))))
 
 
+def parse_kr_live_price(item: dict, to_float) -> float:
+    """KR 잔고 output1 행의 현재가 — ``fetch_price`` 대체."""
+    px = float(to_float(item.get("prpr", item.get("stck_prpr", 0))))
+    return px if px > 0 else 0.0
+
+
+def parse_us_live_price(item: dict, to_float) -> float:
+    """US 잔고 output1 행의 현재가 — ``fetch_price`` 대체."""
+    for key in ("ovrs_nmix_prpr", "ovrs_now_pric1", "ovrs_now_prc2", "prpr"):
+        px = float(to_float(item.get(key, 0)))
+        if px > 0:
+            return px
+    return 0.0
+
+
 def parse_kr_holdings_metrics(balance_data, to_float) -> dict:
     """국내 output1 기준 투자·평가·손익·ROI (``_calc_kr_holdings_metrics`` 동일)."""
     rows = ensure_output1(balance_data)

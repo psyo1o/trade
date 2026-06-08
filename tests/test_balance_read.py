@@ -59,18 +59,28 @@ class TestBalanceReadCache(unittest.TestCase):
             side_effect=[good, bad],
         ) as m:
             br.kr_balance_raw(refresh=True)
-            br._last_api_mono.pop("KR", None)
-            br.kr_balance_raw(refresh=True)
+            br.kr_balance_raw(refresh=False)
             q = br.kr_stock_qty("005930", refresh=False)
         self.assertEqual(q, 10.0)
-        self.assertEqual(m.call_count, 2)
+        self.assertEqual(m.call_count, 1)
 
-    def test_min_interval_reuses_cache(self):
+    def test_min_interval_reuses_cache_on_non_refresh(self):
         bal = {"rt_cd": "0", "output1": [{"pdno": "005930", "hldg_qty": "3"}]}
         with patch("api.kis_api._fetch_kr_balance_with_backoff", return_value=bal) as m:
             br.kr_balance_raw(refresh=True)
-            br.kr_balance_raw(refresh=True)
+            br.kr_balance_raw(refresh=False)
         self.assertEqual(m.call_count, 1)
+
+    def test_refresh_bypasses_min_interval(self):
+        b1 = {"rt_cd": "0", "output1": [{"pdno": "005930", "hldg_qty": "3"}]}
+        b2 = {"rt_cd": "0", "output1": [{"pdno": "005930", "hldg_qty": "1"}]}
+        with patch(
+            "api.kis_api._fetch_kr_balance_with_backoff",
+            side_effect=[b1, b2],
+        ) as m:
+            br.kr_balance_raw(refresh=True)
+            br.kr_balance_raw(refresh=True)
+        self.assertEqual(m.call_count, 2)
 
 
 if __name__ == "__main__":

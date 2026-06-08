@@ -207,9 +207,22 @@ def refresh_brokers_if_needed(force=False):
         _create_brokers_safe()
 
 
-def get_us_cash_real(broker):
-    """[직통] 미장 예수금 상세 조회 (토큰 재활용)"""
+def get_us_cash_real(broker, *, refresh: bool = False):
+    """[직통] 미장 예수금 상세 조회 (토큰 재활용, TTL 캐시)."""
+    import os
+    import time
+
+    from api.kis_rate_limit import wait_for_slot
+
     global KIS_TOKEN
+    ttl = max(8.0, float(os.environ.get("BOT_KIS_US_CASH_CACHE_SEC", "20")))
+    cache_key = "_us_cash_cache"
+    ent = getattr(get_us_cash_real, cache_key, None)
+    now = time.monotonic()
+    if not refresh and isinstance(ent, tuple) and len(ent) == 2:
+        ts, amt = ent
+        if (now - float(ts)) < ttl:
+            return float(amt)
     base_url = getattr(broker, "base_url", "https://openapi.koreainvestment.com:9443")
     is_mock = "vps" in base_url or "vts" in base_url
     if not KIS_TOKEN:
@@ -222,6 +235,7 @@ def get_us_cash_real(broker):
             print(f"⚠️ 직통 토큰 발급 실패: {e}")
 
     try:
+        wait_for_slot(label="us_cash")
         tr_id = "VTTT3007R" if is_mock else "JTTT3007R"
         url = f"{base_url}/uapi/overseas-stock/v1/trading/inquire-psamount"
         headers = {
@@ -240,7 +254,9 @@ def get_us_cash_real(broker):
             amt = float(out.get('ovrs_ord_psbl_amt', 0.0))
             if amt == 0.0:
                 amt = float(out.get('frcr_ord_psbl_amt1', 0.0))
+            setattr(get_us_cash_real, cache_key, (time.monotonic(), float(amt)))
             return amt
+        setattr(get_us_cash_real, cache_key, (time.monotonic(), 0.0))
         return 0.0
     except Exception:
         return 0.0
@@ -474,6 +490,9 @@ def get_real_us_positions(broker):
     }
 
     try:
+        from api.kis_rate_limit import wait_for_slot
+
+        wait_for_slot(label="us_positions")
         res = requests.get(url, headers=headers, params=params).json()
         if res.get('rt_cd') != '0':
             print(f"⚠️ [잔고조회 거절됨] {res.get('msg_cd')}: {res.get('msg1')}")
@@ -612,7 +631,10 @@ def execute_us_order_direct(broker, side, ticker, qty, price):
 
 def _fetch_kr_balance_uncached():
     """국내 잔고 API 1회 (캐시 없음, tr_cont 에러 우회)."""
+    from api.kis_rate_limit import wait_for_slot
+
     try:
+        wait_for_slot(label="kr_balance")
         return broker_kr.fetch_balance()
     except KeyError as e:
         if str(e) == "'tr_cont'":
@@ -652,9 +674,10 @@ def _fetch_kr_balance_uncached():
         return {}
 
 
-def _fetch_kr_balance_with_backoff(*, max_attempts: int = 3, base_delay_sec: float = 1.2):
-    """국내 잔고 — KIS 한도·일시 오류 시 짧은 백오프 재시도."""
-    from api.kis_parsers import kis_response_transient
+def _fetch_kr_balance_with_backoff(*, max_attempts: int = 4, base_delay_sec: float = 2.0):
+    """국내 잔고 — KIS 한도·일시 오류 시 백오프 재시도."""
+    from api.kis_parsers import kis_response_rate_limited, kis_response_transient
+    from api.kis_rate_limit import rate_limit_cooldown_sec
     import time
 
     last: dict = {}
@@ -662,12 +685,20 @@ def _fetch_kr_balance_with_backoff(*, max_attempts: int = 3, base_delay_sec: flo
         last = _fetch_kr_balance_uncached() or {}
         if not kis_response_transient(last):
             return last
-        if i < max_attempts - 1:
-            delay = float(base_delay_sec) * (i + 1)
+        if i >= max_attempts - 1:
+            break
+        if kis_response_rate_limited(last):
+            delay = rate_limit_cooldown_sec()
             print(
-                f"  ⚠️ [KR 잔고] KIS 일시 제한/오류 — {delay:.1f}s 후 재시도 ({i + 2}/{max_attempts})"
+                f"  ⚠️ [KR 잔고] KIS 호출 한도 — {delay:.1f}s 후 1회 재시도 ({i + 2}/{max_attempts})"
             )
             time.sleep(delay)
+            continue
+        delay = float(base_delay_sec) * (i + 1)
+        print(
+            f"  ⚠️ [KR 잔고] KIS 일시 제한/오류 — {delay:.1f}s 후 재시도 ({i + 2}/{max_attempts})"
+        )
+        time.sleep(delay)
     return last
 
 
@@ -679,8 +710,9 @@ def _fetch_us_positions_uncached():
         return {}
 
 
-def _fetch_us_positions_with_backoff(*, max_attempts: int = 3, base_delay_sec: float = 1.2):
-    from api.kis_parsers import kis_response_transient
+def _fetch_us_positions_with_backoff(*, max_attempts: int = 4, base_delay_sec: float = 2.0):
+    from api.kis_parsers import kis_response_rate_limited, kis_response_transient
+    from api.kis_rate_limit import rate_limit_cooldown_sec
     import time
 
     last: dict = {}
@@ -688,12 +720,20 @@ def _fetch_us_positions_with_backoff(*, max_attempts: int = 3, base_delay_sec: f
         last = _fetch_us_positions_uncached() or {}
         if not kis_response_transient(last):
             return last
-        if i < max_attempts - 1:
-            delay = float(base_delay_sec) * (i + 1)
+        if i >= max_attempts - 1:
+            break
+        if kis_response_rate_limited(last):
+            delay = rate_limit_cooldown_sec()
             print(
-                f"  ⚠️ [US 잔고] KIS 일시 제한/오류 — {delay:.1f}s 후 재시도 ({i + 2}/{max_attempts})"
+                f"  ⚠️ [US 잔고] KIS 호출 한도 — {delay:.1f}s 후 1회 재시도 ({i + 2}/{max_attempts})"
             )
             time.sleep(delay)
+            continue
+        delay = float(base_delay_sec) * (i + 1)
+        print(
+            f"  ⚠️ [US 잔고] KIS 일시 제한/오류 — {delay:.1f}s 후 재시도 ({i + 2}/{max_attempts})"
+        )
+        time.sleep(delay)
     return last
 
 

@@ -33,11 +33,23 @@ class TestSwingMa60ExtensionByMarket(unittest.TestCase):
         self.assertEqual(SWING_MA60_MAX_EXTENSION_PCT_COIN, 30.0)
 
     def _df_with_extension_pct(self, ext_pct: float) -> pd.DataFrame:
-        """마지막 봉만 60MA 대비 ext_pct 이격 (앞 59봉은 100 고정)."""
+        """마지막 봉만 60MA 대비 ext_pct 이격 (앞 59봉은 100 고정).
+
+        시가는 전일 종가(100) 근처 — 갭상승(3%) 필터가 60MA 이격 검사보다 먼저
+        실행되므로, 시가를 급등 종가에 맞추면 MA60 테스트가 오탐한다.
+        """
         base = [100.0] * 59
         ma60_approx = 100.0
-        last = ma60_approx * (1.0 + ext_pct / 100.0)
-        return _df_flat_closes(base + [last])
+        last_c = ma60_approx * (1.0 + ext_pct / 100.0)
+        last_o = 100.5  # 전일 종가 100 대비 +0.5% — 갭상승 필터 통과
+        last_h = max(last_c, last_o) * 1.002
+        last_l = min(last_c, last_o) * 0.998
+        rows = []
+        for c in base:
+            o = c * 0.995
+            rows.append({"o": o, "h": c * 1.002, "l": o, "c": c, "v": 500_000.0})
+        rows.append({"o": last_o, "h": last_h, "l": last_l, "c": last_c, "v": 500_000.0})
+        return pd.DataFrame(rows)
 
     def test_us_blocks_above_15pct(self):
         df = self._df_with_extension_pct(18.0)

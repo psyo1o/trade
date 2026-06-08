@@ -195,7 +195,10 @@ def synthetic_kr_balance_dict(
     cash = display_cash_from_state(state, "KR")
     total = cash + holdings_value
     snap_total = kis_display_total(state, "KR")
-    if total <= 0 and snap_total > 0:
+    if holdings_value <= 0 and snap_total > cash * 1.02:
+        cash = snap_total
+        total = snap_total
+    elif total <= 0 and snap_total > 0:
         total = snap_total
         if cash <= 0:
             cash = max(0.0, total - holdings_value)
@@ -241,7 +244,10 @@ def synthetic_us_balance_dict(
     cash = display_cash_from_state(state, "US")
     total = cash + holdings_value
     snap_total = kis_display_total(state, "US")
-    if total <= 0 and snap_total > 0:
+    if holdings_value <= 0 and snap_total > cash * 1.02:
+        cash = snap_total
+        total = snap_total
+    elif total <= 0 and snap_total > 0:
         total = snap_total
         if cash <= 0:
             cash = max(0.0, total - holdings_value)
@@ -273,7 +279,10 @@ def coalesce_ledger_kis_labels(
         cash = float(cash_guess or 0.0)
 
     ref_total = snap_total if snap_total > 0 else float(total_guess or 0.0)
-    if hc > 0 and ref_total > 0:
+    if hc <= 0 and ref_total > max(cash, 0.0) * 1.02:
+        cash = ref_total
+        total = ref_total
+    elif hc > 0 and ref_total > 0:
         if cash >= ref_total * 0.95:
             cash = max(0.0, ref_total - hc)
         elif cash + hc > ref_total * 1.12:
@@ -291,13 +300,48 @@ def coalesce_ledger_kis_labels(
 
 
 def persist_kr_cash_from_balance(bal: dict, state: dict) -> None:
-    """레거시 — 국·미 표시는 ``last_kis_display_snapshot`` 만 갱신한다 (잔고 API로 덮어쓰지 않음)."""
-    del bal, state
+    """KIS 국장 잔고 조회 성공 시 ``last_kis_display_snapshot.kr`` 갱신."""
+    if not isinstance(bal, dict):
+        return
+    try:
+        from api.kis_parsers import kis_response_rate_limited, parse_kr_cash_total
+        from run_bot import _to_float
+
+        if kis_response_rate_limited(bal):
+            return
+        cash, total = parse_kr_cash_total(bal.get("output2", []), _to_float)
+        if cash > 0 or total > 0:
+            write_kis_display_snapshot_part(
+                state, "KR", cash=float(cash), total=float(total), force=True
+            )
+    except Exception:
+        pass
 
 
 def persist_us_cash_from_balance(bal: dict, state: dict) -> None:
-    """레거시 — 국·미 표시는 ``last_kis_display_snapshot`` 만 갱신한다 (잔고 API로 덮어쓰지 않음)."""
-    del bal, state
+    """KIS 미장 잔고 조회 성공 시 ``last_kis_display_snapshot.us`` 갱신."""
+    if not isinstance(bal, dict):
+        return
+    try:
+        from api.kis_parsers import (
+            compute_us_stock_value_from_output,
+            kis_response_rate_limited,
+            parse_us_cash_fallback,
+        )
+        from run_bot import _to_float
+
+        if kis_response_rate_limited(bal):
+            return
+        out2 = bal.get("output2", {})
+        cash = float(parse_us_cash_fallback(out2, _to_float))
+        stock = float(compute_us_stock_value_from_output(bal, out2, _to_float))
+        total = cash + stock
+        if cash > 0 or total > 0:
+            write_kis_display_snapshot_part(
+                state, "US", cash=cash, total=total, force=True
+            )
+    except Exception:
+        pass
 
 
 def update_circuit_aux_from_ledger(

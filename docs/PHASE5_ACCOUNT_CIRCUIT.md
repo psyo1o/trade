@@ -125,9 +125,10 @@ Phase5 청산 직후 로그 ` [쿨다운 적용] 379810 | 사유: Phase5 서킷 
 
 - `execution/balance_policy.py` — 플래그·판정
 - `services/ledger_valuation.py` — 장부+시세 합산
-- `execution/balance_read.py` — TTL 캐시·한도 시 stale·최소 호출 간격
+- `execution/balance_read.py` — TTL 캐시·한도 시 stale·최소 호출 간격(4초)
+- `api/kis_rate_limit.py` — KIS HTTP 전역 스로틀(실전 기본 12건/초)
 
-환경 변수(선택): `BOT_KIS_BALANCE_CACHE_TTL_SEC`, `BOT_KIS_BALANCE_MIN_INTERVAL_SEC`, `BOT_KIS_BALANCE_STALE_SEC`
+환경 변수(선택): `BOT_KIS_BALANCE_CACHE_TTL_SEC`, `BOT_KIS_BALANCE_MIN_INTERVAL_SEC`, `BOT_KIS_BALANCE_STALE_SEC`, `BOT_KIS_MAX_CALLS_PER_SEC`, `BOT_KIS_RATE_LIMIT_COOLDOWN_SEC`
 
 자세한 TTL·주문 검증 규칙: [`idempotency/BALANCE_READS.md`](idempotency/BALANCE_READS.md)
 
@@ -199,7 +200,7 @@ tests/test_phase5_share_circuit.py
 | 증상 | 확인 |
 |------|------|
 | 비중 정상인데 청산됨 | `phase5_pending_liquidation*` · 레거시 boolean — 봇 재시작 후 prune 로그 확인 |
-| `output1 없음` / EGW00201 | `on_trade`·캐시 동작 여부, 출동+새로고침 동시 클릭 줄이기 |
+| `output1 없음` / EGW00201 | `on_trade`·캐시·`kis_rate_limit` 동작, **강제 새로고침** 남용 줄이기, 환경 변수로 `BOT_KIS_MAX_CALLS_PER_SEC` 낮추기 |
 | 한 시장만 막혀야 하는데 전 시장 매수 불가 | `account_circuit_use_total` 이 true 인지, `account_circuit_cooldown_until` 존재 여부 |
 | 예수금 표시 어긋남 | 강제 KIS 새로고침 1회 또는 `adjust_capital` 로 live sync |
 | Phase5 비중 %가 GUI와 다름 | `ledger_only` 루프 — `_phase5_aux_sync` 추정값 사용 여부 확인; KIS 강제 새로고침으로 스냅샷 정렬 |

@@ -57,6 +57,21 @@ class TestExitLineNoPctCap(unittest.TestCase):
         self.assertAlmostEqual(floor, 88.0)
         self.assertLess(floor, buy * 0.95)
 
+    def test_v8_breakeven_lock_exit_label(self):
+        import run_bot as rb
+
+        buy = 140_100.0
+        lock = buy * 1.005
+        pos_done = {"scale_out_done": True}
+        pos_open = {"scale_out_done": False}
+        self.assertTrue(rb._v8_loss_stop_is_breakeven_lock(buy, pos_done, lock))
+        reason, log = rb._v8_loss_zone_exit_meta(buy, pos_done, lock, 139_000.0, market="KR")
+        self.assertIn("본절락", reason)
+        self.assertIn("본절락", log)
+        self.assertFalse(rb._v8_loss_stop_is_breakeven_lock(buy, pos_open, lock))
+        reason2, _ = rb._v8_loss_zone_exit_meta(buy, pos_open, buy * 0.9, 130_000.0, market="KR")
+        self.assertIn("하드스탑", reason2)
+
 
 if __name__ == "__main__":
     unittest.main()
