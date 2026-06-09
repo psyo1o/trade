@@ -32,6 +32,7 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
         print("▶️ [🇰🇷 국장] 매매 엔진 시작...")
         _, kr_cash, total_kr_equity, kr_output1, held_kr = rb._prepare_kr_market_cycle_inputs(state)
         kr_cash_snap, total_kr_equity_snap = kr_cash, total_kr_equity
+        kr_sell_fills = 0
         # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
         positions_count = rb._count_positions_in_state(held_kr, state.get("positions", {}))
         rb._prefetch_kr_sell_ohlcv_if_needed(kr_output1, held_kr, positions_count)
@@ -183,6 +184,7 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
                             cycle_tag=_buy_cycle_tag,
                         )
                         if fill_half.ok:
+                            kr_sell_fills += 1
                             new_half = rb.post_partial_ledger(
                                 pos_info,
                                 float(sq),
@@ -241,6 +243,7 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
                             cycle_tag=_buy_cycle_tag,
                         )
                         if fill_full.ok:
+                            kr_sell_fills += 1
                             p_full = ((float(curr_p) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
                             rb._record_trade_event("KR", t, "SELL", qty_full, price=float(curr_p), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
                             print(f"  ✅ [SWING-SELL] {kr_name}({t}) FULL | {sw_reason}")
@@ -300,6 +303,7 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
                         display_name=kr_nm,
                     )
                     if so_cont:
+                        kr_sell_fills += 1
                         continue
 
                 # 매도 결정 로직 (우선순위: 타임스탑 > 하드스탑 > 샹들리에)
@@ -379,6 +383,7 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
                     )
 
                     if fill_exit.ok:
+                        kr_sell_fills += 1
                         profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                         stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
                         if profit_rate > 0:
@@ -424,10 +429,17 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
         now_kr_post = datetime.now(pytz.timezone("Asia/Seoul"))
         is_kr_buy_time_post, _, _ = rb._is_kr_buy_window_now(now_kr_post)
         if rb.is_market_open("KR"):
-            kr_cash, total_kr_equity = rb._refresh_kr_cash_equity_after_sells()
-            rb._sync_market_display_snapshot_after_sells(
-                "KR", state, int(kr_cash), int(total_kr_equity)
-            )
+            if kr_sell_fills > 0:
+                kr_cash, total_kr_equity = rb._refresh_kr_cash_equity_after_sells()
+                rb._sync_market_display_snapshot_after_sells(
+                    "KR", state, int(kr_cash), int(total_kr_equity)
+                )
+            else:
+                kr_cash, total_kr_equity = kr_cash_snap, total_kr_equity_snap
+                print(
+                    "  ⏭️ [KR] 이번 사이클 매도 체결 없음 — "
+                    "사이클 시작 잔고 재사용 (KIS 재조회 생략)"
+                )
         else:
             bal_est = rb.ensure_dict(rb.bal_read.kr_balance_raw(refresh=False))
             kr_cash, total_kr_equity = rb.parse_kr_cash_total(

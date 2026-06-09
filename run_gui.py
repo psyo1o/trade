@@ -259,7 +259,7 @@ def _build_strategy_guide_text() -> str:
         "- Phase4: 시장별 일반 주식 신규 매수 차단 (macro_mult=1.0, 예산 축소 없음)\n"
         "  · US: SPY Put/Call ≥1.2 → US 일반 종목 차단 (헷지 3종은 예외)\n"
         "  · COIN: BTC 고래 롱숏 ≤0.8 → COIN 전면 차단 (헷지 유니버스 없음)\n"
-        "  · KR: 원/달러 모멘텀 ≥1.015 → KR 일반 종목 차단 (헷지 3종은 예외)\n"
+        "  · KR: 환율 Z-Score ≥2.0 & 당일 상승 → KR 일반 종목 차단 (헷지 3종은 예외)\n"
         "  · Phase4 발동 시 로그: 🚨 [Phase 4 발동] … 헷지 자산만 매수 검토\n"
         "- 하락장 헷지 (안전자산 ETF, strategy/hedge_universe.py)\n"
         f"  · KR: {format_hedge_universe_summary('KR')}\n"
@@ -1130,6 +1130,7 @@ class BotDashboard(QMainWindow):
         self._refresh_inflight = False
         self._refresh_was_force_kis = False
         self._refresh_done_callbacks = []
+        self._pending_capital_force_kis = False
 
         self._net_fail_count = 0
         self._net_watch_timer = QTimer(self)
@@ -1497,12 +1498,28 @@ class BotDashboard(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
+        if self._capital_thread is not None and self._capital_thread.isRunning():
+            QMessageBox.warning(self, "진행 중", "고점 보정이 이미 실행 중입니다.")
+            return
+        if self._refresh_inflight:
+            QMessageBox.warning(
+                self,
+                "잠시 대기",
+                "잔고 갱신이 진행 중입니다. 완료된 뒤 다시 시도해 주세요.",
+            )
+            return
+
         self.capital_apply_btn.setEnabled(False)
         self._capital_thread = CapitalAdjustThread(withdraw, amount, STATE_PATH)
-        self._capital_thread.done.connect(self._on_capital_adjust_finished)
+        self._capital_thread.done.connect(
+            self._on_capital_adjust_finished, Qt.QueuedConnection
+        )
         self._capital_thread.start()
 
     def _on_capital_adjust_finished(self, ok: bool, msg: str):
+        thread = self._capital_thread
+        if thread is not None:
+            thread.wait(120_000)
         self.capital_apply_btn.setEnabled(True)
         self._capital_thread = None
         if ok:
@@ -1511,9 +1528,23 @@ class BotDashboard(QMainWindow):
                 "  💰 [고점 보정] 입출금 반영 — KIS 라벨 1회 실조회 "
                 "(비장중 급변 방어 스킵)"
             )
-            self.refresh_balance(sync_first=False, force_kis=True)
+            self._queue_capital_followup_kis_refresh()
         else:
             QMessageBox.warning(self, "고점 보정 실패", msg.replace("\n", "<br>"))
+
+    def _queue_capital_followup_kis_refresh(self):
+        """고점 보정 직후 KIS 1회 실조회 — 진행 중 잔고 갱신과 겹치면 완료 후 예약."""
+        if self._refresh_inflight:
+            self._pending_capital_force_kis = True
+            print("  ⏳ [고점 보정] 잔고 갱신 완료 후 KIS 실조회를 예약했습니다.")
+            return
+        QTimer.singleShot(300, self._run_capital_followup_kis_refresh)
+
+    def _run_capital_followup_kis_refresh(self):
+        if self._refresh_inflight:
+            self._pending_capital_force_kis = True
+            return
+        self.refresh_balance(sync_first=False, force_kis=True)
 
     def _qty_max_numeric(self, row: dict) -> float:
         """보유 행의 최대 매도 가능 수량(표시 qty와 동일 기준)."""
@@ -1932,7 +1963,11 @@ class BotDashboard(QMainWindow):
             self._refresh_done_callbacks.append(on_finished)
         if self._refresh_inflight:
             if force_kis:
-                print("  ⏭️ [KIS 강제 새로고침] 다른 잔고 갱신이 진행 중 — 완료 후 다시 눌러 주세요.")
+                self._pending_capital_force_kis = True
+                print(
+                    "  ⏳ [KIS 강제 새로고침] 다른 잔고 갱신 완료 후 자동 실행 예약 "
+                    "(고점 보정 후속)"
+                )
             return
         self._refresh_inflight = True
         self._refresh_was_force_kis = bool(force_kis)
@@ -2082,6 +2117,9 @@ class BotDashboard(QMainWindow):
                 cb()
             except Exception as e:
                 print(f"⚠️ 후속 작업 실행 오류: {e}")
+        if self._pending_capital_force_kis:
+            self._pending_capital_force_kis = False
+            QTimer.singleShot(300, self._run_capital_followup_kis_refresh)
 
     
     def update_max_price_if_higher(self, ticker, current_p):

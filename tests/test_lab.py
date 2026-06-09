@@ -34,7 +34,7 @@ Phase 1 샌드박스 — 동적 섹터 쏠림 방지 (MDD 1차 방어)
   OPENAI_API_KEY / GOOGLE_API_KEY : 선택한 AI 제공자 키.
   tests/ai_keys.txt               : 이 샌드박스 전용(환경변수 없을 때). 운영 run_bot 은
                                     config.json 동일 키 또는 루트 ``ai_keys.txt`` (``strategy/ai_filter._get_secret``).
-  Phase 4 샌드박스: 실조회(PCR·고래·환율 모멘텀) + Mock 시나리오(US/COIN/KR 차단 조건).
+  Phase 4 샌드박스: 실조회(PCR·고래·환율 Z-Score) + Mock 시나리오(US/COIN/KR 차단 조건).
 """
 from __future__ import annotations
 
@@ -887,7 +887,7 @@ def run_phase3_ai_filter_lab() -> None:
 def run_phase4_macro_guard_lab() -> None:
     """Phase 4 샌드박스: 글로벌 알파 시장별 매수 차단 (운영과 동일 `get_macro_guard_snapshot`)."""
     print("\n" + "=" * 72)
-    print("[Phase4 샌드박스] Macro 글로벌 알파 방어막 (PCR·고래·환율 모멘텀)")
+    print("[Phase4 샌드박스] Macro 글로벌 알파 방어막 (PCR·고래·환율 Z-Score)")
     print("=" * 72)
 
     lab_cfg: Dict[str, Any] = {"macro_guard_enabled": True}
@@ -895,23 +895,25 @@ def run_phase4_macro_guard_lab() -> None:
 
     print(f"  PCR = {snap.get('us_put_call_ratio')}")
     print(f"  고래 롱숏 = {snap.get('coin_whale_long_short_ratio')}")
-    print(f"  환율 모멘텀 = {snap.get('usd_krw_momentum_ratio')}")
+    print(f"  환율 Z-Score = {snap.get('usd_krw_z_score')}")
+    print(f"  환율 당일방향 = {snap.get('usd_krw_is_rising')}")
     print(f"  decision = {snap.get('mode')} | reason = {snap.get('reason')}")
     print(f"  market_buy_allowed = {snap.get('market_buy_allowed')}")
 
     print("\n  --- 시나리오 검증 (Mock) ---")
     scenarios = [
-        ("US_PCR_BLOCK", "US", 1.25, 1.0, 1.01, False),
-        ("COIN_WHALE_BLOCK", "COIN", 1.0, 0.75, 1.01, False),
-        ("KR_FX_MOM_BLOCK", "KR", 1.0, 1.0, 1.02, False),
-        ("ALL_CLEAR", "KR", 1.0, 1.0, 1.005, True),
+        ("US_PCR_BLOCK", "US", 1.25, 1.0, None, False),
+        ("COIN_WHALE_BLOCK", "COIN", 1.0, 0.75, None, False),
+        ("KR_FX_Z_BLOCK", "KR", 1.0, 1.0, {"z_score": 2.2, "is_rising": True}, False),
+        ("KR_FX_Z_FALL_ALLOW", "KR", 1.0, 1.0, {"z_score": 2.2, "is_rising": False}, True),
+        ("ALL_CLEAR", "KR", 1.0, 1.0, {"z_score": 0.5, "is_rising": True}, True),
     ]
-    for name, mk, pcr, whale, fx_mom, expect_allowed in scenarios:
+    for name, mk, pcr, whale, fx_pack, expect_allowed in scenarios:
         d = evaluate_market_macro_buy_permission(
             mk,
             us_put_call_ratio=pcr,
             coin_whale_long_short_ratio=whale,
-            usd_krw_momentum_ratio=fx_mom,
+            usd_krw_fx=fx_pack,
         )
         ok = bool(d.get("allowed")) == expect_allowed
         print(

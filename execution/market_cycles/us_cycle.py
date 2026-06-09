@@ -43,6 +43,7 @@ def run_us_cycle(ctx: TradingCycleContext) -> None:
 
         total_us_equity = us_cash + us_stock_value
         us_cash_snap, total_us_equity_snap = us_cash, total_us_equity
+        us_sell_fills = 0
         print(f"  💰 [미장 자산 최종] 총자산: ${total_us_equity:.2f} (현금: ${us_cash:.2f} + 주식: ${us_stock_value:.2f})")
 
         from services import ledger_valuation as lv
@@ -206,6 +207,7 @@ def run_us_cycle(ctx: TradingCycleContext) -> None:
                             cycle_tag=_buy_cycle_tag,
                         )
                         if fill_half.ok:
+                            us_sell_fills += 1
                             new_half = rb.post_partial_ledger(
                                 pos_info,
                                 float(sq),
@@ -264,6 +266,7 @@ def run_us_cycle(ctx: TradingCycleContext) -> None:
                             cycle_tag=_buy_cycle_tag,
                         )
                         if fill_full.ok:
+                            us_sell_fills += 1
                             p_full = ((float(sp_full) - float(buy_p)) / float(buy_p) * 100) if float(buy_p) > 0 else 0.0
                             rb._record_trade_event("US", t, "SELL", qty_full, price=float(sp_full), profit_rate=float(p_full), reason=f"[SWING-SELL] {sw_reason}")
                             print(f"  ✅ [SWING-SELL] {us_name}({t}) FULL | {sw_reason}")
@@ -321,6 +324,7 @@ def run_us_cycle(ctx: TradingCycleContext) -> None:
                         display_name=us_name,
                     )
                     if so_cont:
+                        us_sell_fills += 1
                         continue
 
                 reason = ""
@@ -410,6 +414,7 @@ def run_us_cycle(ctx: TradingCycleContext) -> None:
                     )
 
                     if fill_exit.ok:
+                        us_sell_fills += 1
                         px = float(fill_exit.price) if fill_exit.price > 0 else float(sell_price)
                         profit_rate = ((px - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
                         stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
@@ -455,10 +460,17 @@ def run_us_cycle(ctx: TradingCycleContext) -> None:
         now_us_post = datetime.now(pytz.timezone("US/Eastern"))
         is_us_buy_time_post, _, _ = rb._is_us_buy_window_now(now_us_post)
         if rb.is_market_open("US"):
-            us_cash, total_us_equity = rb._refresh_us_cash_equity_after_sells()
-            rb._sync_market_display_snapshot_after_sells(
-                "US", state, float(us_cash), float(total_us_equity)
-            )
+            if us_sell_fills > 0:
+                us_cash, total_us_equity = rb._refresh_us_cash_equity_after_sells()
+                rb._sync_market_display_snapshot_after_sells(
+                    "US", state, float(us_cash), float(total_us_equity)
+                )
+            else:
+                us_cash, total_us_equity = us_cash_snap, total_us_equity_snap
+                print(
+                    "  ⏭️ [US] 이번 사이클 매도 체결 없음 — "
+                    "사이클 시작 잔고 재사용 (KIS 재조회 생략)"
+                )
         else:
             us_bal_est = rb.ensure_dict(rb.bal_read.us_balance_raw(refresh=False))
             us_cash = float(rb.get_us_cash_real(rb.kis_api.broker_us) or 0.0)

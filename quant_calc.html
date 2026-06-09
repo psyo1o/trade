@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>🚀 V7.1 완전 자동화 자금 & 손익비 대시보드</title>
+    <title>🚀 V7.3 퀀트 자금 & 풀오토 베팅 시뮬레이터</title>
     <style>
         body { font-family: 'Malgun Gothic', sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px; margin: 0; }
         .container { max-width: 1100px; margin: auto; background-color: #1e1e1e; padding: 30px; border-radius: 12px; box-shadow: 0 8px 16px rgba(0,0,0,0.8); }
@@ -23,9 +23,11 @@
         .input-row label { font-size: 16px; color: #ccc; }
         .input-row input { width: 80px; text-align: center; font-size: 18px; padding: 5px; border-radius: 4px; background: #121212; color: #fff; border: 1px solid #555;}
         
-        .rr-summary { text-align: center; background: #121212; padding: 15px; border-radius: 8px; border: 1px dashed #feca57; margin-bottom: 20px; font-size: 1.1rem; }
-        .rr-summary span { font-weight: bold; color: #feca57; font-size: 1.3rem; }
-
+        .auto-calc-box { text-align: center; background: #1a2634; padding: 20px; border-radius: 8px; border: 1px solid #4facfe; margin-bottom: 30px; }
+        .auto-calc-box h2 { margin: 0 0 10px 0; color: #4facfe; font-size: 1.5rem; }
+        .auto-calc-box .result-text { font-size: 1.2rem; color: #fff; margin: 5px 0;}
+        .auto-calc-box .highlight-money { color: #feca57; font-size: 1.6rem; font-weight: bold; }
+        
         table { width: 100%; border-collapse: collapse; background: #2a2a2a; border-radius: 8px; overflow: hidden; }
         th, td { padding: 12px 10px; text-align: center; border-bottom: 1px solid #3a3a3a; vertical-align: middle; }
         th { background-color: #333; color: #fff; font-size: 14px;}
@@ -44,31 +46,36 @@
 <body>
 
 <div class="container">
-    <h1>🚀 V7.1 자금 & 손익비 오토 시뮬레이터</h1>
+    <h1>🚀 V7.3 자금 & 풀오토 베팅 시뮬레이터</h1>
     
-    <div class="section-title">⚙️ 1. 글로벌 시드 & 엔진 설정</div>
+    <div class="section-title">⚙️ 1. 글로벌 시드 & 리스크 통제 설정</div>
     <div class="global-inputs">
         <div class="input-box">
             <label>💰 총 운용 시드 (원)</label>
             <input type="text" id="totalSeed" value="100,000,000" oninput="formatNumber(this); calculate();">
         </div>
-        <div class="input-box">
-            <label>🔪 TWAP 기준금액 (원)</label>
-            <input type="text" id="twapThreshold" value="3,000,000" oninput="formatNumber(this); calculate();">
-        </div>
-        <div class="input-box" style="border-color: #1dd1a1;">
-            <label>📈 목표 익절 (%)</label>
-            <input type="number" id="takeProfit" value="10" step="0.5" oninput="calculate()" style="color: #1dd1a1;">
+        <div class="input-box" style="border-color: #feca57;">
+            <label>⚠️ 계좌당 1회 최대 리스크 (%)<br><span style="font-size:11px; color:#888;">(손절시 내 총시드의 몇 %를 날릴 것인가)</span></label>
+            <input type="number" id="accountRisk" value="1.0" step="0.1" oninput="calculate()" style="color: #feca57;">
         </div>
         <div class="input-box" style="border-color: #ff4757;">
-            <label>📉 최대 손절 (%)</label>
+            <label>📉 종목당 최대 손절선 (%)<br><span style="font-size:11px; color:#888;">(하드스탑 V8/스윙 기준)</span></label>
             <input type="number" id="stopLoss" value="5" step="0.5" oninput="calculate()" style="color: #ff4757;">
+        </div>
+        <div class="input-box">
+            <label>🔪 TWAP 분할 기준 (원)</label>
+            <input type="text" id="twapThreshold" value="3,000,000" oninput="formatNumber(this); calculate();">
         </div>
     </div>
 
-    <div class="rr-summary">
-        현재 세팅된 포트폴리오의 <strong>손익비(Risk/Reward Ratio)</strong>는 <span id="rrRatioText">2.00</span> 입니다. 
-        <br><span style="font-size: 0.9rem; color: #888; font-weight: normal;">(1번 지면 1번 이길 때 잃은 돈의 몇 배를 버는가)</span>
+    <div class="auto-calc-box">
+        <h2>🤖 퀀트 엔진 자동 산출: 1회 최적 베팅 사이즈</h2>
+        <div class="result-text">현재 세팅된 리스크를 감내하기 위한 종목당 권장 투입액은</div>
+        <div class="highlight-money" id="autoBetSizeText">20,000,000 원</div>
+        <div class="result-text" style="font-size: 0.9rem; color: #aaa; margin-top:10px;">
+            손익비(RR): <span id="rrRatioText" style="color:#fff; font-weight:bold;">2.00</span> 
+            (목표 익절 <input type="number" id="takeProfit" value="10" step="0.5" style="width:50px; background:#121212; border:1px solid #555; color:#1dd1a1; text-align:center;" oninput="calculate()"> % 기준)
+        </div>
     </div>
 
     <div class="section-title">📊 2. 시장별 자산 비중 (%) 입력</div>
@@ -89,17 +96,17 @@
         </div>
     </div>
 
-    <div class="section-title">📈 3. V7.1 매매 시나리오 결과 (손익비 반영)</div>
+    <div class="section-title">📈 3. 시장별 최종 MAX_POSITIONS (봇 세팅용)</div>
     <table>
         <thead>
             <tr>
                 <th>시장</th>
-                <th>시장 배정 예산</th>
-                <th>🤖 자동 슬롯</th>
-                <th>1종목당 투입액</th>
-                <th>예상 익절금액 (종목당)</th>
-                <th>최대 손실금액 (종목당)</th>
-                <th>TWAP 분할매매</th>
+                <th>시장 예산 (Budget)</th>
+                <th>🤖 산출된 MAX 포지션</th>
+                <th>실제 1종목 투입액</th>
+                <th>예상 익절 (+원)</th>
+                <th>최대 손실 (-원)</th>
+                <th>TWAP 체결 로직</th>
             </tr>
         </thead>
         <tbody id="resultBody">
@@ -110,8 +117,11 @@
 <script>
     function formatNumber(input) {
         let val = input.value.replace(/,/g, '');
-        if(isNaN(val) || val === '') val = 0;
-        input.value = parseInt(val).toLocaleString();
+        if(isNaN(val) || val === '') {
+            input.value = '';
+            return;
+        }
+        input.value = parseInt(val, 10).toLocaleString('ko-KR');
     }
 
     function getVal(id) {
@@ -120,14 +130,25 @@
 
     function calculate() {
         const seed = getVal('totalSeed');
+        const accountRisk = getVal('accountRisk'); // 계좌 허용 리스크 (예: 1.0%)
+        const sl = getVal('stopLoss');             // 종목당 손절선 (예: 5.0%)
+        const tp = getVal('takeProfit');           // 종목당 익절선
         const threshold = getVal('twapThreshold');
-        const tp = getVal('takeProfit');
-        const sl = getVal('stopLoss');
-        
-        // 손익비 계산 표시
-        const rrText = sl > 0 ? (tp / sl).toFixed(2) : "∞";
+
+        // 1. 손익비 세팅
+        const rrText = sl > 0 ? (tp / sl).toFixed(2) : "0 불가";
         document.getElementById('rrRatioText').innerText = rrText;
 
+        // 2. 핵심 퀀트 로직: 자동 베팅 사이즈 산출
+        let autoBetSize = 0;
+        if (sl > 0 && accountRisk > 0) {
+            // (총시드 * (계좌리스크% / 100)) / (손절% / 100)
+            const maxLossAmount = seed * (accountRisk / 100);
+            autoBetSize = maxLossAmount / (sl / 100);
+        }
+        document.getElementById('autoBetSizeText').innerText = Math.floor(autoBetSize).toLocaleString('ko-KR') + " 원";
+
+        // 3. 시장별 비중 유효성 검사
         const markets = [
             { name: "🇺🇸 미장", ratio: getVal('usRatio') },
             { name: "🇰🇷 국장", ratio: getVal('krRatio') },
@@ -143,28 +164,32 @@
             alertBox.style.display = 'none';
         }
 
+        // 4. 테이블 결과 도출
         let html = '';
         markets.forEach(m => {
             const alloc = seed * (m.ratio / 100);
-            let maxPos = 1;
             
-            if (alloc === 0) maxPos = 0;
-            else if (alloc < 500000) maxPos = 1;
-            else if (alloc <= 1500000) maxPos = 2;
-            else if (alloc <= 3000000) maxPos = 3;
-            else if (alloc <= 10000000) maxPos = 5;
-            else if (alloc <= 30000000) maxPos = 7;
-            else maxPos = 10;
+            let maxPos = 0;
+            let perPos = 0;
+            
+            if (alloc > 0) {
+                if (autoBetSize > 0) {
+                    // 예산을 최적 베팅 사이즈로 나누어 맥스 포지션 슬롯 도출 (최소 1개 보장)
+                    maxPos = Math.max(1, Math.floor(alloc / autoBetSize));
+                } else {
+                    maxPos = 1; // 손절 0 입력 등의 에러 상황 방어
+                }
+                perPos = alloc / maxPos; // 최종 보정된 실제 투입액
+            }
 
-            const perPos = maxPos > 0 ? alloc / maxPos : 0;
             const expectedProfit = perPos * (tp / 100);
             const expectedLoss = perPos * (sl / 100);
             
-            let twapResult = `<span class="twap-safe">일괄 시장가</span>`;
+            let twapResult = `<span class="twap-safe">시장가 1회 전량</span>`;
             if (perPos > threshold && threshold > 0) {
                 const n = Math.min(5, Math.max(2, Math.ceil(perPos / threshold)));
                 const sliceAmt = perPos / n;
-                twapResult = `<span class="twap-alert">🔥 ${n}분할<br>(${Math.floor(sliceAmt).toLocaleString()}원)</span>`;
+                twapResult = `<span class="twap-alert">🔥 ${n}분할 TWAP<br>(${Math.floor(sliceAmt).toLocaleString()}원씩)</span>`;
             } else if (perPos === 0) {
                 twapResult = "-";
             }

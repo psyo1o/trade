@@ -36,7 +36,7 @@ class HedgeAsset(NamedTuple):
 
 HEDGE_ASSETS_KR: tuple[HedgeAsset, ...] = (
     # (코드,   한글명)
-    HedgeAsset("133690", "TIGER 미국나스닥100"),           # 성장·방어 혼합 (사용자 지정)
+    HedgeAsset("261240", "KODEX 미국달러선물"),            # 달러 강세·환율 헷지
     HedgeAsset("411060", "ACE KRX금현물"),                 # 금 현물 추종
     HedgeAsset("304660", "KODEX 미국30년국채울트라선물(H)"),  # 장기 국채 선물(H)
 )

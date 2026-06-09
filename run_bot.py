@@ -451,7 +451,7 @@ BUY_WINDOW_MINUTES_BEFORE_CLOSE = int(config.get("buy_window_minutes_before_clos
 PORTFOLIO_HEAT_MAX_PCT = float(config.get("portfolio_heat_max_pct", 0.06))
 
 # Phase 4: VIX / Fear&Greed 거시 방어막 (매 루프 `get_macro_guard_snapshot(config)` 로 적용)
-# config: macro_guard_enabled, macro_us_put_call_*, macro_coin_whale_*, macro_krw_fx_momentum_*
+# config: macro_guard_enabled, macro_us_put_call_*, macro_coin_whale_*, macro_krw_fx_zscore_*
 
 # 📊 [지수 급락 기준] 각 시장의 신규 매수 중단 임계값
 INDEX_CRASH_KR = -3.0     # 국장 KOSPI 급락 기준 (%)
@@ -3804,12 +3804,21 @@ def _build_market_context(state: dict) -> tuple[dict, float, str, dict]:
         print(f"  🛡️ [Phase4 거시] {_macro_snap.get('mode')} | {macro_reason}")
         pcr = _macro_snap.get("us_put_call_ratio")
         whale = _macro_snap.get("coin_whale_long_short_ratio")
-        fx_mom = _macro_snap.get("usd_krw_momentum_ratio")
-        if pcr is not None or whale is not None or fx_mom is not None:
+        fx_z = _macro_snap.get("usd_krw_z_score")
+        fx_rising = _macro_snap.get("usd_krw_is_rising")
+        fx_spot = _macro_snap.get("usd_krw_spot")
+        if pcr is not None or whale is not None or fx_z is not None:
+            rising_txt = (
+                "상승"
+                if fx_rising is True
+                else ("하락" if fx_rising is False else "n/a")
+            )
+            spot_txt = f"{float(fx_spot):,.2f}" if fx_spot is not None else "n/a"
             print(
                 f"  🛡️ [Phase4 글로벌] PCR={pcr if pcr is not None else 'n/a'} "
                 f"고래롱숏={whale if whale is not None else 'n/a'} "
-                f"환율모멘텀={fx_mom if fx_mom is not None else 'n/a'}"
+                f"환율Z={fx_z if fx_z is not None else 'n/a'} "
+                f"당일={rising_txt} spot={spot_txt}"
             )
         for mk in ("KR", "US", "COIN"):
             if not _macro_market_buy_allowed(_macro_snap, mk):
@@ -4572,6 +4581,10 @@ V8_TIME_STOP_EXEMPT_PROFIT_PCT = 4.0
 SWING_TIME_STOP_HOURS_EQUITY = 48.0
 SWING_TIME_STOP_HOURS_COIN = 24.0
 SWING_TIME_STOP_EXEMPT_PROFIT_PCT = 2.0
+# COIN SWING_FIB: 진입 직후 기술바닥 FULL 유예(잔파동 노이즈) — 하드컷 % 이하는 즉시 탈출
+COIN_SWING_ENTRY_NOISE_GRACE_HOURS = float(config.get("coin_swing_entry_noise_grace_hours", 2.0))
+COIN_SWING_ENTRY_HARD_CUT_PCT = float(config.get("coin_swing_entry_hard_cut_pct", -3.0))
+_SWING_TECH_FLOOR_FULL_PREFIX = "스윙 기술바닥 이탈"
 
 
 def _time_stop_params(market: str, strategy_type: str) -> tuple[str, float, float]:
@@ -4628,6 +4641,46 @@ def _new_buy_sell_protection_blocks(profit_rate_pct: float, buy_time) -> bool:
     if _new_buy_protection_remaining_sec(buy_time) <= 0:
         return False
     return float(profit_rate_pct) < 1.0
+
+
+def _coin_swing_tech_floor_full_reason(sw_reason: str) -> bool:
+    """``check_swing_exit`` FULL 중 피보·구름 기술바닥 이탈 여부."""
+    return str(sw_reason or "").startswith(_SWING_TECH_FLOOR_FULL_PREFIX)
+
+
+def _coin_swing_entry_noise_defers_tech_floor_full(
+    *,
+    sw_action: str,
+    sw_reason: str,
+    hours_held: float,
+    profit_rate_pct: float,
+) -> bool:
+    """
+    COIN ``SWING_FIB`` — 진입 후 ``COIN_SWING_ENTRY_NOISE_GRACE_HOURS`` 미만이면
+    기술바닥 FULL을 유예. ``profit_rate_pct`` 가 하드컷(기본 -3%) 이하면 유예 없음.
+    """
+    if str(sw_action or "").upper() != "FULL":
+        return False
+    if not _coin_swing_tech_floor_full_reason(sw_reason):
+        return False
+    if float(hours_held) >= float(COIN_SWING_ENTRY_NOISE_GRACE_HOURS):
+        return False
+    if float(profit_rate_pct) <= float(COIN_SWING_ENTRY_HARD_CUT_PCT):
+        return False
+    return True
+
+
+def _log_coin_swing_entry_noise_defer(
+    ticker: str,
+    hours_held: float,
+    curr_label: str,
+    sl_label: str,
+) -> None:
+    grace = float(COIN_SWING_ENTRY_NOISE_GRACE_HOURS)
+    print(
+        f"  🔰 [{ticker}] 진입 초기 노이즈 구간 (보유: {hours_held:.1f}h < {grace:.0f}h) "
+        f"-> 기술바닥 이탈 검사 유예 (현재가: {curr_label} / 손절가: {sl_label})"
+    )
 
 
 def _ai_false_breakout_buy_gate(

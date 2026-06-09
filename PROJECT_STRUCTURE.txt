@@ -1,7 +1,7 @@
 ================================================================================
   c-bot 프로젝트 구조 / 파일 설명 (2026-06-06)
   — 처음 보는 분도 따라갈 수 있게: 무엇이 어디에 있고, 무엇을 Git에 올리지 않는지까지 정리
-  — 멱등·장부정합·매매내역 복구·balance_read·매매 로직(사이클 순서·SWING/V8) 반영
+  — 멱등·장부정합·매매내역 복구·balance_read·매매 로직(사이클 순서·SWING/V8·COIN 진입유예) 반영
 ================================================================================
 
 [이 저장소는?]
@@ -63,7 +63,7 @@ run_bot.py
     load_state·reconcile_positions_for_cycle, _build_market_context
   - build_account_snapshot_for_report: deps 잔고 = balance_read (fresh_balances·force_kis 시 refresh=True)
   - get_safe_balance("KR"|"US"|"COIN") → balance_read (레거시 시장 문자열 모드)
-    (macro_snap: PCR·고래·환율 모멘텀·market_buy_allowed / market_buy_block_reason; macro_mult=1.0)
+    (macro_snap: PCR·고래·환율 Z-Score·market_buy_allowed / market_buy_block_reason; macro_mult=1.0)
   - 매수 전 RS: _sort_buy_targets_by_rs → alpha_sizing. 비중: _position_ratio_with_vol_target
     (min(1/N, alpha_target_vol/ATR%), config alpha_target_vol 기본 0.02)
   - 본문: helper 2차 + 시장별 3차 → execution/market_cycles/ (매도·매수). run_bot._run_*_buy_cycle / _execute_*_market_buy_twap 은 **위임 래퍼** — 구현은 *_buy_cycle.py·order_executor.py.
@@ -224,6 +224,9 @@ strategy/
     SWING_TIME_DECAY_START_TRADING_HOURS=24, SWING_TIME_DECAY_GAP_CLOSE_PER_24H=0.40,
     SWING_UPPER_WICK_DROP_PCT=5.0,
     SWING_PROFIT_LOCK_ACTIVATE_PCT=3, BREAKEVEN_LOCK_MULT=1.005,
+    COIN_SWING_ENTRY_NOISE_GRACE_HOURS=2 (config coin_swing_entry_noise_grace_hours),
+    COIN_SWING_ENTRY_HARD_CUT_PCT=-3 (config coin_swing_entry_hard_cut_pct),
+    _coin_swing_entry_noise_defers_tech_floor_full … coin_cycle SWING FULL 유예
     get_v8_profit_lock_floor(scale_out_done 후 본절락), get_swing_profit_lock_floor(max_p>3%),
     get_final_exit_price/get_chandelier_exit(V8: 샹들리에+20MA/ATR+1차익절 후 본절락, 고정% 캡 없음) 등
   api/kis_rate_limit.py … KIS Open API 전역 호출 간격(EGW00201 완화)
@@ -234,7 +237,7 @@ strategy/
   indicators.py … get_safe_atr (V8 ATR 무결성)
   sector_lock.py … Phase1 섹터 과다 방지
   ai_filter.py … Phase3 뉴스 LLM 0~100, 듀얼 프롬프트(v8_strict / swing_terminal_risk), Gemini→OpenAI 폴백
-  macro_guard.py … Phase4 시장별 글로벌 매수 차단(US PCR / COIN 고래 / KR 환율 모멘텀).
+  macro_guard.py … Phase4 시장별 글로벌 매수 차단(US PCR / COIN 고래 / KR 환율 Z-Score+당일방향).
   hedge_universe.py … 하락장 헷지 티커 하드코딩(HEDGE_ASSETS_KR/US, grep HEDGE_UNIVERSE).
     market_buy_allowed만 사용 — V8·SWING 전략 예외 없음.
     macro_buy_allowed_for_strategy(호환 래퍼), is_us_put_call_macro_block — run_bot _macro_market_buy_allowed
@@ -319,6 +322,9 @@ tests/
   7a) run_*_cycle — 장 개장 시 **매도 루프 항상** (Phase4·매수창 무관)
        - 브로커 보유·장부 없음 → 매도 루프 ``자동등록(보유종목)`` (sync 자동복구와 별개)
        - SWING: check_swing_exit HALF/FULL → continue. HOLD면 **V8 Scale-Out 절대 안 탐**
+       - **COIN SWING only:** 진입 2h 미만 + 기술바닥 FULL → 유예(``🔰 … 기술바닥 이탈 검사 유예``).
+         -3% 이하 하드컷은 유예 없음. 15분 신규매수 보호(``_new_buy_sell_protection_blocks``)와 별도.
+         run_bot ``COIN_SWING_ENTRY_*`` · coin_cycle ``decide_swing_exit`` FULL 직전.
        - V8만: _try_v8_scale_out_* (entry_atr×3·×6; ATR 없을 때 +30% fallback)
        - EXIT: 타임스탑 → (손실·V8만) hard_stop → (수익) 스윙 트레일 / V8 샹들리에
        - 전량 청산: LANE_EXIT·LANE_SWING_FULL — 시장가 1회 (TWAP 아님)
@@ -351,7 +357,7 @@ tests/
   Phase 1 … sector_lock.py (동일 섹터 과다 보유 방지)
   Phase 2 … order_twap.py, order_executor.py, scale_out.py, run_bot._execute_* 위임
   Phase 3 … ai_filter.py + run_bot._ai_false_breakout_buy_gate (뉴스 LLM, 전략별 듀얼 프롬프트)
-  Phase 4 … macro_guard.py, macro_data.py (US PCR / COIN 고래 / KR 환율 모멘텀)
+  Phase 4 … macro_guard.py, macro_data.py (US PCR / COIN 고래 / KR 환율 Z-Score)
     + hedge_universe.py (Phase4 시 헷지 ETF만; docs/HEDGE_UNIVERSE.md)
   Phase 5 … circuit_break.py, guard.py, run_bot circuit_aux_*, adjust_capital.py
   (별도 번호 없음) ticker_cooldowns … 매도 사유별 1h/24h 재진입 쿨다운 (분할 익절 잔량 시 미부여 / guard.py + run_bot 매도 루프)

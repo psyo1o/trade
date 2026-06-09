@@ -8,7 +8,8 @@ Phase 4 — 거시 방어막 (시장별 글로벌 알파).
 규칙(기본)
     * **US** — ``us_put_call_ratio`` >= 1.2 → US 시장 **V8·SWING 포함** 신규 매수 차단
     * **COIN** — ``coin_whale_long_short_ratio`` <= 0.8 → 차단
-    * **KR** — ``usd_krw_momentum_ratio`` >= 1.015 (5일 이평 대비 1.5% 급등) → 차단
+    * **KR** — ``z_score`` >= 2.0 **그리고** ``is_rising`` → 차단
+      (20일 변동성 대비 +2σ 급등 **이면서** 당일 환율이 전일 종가보다 오를 때만)
 
 전략별 예외(SWING_FIB PCR 우회 등) 없음 — ``market_buy_allowed[market]`` 만 사용.
 
@@ -29,22 +30,24 @@ from api.macro_data import (
     fetch_usd_krw_momentum,
 )
 
+DEFAULT_KRW_FX_ZSCORE_BLOCK = 2.0
+
 
 def evaluate_market_macro_buy_permission(
     market: str,
     *,
     us_put_call_ratio: float | None,
     coin_whale_long_short_ratio: float | None,
-    usd_krw_momentum_ratio: float | None,
+    usd_krw_fx: Dict[str, Any] | None = None,
     us_pcr_block: float = 1.2,
     coin_whale_block: float = 0.8,
-    krw_fx_momentum_block: float = 1.015,
+    krw_fx_zscore_block: float = DEFAULT_KRW_FX_ZSCORE_BLOCK,
 ) -> Dict[str, Any]:
     """시장별 글로벌 알파 차단. 지표 미수집 시 통과."""
     mk = str(market or "").strip().upper()
     pcr = float(us_put_call_ratio) if us_put_call_ratio is not None else None
     whale = float(coin_whale_long_short_ratio) if coin_whale_long_short_ratio is not None else None
-    fx_mom = float(usd_krw_momentum_ratio) if usd_krw_momentum_ratio is not None else None
+    fx = usd_krw_fx if isinstance(usd_krw_fx, dict) else {}
 
     if mk == "US":
         if pcr is not None and pcr >= float(us_pcr_block):
@@ -63,10 +66,16 @@ def evaluate_market_macro_buy_permission(
         return {"allowed": True, "reason": "COIN 글로벌 지표 정상"}
 
     if mk == "KR":
-        if fx_mom is not None and fx_mom >= float(krw_fx_momentum_block):
+        z = _coerce_float(fx.get("z_score"))
+        is_rising = fx.get("is_rising")
+        z_thr = float(krw_fx_zscore_block)
+        if z is not None and is_rising is True and z >= z_thr:
             return {
                 "allowed": False,
-                "reason": f"환율 모멘텀 {fx_mom:.4f} >= {krw_fx_momentum_block:g}",
+                "reason": (
+                    f"환율 발작 감지: Z-Score {z:.2f} >= {z_thr:g} "
+                    f"& 당일 상승 진행 중 -> KR 신규 매수 차단"
+                ),
             }
         return {"allowed": True, "reason": "KR 글로벌 지표 정상"}
 
@@ -126,7 +135,7 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
       macro_guard_enabled (기본 True)
       macro_us_put_call_block_threshold, macro_us_put_call_symbol
       macro_coin_whale_long_short_block_threshold, macro_coin_whale_symbol, macro_coin_whale_period
-      macro_krw_fx_momentum_block_threshold
+      macro_krw_fx_zscore_block_threshold (기본 2.0)
     """
     enabled = bool(config.get("macro_guard_enabled", True))
     if not enabled:
@@ -136,7 +145,11 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
             "budget_multiplier": 1.0,
             "us_put_call_ratio": None,
             "coin_whale_long_short_ratio": None,
-            "usd_krw_momentum_ratio": None,
+            "usd_krw_fx": None,
+            "usd_krw_z_score": None,
+            "usd_krw_is_rising": None,
+            "usd_krw_spot": None,
+            "usd_krw_ma20": None,
             "market_buy_allowed": {"KR": True, "US": True, "COIN": True},
             "market_buy_block_reason": {"KR": "", "US": "", "COIN": ""},
             "reason": "macro_guard_enabled=false",
@@ -144,7 +157,9 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
 
     us_pcr_block = float(config.get("macro_us_put_call_block_threshold", 1.2))
     coin_whale_block = float(config.get("macro_coin_whale_long_short_block_threshold", 0.8))
-    krw_fx_mom_block = float(config.get("macro_krw_fx_momentum_block_threshold", 1.015))
+    krw_z_block = float(
+        config.get("macro_krw_fx_zscore_block_threshold", DEFAULT_KRW_FX_ZSCORE_BLOCK)
+    )
 
     us_pcr = fetch_us_put_call_ratio(str(config.get("macro_us_put_call_symbol", "SPY")))
     whale_ratio = fetch_coin_whale_short_ratio(
@@ -152,7 +167,7 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
         str(config.get("macro_coin_whale_period", "1d")),
     )
     fx_pack = fetch_usd_krw_momentum() or {}
-    usd_krw_momentum_ratio = _coerce_float(fx_pack.get("momentum_ratio"))
+    usd_krw_fx = fx_pack if isinstance(fx_pack, dict) else {}
 
     market_buy_allowed: Dict[str, bool] = {}
     market_buy_block_reason: Dict[str, str] = {}
@@ -161,10 +176,10 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
             mk,
             us_put_call_ratio=us_pcr,
             coin_whale_long_short_ratio=whale_ratio,
-            usd_krw_momentum_ratio=usd_krw_momentum_ratio,
+            usd_krw_fx=usd_krw_fx,
             us_pcr_block=us_pcr_block,
             coin_whale_block=coin_whale_block,
-            krw_fx_momentum_block=krw_fx_mom_block,
+            krw_fx_zscore_block=krw_z_block,
         )
         market_buy_allowed[mk] = bool(perm.get("allowed", True))
         market_buy_block_reason[mk] = str(perm.get("reason", "") or "")
@@ -177,7 +192,7 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
         ]
         summary = " | ".join(reasons)
     else:
-        summary = "글로벌 알파 정상 (US PCR·코인 고래·KR 환율 모멘텀)"
+        summary = "글로벌 알파 정상 (US PCR·코인 고래·KR 환율 Z-Score)"
 
     return {
         "enabled": True,
@@ -185,7 +200,11 @@ def get_macro_guard_snapshot(config: Dict[str, Any]) -> Dict[str, Any]:
         "budget_multiplier": 1.0,
         "us_put_call_ratio": us_pcr,
         "coin_whale_long_short_ratio": whale_ratio,
-        "usd_krw_momentum_ratio": usd_krw_momentum_ratio,
+        "usd_krw_fx": usd_krw_fx or None,
+        "usd_krw_z_score": _coerce_float(usd_krw_fx.get("z_score")),
+        "usd_krw_is_rising": usd_krw_fx.get("is_rising"),
+        "usd_krw_spot": _coerce_float(usd_krw_fx.get("spot")),
+        "usd_krw_ma20": _coerce_float(usd_krw_fx.get("ma20")),
         "market_buy_allowed": market_buy_allowed,
         "market_buy_block_reason": market_buy_block_reason,
         "reason": summary,

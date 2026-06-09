@@ -9,7 +9,7 @@ _티커 하드코딩의 **단일 출처**: [`strategy/hedge_universe.py`](../str
 
 | 시장 | 코드 | 한글/설명 |
 |------|------|-----------|
-| **KR** | `133690` | TIGER 미국나스닥100 |
+| **KR** | `261240` | KODEX 미국달러선물 |
 | **KR** | `411060` | ACE KRX금현물 |
 | **KR** | `304660` | KODEX 미국30년국채울트라선물(H) |
 | **US** | `GLD` | SPDR Gold Shares |
@@ -39,6 +39,7 @@ _티커 하드코딩의 **단일 출처**: [`strategy/hedge_universe.py`](../str
    KOSPI/S&P `INDEX_CRASH_*` 차단 무시, `HEDGE_PHASE4` 방어 진입(V8/스윙·갭 필터 생략).
 
 Phase 4 거시 지표 자체는 [`strategy/macro_guard.py`](../strategy/macro_guard.py) · [`api/macro_data.py`](../api/macro_data.py) 와 동일합니다.  
+**KR 환율 차단(2026-06):** 20일 Z-Score ≥ 2.0 **이면서** 당일 환율 상승(`is_rising`)일 때만 일반 주식 신규 매수 차단. 실시간 spot은 yfinance 1분봉 또는 261240 ETF 프록시.  
 헷지는 **차단된 시장 안에서만** 살아남는 예외 경로입니다.
 
 ---

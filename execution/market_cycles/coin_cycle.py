@@ -174,6 +174,16 @@ def run_coin_cycle(ctx: TradingCycleContext) -> None:
                     reference_price=float(curr_p),
                     trading_hours_held=trading_h,
                 )
+                if rb._coin_swing_entry_noise_defers_tech_floor_full(
+                    sw_action=sw_action,
+                    sw_reason=sw_reason,
+                    hours_held=float(hours_held),
+                    profit_rate_pct=float(profit_rate_now),
+                ):
+                    rb._log_coin_swing_entry_noise_defer(
+                        t, float(hours_held), curr_fmt, chan_fmt
+                    )
+                    continue
                 if sw_action == "HALF":
                     if rb.order_idem.lane_has_filled_sell(
                         state, "COIN", t, rb.order_idem.LANE_SWING_HALF, _buy_cycle_tag

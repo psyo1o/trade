@@ -162,7 +162,9 @@ Phase5 비중 계산은 `ledger_valuation.kis_display_total()` 을 사용한다.
   "account_circuit_share_anchor_min_ratio": 0.5,
   "account_circuit_cooldown_hours": 24,
   "account_circuit_mdd_pct": 15,
-  "kis_balance_sync_mode": "on_trade"
+  "kis_balance_sync_mode": "on_trade",
+  "coin_swing_entry_noise_grace_hours": 2.0,
+  "coin_swing_entry_hard_cut_pct": -3.0
 }
 ```
 
@@ -195,7 +197,39 @@ tests/test_phase5_share_circuit.py
 
 ---
 
-## 9. 운영 체크리스트
+## 10. COIN SWING 매도 — 진입 유예 (노이즈 방어)
+
+**대상:** `SWING_FIB` 코인만 (`execution/market_cycles/coin_cycle.py`). KR/US는 **미적용**.
+
+스윙 진입 직후 잔파동으로 `check_swing_exit` **기술바닥 FULL**(`스윙 기술바닥 이탈 …`)이 나와 허무하게 청산되는 것을 줄이기 위한 **2단계 보호**입니다.
+
+| 단계 | 조건 | 동작 |
+|------|------|------|
+| **1) 신규 매수 보호** | 매수 후 **15분** + 수익률 **+1% 미만** | **모든** 매도 판정 스킵 (`_new_buy_sell_protection_blocks`, KR/US/COIN 공통) |
+| **2) COIN 진입 유예** | 보유 **2h 미만** + 기술바닥 FULL + 수익률 **-3% 초과** | FULL **유예** — 로그 `🔰 … 기술바닥 이탈 검사 유예` |
+| **하드컷** | 수익률 **≤ -3%** | 2h·유예 **무시**, 즉시 FULL |
+| **2h 이후** | — | 기술바닥 FULL **100% 적용** (기존과 동일) |
+
+**유예 대상 아님:** 1.5R HALF, 5MA·RSI FULL, 타임스탑, V8 경로.
+
+`config.json` (선택):
+
+```json
+"coin_swing_entry_noise_grace_hours": 2.0,
+"coin_swing_entry_hard_cut_pct": -3.0
+```
+
+코드:
+
+- `run_bot.py` — `COIN_SWING_ENTRY_*`, `_coin_swing_entry_noise_defers_tech_floor_full`, `_log_coin_swing_entry_noise_defer`
+- `execution/market_cycles/coin_cycle.py` — `decide_swing_exit` FULL 직전 검사
+- `tests/test_coin_swing_entry_grace.py`
+
+README §5-3 표와 동일 내용.
+
+---
+
+## 11. 운영 체크리스트
 
 | 증상 | 확인 |
 |------|------|
@@ -204,6 +238,7 @@ tests/test_phase5_share_circuit.py
 | 한 시장만 막혀야 하는데 전 시장 매수 불가 | `account_circuit_use_total` 이 true 인지, `account_circuit_cooldown_until` 존재 여부 |
 | 예수금 표시 어긋남 | 강제 KIS 새로고침 1회 또는 `adjust_capital` 로 live sync |
 | Phase5 비중 %가 GUI와 다름 | `ledger_only` 루프 — `_phase5_aux_sync` 추정값 사용 여부 확인; KIS 강제 새로고침으로 스냅샷 정렬 |
+| COIN 스윙 진입 직후 곧바로 FULL | `🔰 … 기술바닥 이탈 검사 유예` 로그 — 2h 미만이면 정상; -3% 이하면 하드컷 즉시 매도 |
 
 수동으로 대기 큐 비우기 (`bot_state.json`):
 
@@ -214,7 +249,7 @@ tests/test_phase5_share_circuit.py
 
 ---
 
-## 10. 변경 이력 (요약)
+## 12. 변경 이력 (요약)
 
 | 시기 | 내용 |
 |------|------|
@@ -223,3 +258,4 @@ tests/test_phase5_share_circuit.py
 | 2026-06 | KIS 잔고 **on_trade** + TTL 캐시 |
 | 2026-06 | 대기 청산 **stale prune** · 레거시 pending 플래그 정리 |
 | 2026-06 | 국·미 표시 **단일 스냅샷** · Phase5 `ledger_only` 추정 총평 · US force_kis 급증 가드 정리 |
+| 2026-06 | **COIN SWING** 진입 2h 기술바닥 FULL 유예 · -3% 하드컷 (`coin_swing_entry_*`) |
