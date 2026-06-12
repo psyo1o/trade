@@ -36,7 +36,8 @@ _티커 하드코딩의 **단일 출처**: [`strategy/hedge_universe.py`](../str
    예수금 부족·`portfolio_heat_max_pct` 차단은 **예외 없음**.
 4. **Phase 3 AI** — 헷지는 `evaluate_false_breakout_filter` 미호출, `false_breakout_prob=0` 처리.
 5. **지수 급락·BEAR·V8/스윙 시그널** — Phase4 **헷지 전용 모드**(`hedge_only`)일 때만 예외:  
-   KOSPI/S&P `INDEX_CRASH_*` 차단 무시, `HEDGE_PHASE4` 방어 진입(V8/스윙·갭 필터 생략).
+   KOSPI/S&P `INDEX_CRASH_*` 차단 무시, `HEDGE_PHASE4` 방어 진입(V8/스윙·갭 필터 생략).  
+   **BEAR 날씨:** 일반 종목 V8·SWING_FIB 모두 차단 — 헷지 유니버스·Phase4 헷지 경로만 매수 검토.
 
 Phase 4 거시 지표 자체는 [`strategy/macro_guard.py`](../strategy/macro_guard.py) · [`api/macro_data.py`](../api/macro_data.py) 와 동일합니다.  
 **KR 환율 차단(2026-06):** 20일 Z-Score ≥ 2.0 **이면서** 당일 환율 상승(`is_rising`)일 때만 일반 주식 신규 매수 차단. 실시간 spot은 yfinance 1분봉 또는 261240 ETF 프록시.  
@@ -47,7 +48,7 @@ Phase 4 거시 지표 자체는 [`strategy/macro_guard.py`](../strategy/macro_gu
 ## 그 외 게이트 (헷지도 동일)
 
 - KOSPI/S&P **지수 급락** — 일반 모드만 차단; Phase4 **헷지 전용**이면 예외
-- **BEAR** 날씨 V8 차단 — 헷지 전용 모드에서 `HEDGE_PHASE4` 진입으로 예외
+- **BEAR** 날씨 V8·스윙 차단 — 헷지 전용 모드에서 `HEDGE_PHASE4` 진입으로 예외
 - **섹터 락**, 쿨다운, V8/스윙 **진입 시그널**
 - **갭상승 5%**(국장)
 

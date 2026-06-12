@@ -145,6 +145,9 @@ from strategy.rules import (
     register_swing_entry_risk_fields,
     swing_entry_sl_p,
     SWING_SCALE_OUT_R_MULT,
+    SWING_TIME_STOP_HOURS_EQUITY,
+    SWING_TIME_STOP_HOURS_COIN,
+    SWING_TIME_STOP_EXEMPT_PROFIT_PCT,
     get_ohlcv_yfinance,
     get_ohlcv_stooq,
     get_ohlcv_pykrx,
@@ -462,7 +465,12 @@ WEATHER_LABEL_BEAR = "🌧️ BEAR"
 
 
 def _v8_trend_buy_allowed_in_weather(weather_label: str) -> bool:
-    """BEAR 시장에서는 V8(추세) 신규 매수만 차단. ``SWING_FIB`` 스윙은 허용."""
+    """BEAR 시장에서는 V8(추세) 신규 매수만 차단."""
+    return str(weather_label or "").strip() != WEATHER_LABEL_BEAR
+
+
+def _swing_fib_buy_allowed_in_weather(weather_label: str) -> bool:
+    """BEAR 시장에서는 일반 종목 SWING_FIB 눌림목 매수 차단 (헷지는 buy_cycle 별도 경로)."""
     return str(weather_label or "").strip() != WEATHER_LABEL_BEAR
 
 # 업비트 코인 시장가 매수 — 가용 잔고 캡(수수료·반올림 오차로 InsufficientFundsBid 방지)
@@ -4573,14 +4581,12 @@ def _check_swing_trailing_exit(
 
 # 타임스탑 — KR/US는 **영업시간** 누적, COIN은 24/7 연속시간
 #   V8 주식: 72h(≈3영업일) + 유예 +4% | V8 코인: 48h + 유예 +4%
-#   SWING 주식: 48h + 유예 +2% | SWING 코인: 24h + 유예 +2%
+#   SWING 주식: 72h(≈3영업일) + 유예 +2% | SWING 코인: 48h + 유예 +2%
 # (보유시각: buy_date 우선, 없으면 buy_time)
 V8_TIME_STOP_HOURS_EQUITY = 72.0
 V8_TIME_STOP_HOURS_COIN = 48.0
 V8_TIME_STOP_EXEMPT_PROFIT_PCT = 4.0
-SWING_TIME_STOP_HOURS_EQUITY = 48.0
-SWING_TIME_STOP_HOURS_COIN = 24.0
-SWING_TIME_STOP_EXEMPT_PROFIT_PCT = 2.0
+# SWING_TIME_STOP_* — strategy.rules 단일 출처 (아래 import 재노출)
 # COIN SWING_FIB: 진입 직후 기술바닥 FULL 유예(잔파동 노이즈) — 하드컷 % 이하는 즉시 탈출
 COIN_SWING_ENTRY_NOISE_GRACE_HOURS = float(config.get("coin_swing_entry_noise_grace_hours", 2.0))
 COIN_SWING_ENTRY_HARD_CUT_PCT = float(config.get("coin_swing_entry_hard_cut_pct", -3.0))

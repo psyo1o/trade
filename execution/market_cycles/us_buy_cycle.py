@@ -53,7 +53,7 @@ def run_us_buy_cycle(
             return float(us_cash)
 
     if weather["US"] == rb.WEATHER_LABEL_BEAR:
-        print("  📌 [US] BEAR 날씨 — V8 추세 매수만 중단, SWING_FIB 스윙 후보는 계속 분석")
+        print("  📌 [US] BEAR 날씨 — V8·SWING_FIB 일반 종목 매수 중단 (헷지만 검토)")
 
     buy_targets = rb._sort_buy_targets_by_rs(buy_targets, "US")
     total_us = len(buy_targets)
@@ -134,7 +134,7 @@ def run_us_buy_cycle(
                 v8_ok = bool(is_buy) and rb._v8_trend_buy_allowed_in_weather(weather["US"])
                 if bool(is_buy) and not v8_ok:
                     print(
-                        f"  ⏭️ {us_name}({t}): BEAR 시장 — V8 신호 통과했으나 추세 매수 차단 (스윙만 허용)"
+                        f"  ⏭️ {us_name}({t}): BEAR 시장 — V8 추세 매수 차단"
                     )
                 if v8_ok:
                     print(f"  ✅ [V8-BUY] {us_name}({t}) 진입")
@@ -142,6 +142,11 @@ def run_us_buy_cycle(
                     sw_ok = entry_decision.swing_ok
                     sw_fib = entry_decision.swing_fib
                     sw_why = entry_decision.swing_why
+                    if sw_ok and not rb._swing_fib_buy_allowed_in_weather(weather["US"]):
+                        print(
+                            f"  ⏭️ {us_name}({t}): BEAR 시장 — SWING_FIB 눌림목 매수 차단 (헷지만 허용)"
+                        )
+                        continue
                     if sw_ok:
                         strategy_type = "SWING_FIB"
                         entry_fib_level = float(sw_fib)
@@ -153,7 +158,6 @@ def run_us_buy_cycle(
                         print(
                             f"  ✅ [SWING-BUY] {us_name}({t}) entry_fib={entry_fib_level:.2f} "
                             f"| 양봉({_sw_src} 시가 {_sw_o:.2f} < 종가 {_sw_c:.2f})"
-                            f"{' | BEAR 시장 스윙 예외' if weather['US'] == rb.WEATHER_LABEL_BEAR else ''}"
                         )
                     else:
                         _prog = f"[{idx}/{total_us}]" if total_us > 0 else ""

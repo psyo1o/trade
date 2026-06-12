@@ -7,7 +7,7 @@ V5 전략 코어 — OHLCV 수집, 프로 시그널, 청산 가격.
     * **시그널** — ``calculate_pro_signals`` (V8 진입), ``check_swing_entry`` / ``check_swing_exit`` (SWING_FIB).
     * **청산** — ``check_pro_exit``, ``get_final_exit_price`` (V8, 샹들리에·20MA/ATR·1차 익절 후 본절락), ``get_swing_exit_display_price`` (SWING_FIB 매도선).
 
-스윙 요약은 README.md §8. 진입: ``check_swing_entry`` (60MA·이격·갭·양봉·윗꼬리·RSI≥35·피보).
+스윙 요약은 README.md §8. 진입: ``check_swing_entry`` (60MA·20MA>60MA·이격·갭·양봉·윗꼬리·RSI≥40·피보).
 청산 HALF: 1.5R 스케일아웃. 하드바닥: 피보·구름 + 시간가중 손절(영업 24h 후).
 러너(1차 익절 완료 또는 max_p≥1.5R): 5MA 트레일링 FULL·매도선 ``max(하드, 본절락, 5MA)`` — **표시·5MA 청산선은 고점 래칫**(내려가지 않음).
 상수: ``SWING_MA60_MAX_EXTENSION_PCT_{US,KR,COIN}``, ``swing_ma60_max_extension_pct``, ``SWING_GAP_UP_MAX_PCT`` 등.
@@ -805,7 +805,11 @@ def swing_ma60_max_extension_pct(market: str | None) -> float:
 # 전일 종가 대비 당일 시가 갭 상승(%) 상한 — 초과 시 뇌동 추격으로 거절
 SWING_GAP_UP_MAX_PCT = 3.0
 # 진입 시 RSI(14) 하한 — 판정 종가(실시간 우선) 기준, 미만이면 칼날·모멘텀 둔화로 거절
-SWING_ENTRY_RSI_MIN = 35.0
+SWING_ENTRY_RSI_MIN = 40.0
+# 스윙 타임스탑 — KR/US는 영업시간 누적, COIN은 24/7 연속 (``run_bot._time_stop_params``)
+SWING_TIME_STOP_HOURS_EQUITY = 72.0
+SWING_TIME_STOP_HOURS_COIN = 48.0
+SWING_TIME_STOP_EXEMPT_PROFIT_PCT = 2.0
 # 스윙 손절 피보: 60봉 고저 되돌림 비율 (현재가 **아래** 지지만 허용)
 _SWING_FIB_RETRACE_RATIOS = (0.382, 0.500, 0.618)
 # 피보·구름 합산이 평단 위로 나오면 롱 손절·매도선을 평단 대비 -3%로 고정 (KR/US/COIN 공통)
@@ -882,12 +886,13 @@ def check_swing_entry(
 
     진입 조건:
         1. 60MA 위 + 60MA 대비 이격 ≤ 시장별 상한 (US +15% / KR +20% / COIN +30%)
-        2. 당일 양봉 (시가 < 판정가) — ``reference_close`` 우선
-        3. 전일 종가→당일 시가 갭 < ``SWING_GAP_UP_MAX_PCT`` (기본 3%)
-        4. 거래량 Dry-up: 당일 < 5일 평균 거래량
-        5. 윗꼬리 < ``SWING_UPPER_WICK_DROP_PCT``
-        6. RSI(14) ≥ ``SWING_ENTRY_RSI_MIN`` (판정 종가 기준, 모멘텀 둔화·칼날 방지)
-        7. 피보: 60봉 38.2/50/61.8% 중 현재가 **아래** 지지
+        2. **20MA > 60MA** (단기·중기 정배열 — 역추세 칼날 방지)
+        3. 당일 양봉 (시가 < 판정가) — ``reference_close`` 우선
+        4. 전일 종가→당일 시가 갭 < ``SWING_GAP_UP_MAX_PCT`` (기본 3%)
+        5. 거래량 Dry-up: 당일 < 5일 평균 거래량
+        6. 윗꼬리 < ``SWING_UPPER_WICK_DROP_PCT``
+        7. RSI(14) ≥ ``SWING_ENTRY_RSI_MIN`` (판정 종가 기준, 모멘텀 둔화·칼날 방지)
+        8. 피보: 60봉 38.2/50/61.8% 중 현재가 **아래** 지지
 
     ``reference_close`` — 호출 시점 실시간가(KIS·거래소). 없으면 당일 일봉 종가.
 
@@ -903,6 +908,7 @@ def check_swing_entry(
         return False, 0.0, "OHLCV 컬럼 부족"
 
     w["ma60"] = w["c"].rolling(60).mean()
+    w["ma20"] = w["c"].rolling(20).mean()
 
     today = w.iloc[-1]
     close_bar = float(today["c"])
@@ -929,6 +935,12 @@ def check_swing_entry(
                 )
 
     ma60 = float(today["ma60"]) if pd.notna(today["ma60"]) else 0.0
+    ma20 = float(today["ma20"]) if pd.notna(today["ma20"]) else 0.0
+    if ma60 <= 0 or ma20 <= 0:
+        return False, 0.0, "20MA/60MA 산출 불가"
+    if ma20 <= ma60:
+        return False, 0.0, "단기 역추세 (20MA < 60MA)"
+
     ext_limit_pct = swing_ma60_max_extension_pct(market)
     max_extension_price = (
         ma60 * (1.0 + ext_limit_pct / 100.0) if ma60 > 0 else 0.0
@@ -943,7 +955,7 @@ def check_swing_entry(
     cond_bull = close_for_candle > open_today
     # 3. 거래량 Dry-up (당일 < 5일 평균)
     cond_vol, vol_why = _swing_volume_dryup_ok(w, today)
-    # 4. 모멘텀 둔화: 판정 종가 기준 RSI(14) ≥ 35 (과매도 칼날 구간 차단)
+    # 4. 모멘텀 둔화: 판정 종가 기준 RSI(14) ≥ SWING_ENTRY_RSI_MIN (과매도 칼날 구간 차단)
     rsi14 = _swing_entry_rsi_at_price(w, close_for_candle)
     cond_rsi_ok = rsi14 is not None and rsi14 >= SWING_ENTRY_RSI_MIN
 

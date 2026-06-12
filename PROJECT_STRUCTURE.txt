@@ -206,9 +206,9 @@ strategy/
   hedge_universe.py … 하락장 헷지 티커 (grep HEDGE_UNIVERSE)
   rules.py … ``get_ohlcv_pykrx``(국장 백업), ``get_ohlcv_stooq``(키 필요), ``get_ohlcv_yfinance``(stderr·티커 백오프),
     calculate_pro_signals(V8: Hurst<0.45·120MA 위(20일 최고 거래량 갱신 시 예외)·20MA 우상향·MACD·RSI 등, 최소 120봉),
-    check_swing_entry(Pullback: 60MA 위·시장별 이격 US+15/KR+20/COIN+30·Dry-up·갭3%·양봉·윗꼬리5%·RSI≥35·피보),
+    check_swing_entry(Pullback: 60MA 위·20MA>60MA·시장별 이격 US+15/KR+20/COIN+30·Dry-up·갭3%·양봉·윗꼬리5%·RSI≥40·피보),
       swing_ma60_max_extension_pct(market), SWING_MA60_MAX_EXTENSION_PCT_{US,KR,COIN},
-      SWING_ENTRY_RSI_MIN=35, _swing_entry_rsi_at_price(판정종가 반영 RSI14),
+      SWING_ENTRY_RSI_MIN=40, SWING_TIME_STOP_HOURS_EQUITY=72, SWING_TIME_STOP_HOURS_COIN=48,
       SWING_GAP_UP_MAX_PCT,
       _pick_swing_fib_support_below: 38.2/50/61.8% 중 현재가 아래 지지),
     check_swing_exit(피보/구름+시간가중 FULL·HALF 1.5R·러너 5MA FULL·RSI FULL +1~10%),
@@ -334,7 +334,7 @@ tests/
 
   RS: KR=6번 · US=us_buy_cycle 내부 · COIN=coin_buy_cycle 내부
   TWAP: order_twap=계획 · order_executor=매수 · scale_out=조건·장부(주문은 _try_v8_scale_out_*)
-  buy_cycle: Phase4·BEAR(V8만)·V8→스윙·Heat·AI·order_executor TWAP · Holding Lock
+  buy_cycle: Phase4·BEAR(V8·SWING 차단)·V8→스윙·Heat·AI·order_executor TWAP · Holding Lock
   buy_zone_coin: coin_cycle 에서만 (KR/US 동일) — Phase4·매수창·MDD·Phase5 통과 후 buy_cycle 호출 직전
 
   manual_sell: _idempotent_*_sell → persist_idempotency → _apply_manual_sell_state_update
