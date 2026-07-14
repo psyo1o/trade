@@ -18,6 +18,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import re
 import time
 import traceback
 from collections import defaultdict
@@ -62,13 +63,17 @@ SECTOR_COL_CANDIDATES = (
     "GIC Sector",
     "Sector",
     "GICS sector",
+    # List_of_NASDAQ-100_companies — ICB 분류 (각주 [1] 은 _find_column 에서 제거)
+    "ICB Industry",
+    "Industry",
 )
 
 SP_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+# 위키 경로는 대소문자 구분. List_of_Nasdaq-100_companies 는 404 → NASDAQ 표기 필수.
 NDX_WIKI_URLS = (
+    "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies",
     "https://en.wikipedia.org/wiki/Nasdaq-100",
     "https://en.wikipedia.org/wiki/NASDAQ-100",
-    "https://en.wikipedia.org/wiki/List_of_Nasdaq-100_companies",
 )
 
 _WIKI_HEADERS = {
@@ -186,11 +191,23 @@ def _wiki_read_tables(url: str) -> list[pd.DataFrame]:
     )
 
 
+def _normalize_wiki_col_name(name: object) -> str:
+    """위키 표 헤더 — MultiIndex 말단 + 각주 ``[1]`` 제거."""
+    s = str(name).split(".")[-1]
+    s = re.sub(r"\[\d+\]", "", s)
+    return s.strip()
+
+
 def _find_column(table: pd.DataFrame, candidates: Iterable[str]) -> str | None:
-    flat = [str(c).split(".")[-1] for c in table.columns]
+    flat = [_normalize_wiki_col_name(c) for c in table.columns]
     for cand in candidates:
         if cand in flat:
             return table.columns[flat.index(cand)]
+    # 접두 매칭 (예: ``ICB Industry`` ↔ ``ICB Industry (GICS)``)
+    for cand in candidates:
+        for i, col in enumerate(flat):
+            if col == cand or col.startswith(cand + " ") or col.startswith(cand + "("):
+                return table.columns[i]
     return None
 
 
