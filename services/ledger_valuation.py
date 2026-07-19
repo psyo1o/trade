@@ -6,12 +6,16 @@
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Any, Callable
 
 from utils.helpers import is_coin_ticker, normalize_ticker
 
 _LEGACY_CASH_KEYS = {"KR": "last_kr_cash_krw", "US": "last_us_cash_usd"}
+_BUY_CASH_GUARD_KEY = "_buy_cash_guard"
+# 미장 매수 직후 예수 API 지연·재오염은 당일~익일 세션까지 이어질 수 있음
+_BUY_CASH_GUARD_TTL_SEC = 24 * 3600.0
 
 
 def _market_norm(market: str) -> str:
@@ -256,6 +260,225 @@ def synthetic_us_balance_dict(
     return {"rt_cd": "0", "msg1": "ledger_valuation", "output1": output1, "output2": output2}
 
 
+def _ensure_kis_snap_part(state: dict, market: str) -> dict:
+    """``last_kis_display_snapshot`` 버킷을 보장하고 그 dict 를 반환."""
+    m = _market_norm(market)
+    snap = state.get("last_kis_display_snapshot")
+    if not isinstance(snap, dict):
+        snap = {}
+        state["last_kis_display_snapshot"] = snap
+    key = "kr" if m == "KR" else "us"
+    part = snap.get(key)
+    if not isinstance(part, dict):
+        part = {}
+        snap[key] = part
+    return part
+
+
+def _set_buy_cash_guard(state: dict, market: str, cash: float, total: float) -> None:
+    part = _ensure_kis_snap_part(state, market)
+    part[_BUY_CASH_GUARD_KEY] = {
+        "cash": float(cash),
+        "total": float(total),
+        "ts": float(time.time()),
+    }
+
+
+def _get_buy_cash_guard(part: dict) -> dict | None:
+    raw = part.get(_BUY_CASH_GUARD_KEY)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        ts = float(raw.get("ts", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0 or (time.time() - ts) > _BUY_CASH_GUARD_TTL_SEC:
+        return None
+    return raw
+
+
+def _recent_equity_buy_spend(
+    state: dict,
+    market: str,
+    *,
+    max_age_sec: float = _BUY_CASH_GUARD_TTL_SEC,
+) -> float:
+    """최근 매수 포지션의 매입대금 합(국장=원, 미장=USD)."""
+    m = _market_norm(market)
+    positions = state.get("positions")
+    if not isinstance(positions, dict) or not positions:
+        return 0.0
+    now = time.time()
+    spent = 0.0
+    for code, pos in positions.items():
+        if not isinstance(pos, dict):
+            continue
+        ticker = normalize_ticker(code)
+        if not ticker or is_coin_ticker(ticker):
+            continue
+        is_kr = ticker.isdigit()
+        if m == "KR" and not is_kr:
+            continue
+        if m == "US" and is_kr:
+            continue
+        try:
+            bt = float(pos.get("buy_time") or 0)
+        except (TypeError, ValueError):
+            bt = 0.0
+        if bt <= 0 or (now - bt) > max_age_sec:
+            continue
+        try:
+            qty = float(pos.get("qty") or 0)
+            buy_p = float(pos.get("buy_p") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty > 0 and buy_p > 0:
+            spent += qty * buy_p
+    return float(spent)
+
+
+def _sanitize_kis_cash_total_persist(
+    market: str,
+    state: dict,
+    cash: float,
+    stock: float,
+) -> tuple[float, float]:
+    """매수·매도 직후 KIS API 지연/이중합산을 저장 전에 보정."""
+    m = _market_norm(market)
+    part = _kis_snap_bucket(state, m)
+    prev_cash = float(part.get("cash", 0) or 0)
+    prev_total = float(part.get("total", 0) or 0)
+    min_pt = 10_000.0 if m == "KR" else 50.0
+    min_sold = 25_000.0 if m == "KR" else 25.0
+    nc = float(cash)
+    stock_v = float(stock)
+    total = nc + stock_v
+    if prev_total < min_pt:
+        return nc, total
+    prev_stock = max(0.0, prev_total - prev_cash)
+    if stock_v <= 0:
+        return nc, total
+    stock_grew = prev_stock > 0 and stock_v > prev_stock * 1.08
+    cash_stale = nc >= prev_cash * 0.85
+    total_inflated = total > prev_total * 1.03
+    if stock_grew and cash_stale and total_inflated:
+        nc = max(0.0, prev_total - stock_v)
+        total = nc + stock_v
+        _set_buy_cash_guard(state, m, nc, total)
+        print(
+            f"  📌 [snapshot {m}] persist 예수·총평 이중합산 추정 — "
+            f"예수 역산 {nc:,.2f}{'원' if m == 'KR' else ''} · 총평 {total:,.2f}"
+        )
+        return nc, total
+
+    # Case B2: 1차 역산 직후 API 예수가 다시 매수 전 값으로 튀는 재오염 차단
+    guard = _get_buy_cash_guard(part)
+    if guard is not None:
+        g_cash = float(guard.get("cash", 0) or 0)
+        g_total = float(guard.get("total", 0) or 0)
+        if (
+            g_total >= min_pt
+            and nc > max(g_cash * 1.5, g_cash + min_sold)
+            and (nc + stock_v) > g_total * 1.03
+            and stock_v >= max(0.0, g_total - g_cash) * 0.92
+        ):
+            g_stock = max(0.0, g_total - g_cash)
+            if abs(stock_v - g_stock) <= max(min_sold, g_stock * 0.08):
+                nc = g_cash
+            else:
+                nc = max(0.0, g_total - stock_v)
+            total = nc + stock_v
+            print(
+                f"  📌 [snapshot {m}] persist 이중합산 재오염 차단 — "
+                f"예수 {nc:,.2f}{'원' if m == 'KR' else ''} · 총평 {total:,.2f}"
+            )
+            return nc, total
+        # API 예수가 가드와 맞게 내려오면 해제
+        if g_cash > 0 and nc <= g_cash * 1.25 and not total_inflated:
+            live_part = _ensure_kis_snap_part(state, m)
+            live_part.pop(_BUY_CASH_GUARD_KEY, None)
+
+    # Case B3: 최근 매입대금이 예수에 그대로 남아 잔여만 남는 형태(입금과 구분)
+    recent_spend = _recent_equity_buy_spend(state, m)
+    if recent_spend >= min_sold and nc >= recent_spend * 0.85 and stock_v > 0:
+        residual = nc - recent_spend
+        residual_cap = max(min_sold * 2.0, recent_spend * 0.08)
+        if 0.0 <= residual <= residual_cap:
+            adj_cash = residual
+            adj_total = adj_cash + stock_v
+            if adj_total < total * 0.97:
+                _set_buy_cash_guard(state, m, adj_cash, adj_total)
+                print(
+                    f"  📌 [snapshot {m}] persist 최근매수 예수 미반영 보정 — "
+                    f"매입≈{recent_spend:,.2f} → 예수 {adj_cash:,.2f}"
+                    f"{'원' if m == 'KR' else ''} · 총평 {adj_total:,.2f}"
+                )
+                return adj_cash, adj_total
+
+    # Case B2b: 가드 없이 이미 저예수 스냅샷인데 API만 옛 예수로 복귀
+    if (
+        prev_total >= min_pt
+        and prev_cash > 0
+        and prev_cash < prev_total * 0.25
+        and nc > max(prev_cash * 2.0, prev_cash + min_sold)
+        and stock_v >= prev_stock * 0.92
+        and total_inflated
+    ):
+        if abs(stock_v - prev_stock) <= max(min_sold, prev_stock * 0.08):
+            nc = prev_cash
+        else:
+            nc = max(0.0, prev_total - stock_v)
+        total = nc + stock_v
+        _set_buy_cash_guard(state, m, nc, total)
+        print(
+            f"  📌 [snapshot {m}] persist 이중합산 재오염 차단 — "
+            f"예수 {nc:,.2f}{'원' if m == 'KR' else ''} · 총평 {total:,.2f}"
+        )
+        return nc, total
+
+    stock_sold = max(0.0, prev_stock - stock_v)
+    if stock_sold >= min_sold and total < prev_total * 0.97 and nc < prev_cash + stock_sold * 0.5:
+        if m == "US":
+            from run_bot import _reconcile_us_equity_after_sell
+
+            nc, total = _reconcile_us_equity_after_sell(
+                prev_cash=prev_cash,
+                prev_total=prev_total,
+                prev_stock=prev_stock,
+                cash=nc,
+                stock=stock_v,
+            )
+        else:
+            nc = prev_cash + stock_sold
+            total = nc + stock_v
+            print(
+                f"  📌 [snapshot {m}] persist 매도 정산 지연 추정 — "
+                f"예수 {nc:,.0f}원 · 총평 {total:,.0f}원"
+            )
+    elif total < prev_total * 0.97:
+        stock_stable = prev_stock > 0 and abs(stock_v - prev_stock) < max(min_sold, prev_stock * 0.08)
+        cash_dropped = prev_cash > 0 and nc < prev_cash * 0.85
+        if stock_stable and cash_dropped:
+            if m == "US":
+                from run_bot import _reconcile_us_equity_after_sell
+
+                nc, total = _reconcile_us_equity_after_sell(
+                    prev_cash=prev_cash,
+                    prev_total=prev_total,
+                    prev_stock=prev_stock,
+                    cash=nc,
+                    stock=stock_v,
+                )
+            else:
+                nc = prev_total - stock_v
+                total = prev_total
+                print(
+                    f"  📌 [snapshot {m}] persist 정산 지연 지속 추정 — "
+                    f"예수 {nc:,.0f}원 · 총평 {total:,.0f}원"
+                )
+    return nc, total
+
+
 def coalesce_ledger_kis_labels(
     market: str,
     state: dict,
@@ -272,6 +495,7 @@ def coalesce_ledger_kis_labels(
     """
     part = kis_snap_part if isinstance(kis_snap_part, dict) else {}
     snap_total = float(part.get("total", 0) or 0)
+    snap_cash_raw = float(part.get("cash", 0) or 0)
     hc = float(holdings_current or 0.0)
     m = _market_norm(market)
     cash = display_cash_from_state(state, m, part)
@@ -279,13 +503,29 @@ def coalesce_ledger_kis_labels(
         cash = float(cash_guess or 0.0)
 
     ref_total = snap_total if snap_total > 0 else float(total_guess or 0.0)
+    min_sold = 25_000.0 if m == "KR" else 25.0
     if hc <= 0 and ref_total > max(cash, 0.0) * 1.02:
         cash = ref_total
         total = ref_total
     elif hc > 0 and ref_total > 0:
-        if cash >= ref_total * 0.95:
+        prev_implied_stock = max(0.0, snap_total - snap_cash_raw) if snap_total > 0 else 0.0
+        stock_sold = max(0.0, prev_implied_stock - hc)
+        live_total = float(cash) + hc
+        if (
+            prev_implied_stock > 0
+            and hc > prev_implied_stock * 1.08
+            and cash >= snap_cash_raw * 0.85
+        ):
             cash = max(0.0, ref_total - hc)
-        elif cash + hc > ref_total * 1.12:
+        elif (
+            stock_sold >= min_sold
+            and ref_total > live_total * 1.02
+            and cash < snap_cash_raw + stock_sold * 0.5
+        ):
+            cash = max(0.0, snap_cash_raw + stock_sold)
+        elif cash >= ref_total * 0.95:
+            cash = max(0.0, ref_total - hc)
+        elif cash + hc > ref_total * 1.05:
             cash = max(0.0, ref_total - hc)
 
     total = float(cash) + hc
@@ -309,7 +549,13 @@ def persist_kr_cash_from_balance(bal: dict, state: dict) -> None:
 
         if kis_response_rate_limited(bal):
             return
-        cash, total = parse_kr_cash_total(bal.get("output2", []), _to_float)
+        cash, total_parsed = parse_kr_cash_total(bal.get("output2", []), _to_float)
+        from run_bot import _calc_kr_holdings_metrics
+
+        stock = float(_calc_kr_holdings_metrics(bal).get("current", 0.0) or 0.0)
+        if stock <= 0 and total_parsed > cash:
+            stock = max(0.0, float(total_parsed) - float(cash))
+        cash, total = _sanitize_kis_cash_total_persist("KR", state, float(cash), stock)
         if cash > 0 or total > 0:
             write_kis_display_snapshot_part(
                 state, "KR", cash=float(cash), total=float(total), force=True
@@ -324,7 +570,6 @@ def persist_us_cash_from_balance(bal: dict, state: dict) -> None:
         return
     try:
         from api.kis_parsers import (
-            compute_us_stock_value_from_output,
             kis_response_rate_limited,
             parse_us_cash_fallback,
         )
@@ -332,10 +577,21 @@ def persist_us_cash_from_balance(bal: dict, state: dict) -> None:
 
         if kis_response_rate_limited(bal):
             return
+        from run_bot import (
+            _compute_us_stock_value_from_output,
+            _recover_us_cash_from_output2_if_needed,
+            _resolve_us_display_cash,
+            get_us_cash_real,
+            kis_api,
+        )
+
         out2 = bal.get("output2", {})
-        cash = float(parse_us_cash_fallback(out2, _to_float))
-        stock = float(compute_us_stock_value_from_output(bal, out2, _to_float))
-        total = cash + stock
+        cash = _resolve_us_display_cash(kis_api.broker_us, out2, refresh=False)
+        if cash <= 0:
+            cash = float(get_us_cash_real(kis_api.broker_us) or 0.0)
+            cash = float(_recover_us_cash_from_output2_if_needed(cash, out2))
+        stock = float(_compute_us_stock_value_from_output(bal, out2))
+        cash, total = _sanitize_kis_cash_total_persist("US", state, cash, stock)
         if cash > 0 or total > 0:
             write_kis_display_snapshot_part(
                 state, "US", cash=cash, total=total, force=True
@@ -352,29 +608,33 @@ def update_circuit_aux_from_ledger(
     estimate_usdkrw: Callable[[], float],
     coin_equity_krw: float | None = None,
 ) -> dict[str, Any]:
-    """Phase5·표시용 ``circuit_aux_last_*`` — KIS 없이 장부+시세로 갱신."""
+    """Phase5·표시용 ``circuit_aux_last_*`` — KIS 없이 장부+시세로 갱신.
+
+    매수 후 예수 미반영(스냅샷 예수 높음+장부 보유 증가)이면 ``coalesce`` 로 역산한다.
+    """
     kr_bal = synthetic_kr_balance_dict(state, resolve_kr_price=resolve_kr_price)
     us_bal = synthetic_us_balance_dict(state, resolve_us_price=resolve_us_price)
-    from api.kis_parsers import parse_kr_cash_total
 
     try:
-        from run_bot import _to_float
+        from run_bot import _calc_kr_holdings_metrics, _calc_us_holdings_metrics
 
-        _, kr_total = parse_kr_cash_total(kr_bal.get("output2", []), _to_float)
+        kr_h = float(_calc_kr_holdings_metrics(kr_bal).get("current", 0.0) or 0.0)
+        us_h = float(_calc_us_holdings_metrics(us_bal).get("current", 0.0) or 0.0)
     except Exception:
-        kr_total = kis_display_total(state, "KR")
+        kr_h = 0.0
+        us_h = 0.0
 
-    us_total = kis_display_total(state, "US")
-    try:
-        out2 = us_bal.get("output2", {})
-        if isinstance(out2, dict):
-            cash_u = float(out2.get("frcr_dncl_amt_2", 0) or 0)
-            stock_u = float(out2.get("ovrs_stck_evlu_amt", 0) or 0)
-            est = cash_u + stock_u
-            if est > 0:
-                us_total = est
-    except Exception:
-        pass
+    snap = state.get("last_kis_display_snapshot") if isinstance(state.get("last_kis_display_snapshot"), dict) else {}
+    kr_part = snap.get("kr") if isinstance(snap.get("kr"), dict) else {}
+    us_part = snap.get("us") if isinstance(snap.get("us"), dict) else {}
+    kr_cash, kr_total = coalesce_ledger_kis_labels(
+        "KR", state, kr_part, kr_h, cash_guess=float(kr_part.get("cash", 0) or 0),
+        total_guess=float(kr_part.get("total", 0) or 0),
+    )
+    us_cash, us_total = coalesce_ledger_kis_labels(
+        "US", state, us_part, us_h, cash_guess=float(us_part.get("cash", 0) or 0),
+        total_guess=float(us_part.get("total", 0) or 0),
+    )
 
     coin_k = (
         float(coin_equity_krw)

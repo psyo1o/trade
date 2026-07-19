@@ -45,6 +45,64 @@ class TestExitLineNoPctCap(unittest.TestCase):
         self.assertGreater(tech, 0)
         self.assertLess(tech, buy)
 
+    def test_v8_final_exit_not_above_entry_before_profit(self):
+        """미익절·미락: 20MA−ATR이 평단 위여도 매도선은 평단 이하."""
+        buy = 84.5567
+        # 고점=평단, 초기 손절은 평단 아래 — 기술선만 평단 위로 뜨는 케이스
+        pos = {
+            "buy_p": buy,
+            "max_p": buy,
+            "sl_p": 80.33,
+            "current_atr": 0.55,
+            "scale_out_done": False,
+        }
+        # 상승 추세 봉 → ma20−ATR 이 평단 근처/위로 잡히기 쉬움
+        ohlcv = []
+        for i in range(60):
+            c = buy * (0.97 + i * 0.001)
+            ohlcv.append(
+                {"o": c * 0.999, "h": c * 1.01, "l": c * 0.99, "c": c, "v": 1e6}
+            )
+        line = get_final_exit_price("TLT", buy, pos, ohlcv)
+        self.assertLessEqual(line, buy + 1e-9)
+        self.assertGreater(line, 0)
+
+    def test_v8_check_pro_exit_safety_net_blocks_instant_out(self):
+        """평단 이상 최종선 → 비교 직전 ATR×1.5(없으면 -5%)로 내려 Instant Out 방지."""
+        import strategy.rules as rules
+        from strategy.rules import check_pro_exit
+
+        buy = 100.0
+        pos = {
+            "buy_p": buy,
+            "avg_price": buy,
+            "max_p": buy,
+            "sl_p": buy * 1.02,
+            "current_atr": 2.0,
+            "entry_atr": 4.0,
+            "scale_out_done": False,
+        }
+        ohlcv = [{"o": buy, "h": buy * 1.01, "l": buy * 0.99, "c": buy, "v": 1e6}] * 60
+        orig = rules.get_final_exit_price
+        try:
+            rules.get_final_exit_price = lambda *a, **k: buy * 1.02
+            exited, _reason = check_pro_exit("TEST", buy, pos, ohlcv)
+        finally:
+            rules.get_final_exit_price = orig
+        self.assertFalse(exited)
+        # entry_atr 우선: 100 - 1.5*4 = 94
+        self.assertAlmostEqual(pos["sl_p"], buy - 1.5 * 4.0, places=4)
+        self.assertLess(pos["sl_p"], buy)
+
+    def test_v8_initial_stop_safety_net_pct_fallback(self):
+        from strategy.rules import V8_INITIAL_STOP_BELOW_ENTRY_MULT, _v8_initial_stop_safety_net
+
+        buy = 50.0
+        pos = {"max_p": buy, "scale_out_done": False}
+        out = _v8_initial_stop_safety_net(buy, buy, pos)
+        self.assertAlmostEqual(out, buy * V8_INITIAL_STOP_BELOW_ENTRY_MULT, places=6)
+
+
     def test_swing_hard_floor_fib_cloud_only(self):
         buy = 100.0
         pos = {
@@ -61,7 +119,9 @@ class TestExitLineNoPctCap(unittest.TestCase):
         import run_bot as rb
 
         buy = 140_100.0
-        lock = buy * 1.005
+        from strategy.rules import BREAKEVEN_LOCK_MULT
+
+        lock = buy * BREAKEVEN_LOCK_MULT
         pos_done = {"scale_out_done": True}
         pos_open = {"scale_out_done": False}
         self.assertTrue(rb._v8_loss_stop_is_breakeven_lock(buy, pos_done, lock))

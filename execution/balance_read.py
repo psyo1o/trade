@@ -127,21 +127,13 @@ def _ledger_only(refresh: bool) -> bool:
 
 
 def _persist_live_cash(market: str, raw: Any) -> None:
-    if not _kis_balance_cacheable(raw, market):
-        return
-    try:
-        import run_bot as rb
-        from services import ledger_valuation as lv
+    """잔고 캐시 조회 중 스냅샷을 쓰지 않는다.
 
-        st = rb.load_state(rb.STATE_PATH)
-        mk = str(market).strip().upper()
-        if mk == "KR":
-            lv.persist_kr_cash_from_balance(raw, st)
-        elif mk == "US":
-            lv.persist_us_cash_from_balance(raw, st)
-        rb.save_state(rb.STATE_PATH, st)
-    except Exception:
-        pass
+    표시용 ``last_kis_display_snapshot`` 은 ``refresh_and_save_kis_snapshot`` 등
+    명시적 실조회 경로만 갱신한다. TWAP 체결 폴링마다 persist 하면 매수 직후
+    이중합산 보정→재오염이 반복된다 (docs/KIS_GUI_DISPLAY.md).
+    """
+    return
 
 
 def _ledger_balance(market: str) -> Any:
@@ -255,9 +247,19 @@ def kr_stock_qty(ticker: str, *, refresh: bool = False) -> float | None:
     return idem.kis_balance_stock_qty(kr_balance_raw(refresh=refresh), ticker)
 
 
+def kr_stock_avg_price(ticker: str, *, refresh: bool = False) -> float | None:
+    """국장 종목 매입평균가."""
+    return idem.kis_balance_stock_avg_price(kr_balance_raw(refresh=refresh), ticker)
+
+
 def us_stock_qty(ticker: str, *, refresh: bool = False) -> float | None:
     """미장 종목 보유 수량."""
     return idem.kis_balance_stock_qty(us_balance_raw(refresh=refresh), ticker)
+
+
+def us_stock_avg_price(ticker: str, *, refresh: bool = False) -> float | None:
+    """미장 종목 매입평균가."""
+    return idem.kis_balance_stock_avg_price(us_balance_raw(refresh=refresh), ticker)
 
 
 def coin_stock_qty(ticker: str, *, refresh: bool = False) -> float | None:

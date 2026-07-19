@@ -119,6 +119,120 @@ def test_coalesce_after_full_liquidation_uses_snapshot_total():
     assert total == 1_500_000.0
 
 
+def test_coalesce_after_buy_stale_cash_inflates_total():
+    """매수 후 옛 예수($1240)+신규 보유 — coalesce가 예수 역산."""
+    state = {
+        "last_kis_display_snapshot": {
+            "us": {"cash": 1_240.58, "total": 2_289.48},
+        },
+    }
+    snap = state["last_kis_display_snapshot"]["us"]
+    cash, total = coalesce_ledger_kis_labels(
+        "US",
+        state,
+        snap,
+        holdings_current=2_209.0,
+        cash_guess=1_240.58,
+        total_guess=3_449.0,
+    )
+    assert cash < 100.0
+    assert abs(total - (cash + 2_209.0)) < 1.0
+
+
+def test_coalesce_partial_sell_settlement_lag():
+    """부분 매도 후 예수만 API 지연 — 스냅샷 총평 유지·예수 보정."""
+    state = {
+        "last_kis_display_snapshot": {
+            "us": {"cash": 957.40, "total": 2466.12},
+        },
+    }
+    snap = state["last_kis_display_snapshot"]["us"]
+    cash, total = coalesce_ledger_kis_labels(
+        "US",
+        state,
+        snap,
+        holdings_current=1176.14,
+        cash_guess=957.40,
+        total_guess=2133.54,
+    )
+    assert total > 2400.0
+    assert cash > 1250.0
+    assert abs(total - (cash + 1176.14)) < 1.0
+
+
+def test_sanitize_persist_blocks_stale_cash_after_buy():
+    state = {
+        "last_kis_display_snapshot": {
+            "us": {"cash": 1_240.58, "total": 2_289.48},
+        },
+    }
+    from services.ledger_valuation import _sanitize_kis_cash_total_persist
+
+    cash, total = _sanitize_kis_cash_total_persist("US", state, 1_240.58, 2_209.0)
+    assert cash < 100.0
+    assert abs(total - 2_289.48) < 5.0
+
+
+def test_sanitize_persist_blocks_cash_rebound_after_buy_correction():
+    """1차 이중합산 역산 후 API 예수($950) 재유입 → 총평 부풀림 차단."""
+    import time
+
+    from services.ledger_valuation import _sanitize_kis_cash_total_persist
+
+    state = {
+        "last_kis_display_snapshot": {
+            "us": {
+                "cash": 19.97,
+                "total": 3_498.55,
+                "_buy_cash_guard": {
+                    "cash": 19.97,
+                    "total": 3_498.55,
+                    "ts": time.time(),
+                },
+            },
+        },
+    }
+    cash, total = _sanitize_kis_cash_total_persist("US", state, 950.52, 3_478.0)
+    assert cash < 50.0
+    assert total < 3_600.0
+    assert abs(total - (cash + 3_478.0)) < 1.0
+
+
+def test_sanitize_persist_repairs_inflated_snap_via_recent_buy():
+    """이미 오염된 스냅샷($950+$TLT) — 최근 매입대금으로 예수 복구."""
+    import time
+
+    from services.ledger_valuation import _sanitize_kis_cash_total_persist
+
+    state = {
+        "last_kis_display_snapshot": {
+            "us": {"cash": 950.52, "total": 4_428.83},
+        },
+        "positions": {
+            "TLT": {
+                "qty": 11,
+                "buy_p": 84.56,
+                "buy_time": time.time() - 60,
+            },
+            "AAPL": {
+                "qty": 3,
+                "buy_p": 315.36,
+                "buy_time": time.time() - 3 * 86400,
+            },
+        },
+    }
+    cash, total = _sanitize_kis_cash_total_persist("US", state, 950.52, 3_478.0)
+    assert abs(cash - (950.52 - 11 * 84.56)) < 1.0
+    assert cash < 50.0
+    assert total < 3_600.0
+
+
+def test_persist_live_cash_is_noop():
+    from execution.balance_read import _persist_live_cash
+
+    assert _persist_live_cash("US", {"rt_cd": "0", "output2": {}}) is None
+
+
 def test_kis_display_total_prefers_ledger_only_aux():
     from services.ledger_valuation import kis_display_total
 
