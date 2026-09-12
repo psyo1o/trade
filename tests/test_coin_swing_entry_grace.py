@@ -42,7 +42,7 @@ class TestCoinSwingEntryGrace(unittest.TestCase):
         self.assertFalse(
             rb._coin_swing_entry_noise_defers_tech_floor_full(
                 sw_action="FULL",
-                sw_reason="스윙 5MA 러너 이탈 (현재가: 1 < 5MA: 2)",
+                sw_reason="스윙 10MA 러너 이탈 (현재가: 1 < 10MA: 2)",
                 hours_held=0.5,
                 profit_rate_pct=5.0,
             )

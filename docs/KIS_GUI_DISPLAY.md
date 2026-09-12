@@ -120,13 +120,38 @@ Phase5·서킷: [`PHASE5_ACCOUNT_CIRCUIT.md`](PHASE5_ACCOUNT_CIRCUIT.md)
 2. `_sanitize_kis_cash_total_persist` 가 1차로 `prev_total − stock` 역산한 뒤, 다음 조회에서 `stock_grew` 조건이 깨져 **재오염**.  
 3. (과거) 잔고 폴링마다 `persist_us_cash_from_balance` 가 `force=True` 로 스냅샷을 씀.
 
-**대응 (`services/ledger_valuation._sanitize_kis_cash_total_persist`):**
+**대응 (Phase 2 — `services/ledger_valuation._sanitize_kis_cash_total_persist`):**
 
-- Case B: 보유 증가 + 예수 정체 + 총평 부풀림 → 예수 역산, `_buy_cash_guard` 저장(24h).  
-- Case B2: 가드/저예수 스냅샷 위에서 API 예수가 다시 튀면 **재오염 차단**.  
-- Case B3: 최근 매입대금(`buy_time` 24h 이내)이 예수에 그대로 남은 형태면 잔여 예수로 복구.
+표시 전용 3규칙. **서킷·MDD는 `market_equity_for_risk`** — sanitize 결과를 쓰지 않는다.
 
-로그: `persist 예수·총평 이중합산 추정` / `이중합산 재오염 차단` / `최근매수 예수 미반영 보정`.
+| 규칙 | 요약 |
+|------|------|
+| **Rule1** | 이중합산 — 총평↑·예수 정체 → `prev_total − stock` 역산 |
+| **Rule1b** | 보유 정체·예수=`현금+보유`/`직전총평` → 역산 (마감 후 재발 방지) |
+| **Rule2** | 예수 미차감 / 매수 후 예수 0 → 최근 매입대금(`buy_time` 24h) 차감 |
+| **Rule3** | 매도 없이 총평 10%↓ → 직전 총평 유지 (매수 직후 고정) |
+
+레거시 `_buy_cash_guard` 키는 읽을 때 무시·저장 시 삭제 (Phase 2).
+
+### 3.2 국장 예수·총평 필드 (한투 TTTC8434R)
+
+개발자센터 앱 설정이나 `FUND_STTL_ICLD_YN` 으로는 안 바뀐다. **응답 필드를 문서대로 고르는 문제**다.
+
+| 필드 | 한투 의미 | 봇에서 |
+|------|-----------|--------|
+| `dnca_tot_amt` | 예수금총금액 | **표시 예수** |
+| `prvs_rcdl_excc_amt` | D+2 가수도 (주문가능) | 매수 예산. 당일 매수 직후 0일 수 있음 |
+| `scts_evlu_amt` | 유가평가 | 보유 평가 |
+| `tot_evlu_amt` | 유가 + **D+2만** | 표시 총평으로 쓰지 않음 |
+| `nass_amt` | 순자산 | **표시 총평** |
+
+당일 매수 후 D+2=0 이면 `tot_evlu_amt` 가 보유평가만 남아 GUI 예수 0·총평 급감처럼 보였다. `parse_kr_cash_total` 은 `dnca`·`nass` 를 쓴다.
+
+**매도 직후 (2026-08-24):** MTS는 예수(dnca)만 낮고 D+2·총자산은 매도대금 포함인 경우가 많다.  
+- 파서: 보유≈0이면 `total = max(nass, tot_evlu, D+2, …)`  
+- **보유 0(전액 현금)이면 표시 예수 = 총평 = NAV** (dnca만 보여 예수≠총평이 되지 않게)  
+- GUI 강제 새로고침: `max(cash+hold, nav)`. 로그 `📌 [KR raw]`.  
+- 매수 예산만 `prvs_rcdl_excc_amt`(D+2) — `parse_kr_orderable_cash`.
 
 ---
 

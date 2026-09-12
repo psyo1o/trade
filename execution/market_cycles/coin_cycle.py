@@ -35,10 +35,13 @@ def run_coin_cycle(ctx: TradingCycleContext) -> None:
         held_coins = rb._extract_held_coins_from_balances(balances)
 
         total_coin_equity = rb._compute_total_coin_equity_from_balances(balances, float(krw_on_book))
+        total_coin_native = rb._compute_total_coin_equity_native_from_balances(
+            balances, float(krw_on_book)
+        )
         krw_bal_snap = float(krw_bal)
         total_coin_equity_snap = float(total_coin_equity)
 
-        state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
+        rb.coin_broker.persist_circuit_aux_coin(state, float(total_coin_native))
         rb.save_state(rb.STATE_PATH, state)
 
         # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
@@ -430,7 +433,10 @@ def run_coin_cycle(ctx: TradingCycleContext) -> None:
         krw_on_book, krw_bal = rb._compute_coin_krw_balances(balances)
         held_coins = rb._extract_held_coins_from_balances(balances)
         total_coin_equity = rb._compute_total_coin_equity_from_balances(balances, float(krw_on_book))
-        state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
+        total_coin_native = rb._compute_total_coin_equity_native_from_balances(
+            balances, float(krw_on_book)
+        )
+        rb.coin_broker.persist_circuit_aux_coin(state, float(total_coin_native))
         try:
             coin_m = rb._calc_coin_holdings_metrics(balances, state.get("positions"))
             rb.save_last_coin_display_snapshot(
@@ -448,13 +454,11 @@ def run_coin_cycle(ctx: TradingCycleContext) -> None:
                 f"총평가 {float(total_coin_equity):,.0f}원 (매수·비중·보유패스 기준)"
             )
 
-        # 매수는 MDD → Phase5 체크 후 실행 (Phase4·헷지는 buy_cycle 내부 — KR/US 동일)
-        if not rb.check_mdd_break("COIN", total_coin_equity, state, rb.STATE_PATH):
-            print("  -> 🚨 코인 MDD 브레이크 작동 중. 신규 매수 중단.")
-        elif macro_mult <= 0:
+        # 매수는 Phase4 거시 → Phase5 쿨다운 (Phase4·헷지는 buy_cycle 내부 — KR/US 동일)
+        if macro_mult <= 0:
             print(f"  -> 🚨 코인 Phase4 거시 방어막: 신규 매수 중단. ({macro_reason})")
         elif rb.in_account_circuit_cooldown(state, "COIN"):
-            print("  -> 🚨 코인 Phase5 비중 서킷 쿨다운 — 신규 매수 중단.")
+            print("  -> 🚨 코인 Phase5 서킷 쿨다운 — 신규 매수 중단.")
         else:
             # 업비트·바이낸스 동일: KST 일봉(09:00) 직전 N분 창 — 국·미 ``마감 직전 창`` 과 같은 패턴.
             now_coin = datetime.now(pytz.timezone("Asia/Seoul"))

@@ -1,0 +1,20 @@
+---
+description: 유료 LLM(Gemini/OpenAI) 기능은 라이브 스모크 전 배포 금지
+alwaysApply: true
+---
+
+# LLM·유료 API 배포 전 (필수)
+
+Gemini/OpenAI를 호출하는 코드를 **운영 봇에 넣기 전** 반드시:
+
+1. **단위 테스트** — `pytest tests/test_phase5_ai_liquidation.py tests/test_gemini_models.py tests/test_phase5_no_holdings_skip.py -q`
+2. **라이브 스모크 1회** — `python scripts/smoke_phase5_ai.py` → `llm_success=True` 확인
+3. **프로브는 `--quick`만** — `python scripts/probe_gemini_models.py` (전체 모델 나열은 `--full`, 운영 키로 반복 금지)
+
+## 코드 원칙
+
+- Phase5 AI: Gemini **모델 1개**만 시도 → 실패 시 OpenAI 폴백 → **1시간 LLM 쿨다운**
+- 404·429는 **재시도하지 않음** (모델·한도 문제는 반복해도 동일)
+- 보유 0이면 지수·AI·청산 **전부 스킵**
+
+CHANGELOG·CURRENT에 「라이브 스모크 완료」 여부를 남긴다.

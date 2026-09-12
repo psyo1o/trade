@@ -6,10 +6,13 @@
     * ``positions`` — 티커별 ``buy_p``, ``sl_p``, ``tier``, ``qty``(실계좌·매수 시 동기화, 주말 GUI 표시) 등.
     * ``cooldown`` — 매수 직후 짧은 재진입 방지(분 단위, ``in_cooldown``).
     * ``ticker_cooldowns`` — **매도 후** 티커별 절대 만료 시각(ISO). 매도 사유별(익절 1h·손절·타임스탑 24h); 분할 익절 잔량 시 미부여.
-    * ``peak_equity_{KR|US|COIN}`` — 시장별 MDD 브레이크용 고점.
+    * ``peak_equity_{KR|US|COIN}`` — 시장별 MDD 고점. KR=원, US=USD,
+      COIN=업비트 원 / 바이낸스 USDT (``peak_equity_COIN_unit``).
+    * ``circuit_aux_last_coin_native`` — COIN 현재 잔고(견적 통화). ``circuit_aux_last_coin_krw`` 는 합산·비중용 원화.
     * ``peak_total_equity`` / ``last_reset_week`` — (레거시) 합산 서킷·월요일 앵커.
-    * ``phase5_share_anchor`` — 시장별 포트폴리오 비중 앵커(KR/US/COIN).
+    * ``phase5_share_anchor`` — 시장별 포트폴리오 비중 앵커(옵션 비중 서킷).
     * ``account_circuit_market_cooldowns`` — 시장별 서킷 쿨다운(해당 시장 매수만 차단).
+    * ``account_circuit_mode`` — ``per_market_index``(기본) / ``per_market_mdd``(레거시) / ``share`` / ``total``.
 
 V7.1: 모든 보유 종목을 액티브 매매·샹들리에 동일 적용. 포지션별 ``scale_out_done`` 은
 ``load_state`` 시 기본값 ``false`` 로 보강된다.
@@ -197,6 +200,7 @@ def _backup_state_file_before_save(path: Path) -> None:
             return
         bak = path.parent / f"{path.stem}.bak"
         shutil.copy2(path, bak)
+        # 날짜 아카이브는 세션 경계(국·미 시가/종가)에서만 — execution.state_backup
     except Exception:
         pass
 
@@ -295,18 +299,10 @@ def can_open_new(ticker, state, max_positions=5): # 메인에서 안 던져주�
         return us_count < max_positions
 
 def check_mdd_break(market_type, current_equity, state, path):
-    """🛡️ 실시간 자산을 기준으로 고점 대비 5% 하락 시 매수 중단 로직"""
-    peak_key = f"peak_equity_{market_type}"
-    peak_equity = state.get(peak_key, current_equity)
-    
-    if current_equity > peak_equity:
-        state[peak_key] = current_equity
-        save_state(path, state)
-        return True
-    
-    if current_equity < peak_equity * 0.95:
-        print(f"  -> 🚨 [{market_type}] MDD 브레이크 발동! (고점 대비 -5% 하락). 신규 매수 차단.")
-        return False
+    """폐지됨 — 계좌 보호는 Phase5(`account_circuit_mdd_pct` 기본 15%)만.
+
+    호환용 스텁: 항상 True(매수 허용). 고점 갱신·-5% 차단·MDD 브레이크 로그 없음.
+    """
     return True
 
 
@@ -320,9 +316,14 @@ PHASE5_LAST_LOOP_TOTAL_KEY = "phase5_last_loop_total_krw"
 PHASE5_SHARE_ANCHOR_KEY = "phase5_share_anchor"
 PHASE5_MARKET_COOLDOWNS_KEY = "account_circuit_market_cooldowns"
 PHASE5_PENDING_LIQUIDATION_MARKETS_KEY = "phase5_pending_liquidation_markets"
+ACCOUNT_CIRCUIT_MODE_KEY = "account_circuit_mode"
+PHASE5_LAST_LOOP_EQUITY_BY_MARKET_KEY = "phase5_last_loop_equity_by_market"
+ACCOUNT_CIRCUIT_MARKET_PEAK_RESET_PENDING_KEY = "account_circuit_market_peak_reset_pending"
+PEAK_EQUITY_COIN_UNIT_KEY = "peak_equity_COIN_unit"  # "KRW" | "USDT"
 # KIS 미장 개장 직후 합산 급등 오발동 방지 (peak 상향만 동결·MDD 판정은 유지)
 PHASE5_US_OPEN_FREEZE_MINUTES = 5
 PHASE5_PEAK_SPIKE_JUMP_PCT = 5.0
+PHASE5_POST_BUY_GRACE_SEC = 3600.0
 
 
 def _seoul_now() -> datetime:
@@ -395,15 +396,24 @@ def is_us_regular_open_peak_freeze_kst(dt: datetime | None = None) -> bool:
     return start <= t <= end
 
 
-def phase5_peak_raise_block_reason(state: dict, current_total_krw: float, dt: datetime | None = None) -> str:
+def phase5_peak_raise_block_reason(
+    state: dict,
+    current_total_krw: float,
+    dt: datetime | None = None,
+    *,
+    prev_equity: float | None = None,
+    market: str | None = None,
+) -> str:
     """
     고점 **상향** 갱신을 막아야 할 때 사유 문자열, 허용 시 빈 문자열.
 
-    * 미장 개장 직후 5분 동결
+    * 미장 개장 직후 5분 동결 (합산·US 고점만. KR/COIN 은 제외)
     * 직전 루프 대비 +5% 이상 급등(더티 틱)
     """
     cur = float(current_total_krw)
-    if is_us_regular_open_peak_freeze_kst(dt):
+    mk = str(market or "").strip().upper()
+    apply_us_freeze = mk in ("", "US", "TOTAL")
+    if apply_us_freeze and is_us_regular_open_peak_freeze_kst(dt):
         seoul = dt or _seoul_now()
         if seoul.tzinfo is None:
             seoul = seoul.replace(tzinfo=ZoneInfo("Asia/Seoul"))
@@ -412,10 +422,16 @@ def phase5_peak_raise_block_reason(state: dict, current_total_krw: float, dt: da
         start, end = _us_open_peak_freeze_window_kst(seoul)
         return f"us_open_freeze({start.strftime('%H:%M')}~{end.strftime('%H:%M')} KST)"
 
-    try:
-        prev = float(state.get(PHASE5_LAST_LOOP_TOTAL_KEY, 0.0) or 0.0)
-    except (TypeError, ValueError):
-        prev = 0.0
+    if prev_equity is not None:
+        try:
+            prev = float(prev_equity or 0.0)
+        except (TypeError, ValueError):
+            prev = 0.0
+    else:
+        try:
+            prev = float(state.get(PHASE5_LAST_LOOP_TOTAL_KEY, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            prev = 0.0
     if prev > 0.0 and cur > prev:
         jump_pct = (cur - prev) / prev * 100.0
         if jump_pct >= PHASE5_PEAK_SPIKE_JUMP_PCT:
@@ -526,7 +542,344 @@ def set_market_circuit_cooldown(
     cds = _market_cooldowns_map(state)
     cds[mk] = until.isoformat(timespec="seconds")
     state[PHASE5_MARKET_COOLDOWNS_KEY] = cds
+    pending = state.get(ACCOUNT_CIRCUIT_MARKET_PEAK_RESET_PENDING_KEY)
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[mk] = True
+    state[ACCOUNT_CIRCUIT_MARKET_PEAK_RESET_PENDING_KEY] = pending
     save_state(path, state)
+
+
+def peak_equity_market_key(market: str) -> str:
+    return f"peak_equity_{str(market or '').strip().upper()}"
+
+
+def get_phase5_peak_market_equity(state: dict, market: str) -> float:
+    """시장별 트레일링 고점 — KR=원, US=USD, COIN=견적통화(원|USDT)."""
+    try:
+        return float(state.get(peak_equity_market_key(market), 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def phase5_coin_unit_label(unit: str | None = None) -> str:
+    from api import coin_broker
+
+    u = str(unit or coin_broker.coin_equity_quote_unit()).upper()
+    return "USDT" if u == "USDT" else "원"
+
+
+def migrate_coin_peak_unit_if_needed(
+    state: dict,
+    current_native: float,
+    path: Path,
+) -> bool:
+    """바이낸스 USDT / 업비트 원 전환 시 peak 단위 불일치 → 현재값으로 리셋.
+
+    구버전 peak_equity_COIN(원)을 USDT 현재와 비교하면 즉시 ~99% DD 오발동.
+    """
+    from api import coin_broker
+
+    want = coin_broker.coin_equity_quote_unit()
+    have = str(state.get(PEAK_EQUITY_COIN_UNIT_KEY, "") or "").strip().upper()
+    cur = max(0.0, float(current_native or 0.0))
+    peak = get_phase5_peak_market_equity(state, "COIN")
+
+    # 단위 키 없고 peak 도 없으면 현재 단위만 기록
+    if not have and peak <= 0 and cur <= 0:
+        state[PEAK_EQUITY_COIN_UNIT_KEY] = want
+        return False
+
+    need_reset = False
+    if have and have != want:
+        need_reset = True
+    elif not have and want == "USDT" and peak > 0 and cur > 0:
+        # 레거시: 원 고점 vs USDT 현재 (고점이 현재의 수십 배)
+        if peak > cur * 20.0:
+            need_reset = True
+        elif peak < cur * 0.05:
+            # 반대로 이미 USDT처럼 보이면 단위만 기록
+            state[PEAK_EQUITY_COIN_UNIT_KEY] = want
+            return False
+        else:
+            # 애매하면 안전하게 리셋
+            need_reset = True
+    elif not have:
+        state[PEAK_EQUITY_COIN_UNIT_KEY] = want
+        return False
+
+    if not need_reset:
+        if have != want:
+            state[PEAK_EQUITY_COIN_UNIT_KEY] = want
+        return False
+
+    old_peak = peak
+    if cur > 0:
+        state[peak_equity_market_key("COIN")] = cur
+    else:
+        state[peak_equity_market_key("COIN")] = 0.0
+    state[PEAK_EQUITY_COIN_UNIT_KEY] = want
+    last = state.get(PHASE5_LAST_LOOP_EQUITY_BY_MARKET_KEY)
+    if not isinstance(last, dict):
+        last = {}
+    if cur > 0:
+        last["COIN"] = cur
+    state[PHASE5_LAST_LOOP_EQUITY_BY_MARKET_KEY] = last
+    unit_lbl = phase5_coin_unit_label(want)
+    print(
+        f"  📌 [Phase5·COIN] 고점 단위 마이그레이션 {have or 'legacy'}→{want}: "
+        f"{old_peak:,.2f} → {cur:,.2f}{unit_lbl} (오발동 방지 리셋)"
+    )
+    try:
+        save_state(path, state)
+    except Exception:
+        pass
+    return True
+
+
+def _last_loop_equity_map(state: dict) -> dict[str, float]:
+    raw = state.get(PHASE5_LAST_LOOP_EQUITY_BY_MARKET_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for mk in ("KR", "US", "COIN"):
+        try:
+            v = float(raw.get(mk, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            out[mk] = v
+    return out
+
+
+def _ledger_holdings_value_native(state: dict, market: str) -> float:
+    """장부 보유평가. KR=원, US=USD. (ledger_valuation.ledger_holdings_value_native 위임)"""
+    from services.ledger_valuation import ledger_holdings_value_native
+
+    return ledger_holdings_value_native(state, market)
+
+
+def _is_label_correction_equity_drop(peak: float, cur: float, stock_v: float, *, market: str) -> bool:
+    """총평 이중합산이 풀린 형태: (고점 - 현재) ≈ 보유평가."""
+    mk = str(market or "").strip().upper()
+    min_gap = 50.0 if mk == "US" else 10_000.0
+    if peak <= 0 or cur <= 0 or stock_v < min_gap:
+        return False
+    if cur >= peak * 0.92:
+        return False
+    gap = peak - cur
+    if gap < min_gap:
+        return False
+    return abs(gap - stock_v) <= max(stock_v * 0.15, min_gap)
+
+
+def market_in_post_buy_grace(
+    state: dict,
+    market: str,
+    *,
+    grace_sec: float = PHASE5_POST_BUY_GRACE_SEC,
+) -> bool:
+    """최근 매수 직후 KIS 잔고 불안정 구간 — 해당 시장 Phase5 판정 유예."""
+    mk = str(market or "").strip().upper()
+    if mk not in ("KR", "US"):
+        return False
+    positions = state.get("positions")
+    if not isinstance(positions, dict):
+        return False
+    now = time.time()
+    for code, pos in positions.items():
+        if not isinstance(pos, dict):
+            continue
+        ticker = str(code).strip()
+        is_kr = ticker.isdigit() and len(ticker) == 6
+        if mk == "KR" and not is_kr:
+            continue
+        if mk == "US" and (is_kr or is_coin_ticker(ticker)):
+            continue
+        try:
+            bt = float(pos.get("buy_time") or 0)
+        except (TypeError, ValueError):
+            bt = 0.0
+        if bt > 0 and (now - bt) < float(grace_sec):
+            return True
+    return False
+
+
+def market_for_ticker(ticker: str) -> str | None:
+    """티커 → KR / US / COIN (장부 키 기준)."""
+    t = str(ticker or "").strip()
+    if not t:
+        return None
+    if t.isdigit() and len(t) == 6:
+        return "KR"
+    if is_coin_ticker(t):
+        return "COIN"
+    return "US"
+
+
+def _release_phantom_market_circuit(state: dict, market: str) -> None:
+    """잔고 라벨 보정으로 생긴 시장 서킷·대기청산을 해제한다."""
+    mk = str(market or "").strip().upper()
+    cds = _market_cooldowns_map(state)
+    if mk in cds:
+        cds.pop(mk, None)
+        if cds:
+            state[PHASE5_MARKET_COOLDOWNS_KEY] = cds
+        else:
+            state.pop(PHASE5_MARKET_COOLDOWNS_KEY, None)
+        print(f"  📌 [Phase5·{mk}] 잔고 라벨 보정 — 서킷 쿨다운 해제")
+    pending_reset = state.get(ACCOUNT_CIRCUIT_MARKET_PEAK_RESET_PENDING_KEY)
+    if isinstance(pending_reset, dict) and pending_reset.get(mk):
+        pending_reset[mk] = False
+        state[ACCOUNT_CIRCUIT_MARKET_PEAK_RESET_PENDING_KEY] = pending_reset
+    raw = state.get(PHASE5_PENDING_LIQUIDATION_MARKETS_KEY)
+    if isinstance(raw, list):
+        kept = [str(x).strip().upper() for x in raw if str(x).strip() and str(x).strip().upper() != mk]
+        if kept != [str(x).strip().upper() for x in raw if str(x).strip()]:
+            if kept:
+                state[PHASE5_PENDING_LIQUIDATION_MARKETS_KEY] = kept
+                state["phase5_pending_liquidation"] = True
+            else:
+                state.pop(PHASE5_PENDING_LIQUIDATION_MARKETS_KEY, None)
+                state["phase5_pending_liquidation"] = False
+            print(f"  📌 [Phase5·{mk}] 잔고 라벨 보정 — 대기 청산 취소")
+
+
+def apply_phase5_trailing_market_peaks(
+    state: dict,
+    equities: dict[str, float],
+    path: Path,
+) -> None:
+    """
+    시장별 ``peak_equity_*`` 상향 추적·쿨다운 후 리셋.
+
+    ``equities`` 단위: KR=원, US=USD, COIN=견적통화(업비트 원 / 바이낸스 USDT).
+    월요일 주차 리셋은 하지 않는다 (Phase5 시장별 고점만 — 5% MDD 매수 차단은 폐지).
+    """
+    seoul = _seoul_now()
+    last_loop = _last_loop_equity_map(state)
+    pending = state.get(ACCOUNT_CIRCUIT_MARKET_PEAK_RESET_PENDING_KEY)
+    if not isinstance(pending, dict):
+        pending = {}
+    mutated = False
+    new_last: dict[str, float] = dict(last_loop)
+
+    def _unit(mk: str) -> str:
+        if mk == "US":
+            return "USD"
+        if mk == "COIN":
+            return phase5_coin_unit_label(state.get(PEAK_EQUITY_COIN_UNIT_KEY))
+        return "원"
+
+    for mk in ("KR", "US", "COIN"):
+        try:
+            cur = max(0.0, float(equities.get(mk, 0.0) or 0.0))
+        except (TypeError, ValueError):
+            cur = 0.0
+        if cur <= 0.0:
+            continue
+        key = peak_equity_market_key(mk)
+        peak = get_phase5_peak_market_equity(state, mk)
+
+        if pending.get(mk) and not in_market_circuit_cooldown(state, mk):
+            state[key] = cur
+            pending[mk] = False
+            mutated = True
+            print(f"  📌 [Phase5·{mk}] 쿨다운 해제 후 고점 리셋 → {cur:,.2f}{_unit(mk)}")
+            new_last[mk] = cur
+            continue
+
+        if peak <= 0.0:
+            state[key] = cur
+            mutated = True
+            print(f"  📌 [Phase5·{mk}] 시장 고점 초기화 → {cur:,.2f}{_unit(mk)}")
+        elif cur > peak:
+            block = phase5_peak_raise_block_reason(
+                state, cur, seoul, prev_equity=last_loop.get(mk), market=mk
+            )
+            if block:
+                print(
+                    f"  📌 [Phase5·{mk}] 고점 상향 스킵 ({block}) — "
+                    f"peak={peak:,.2f}, current={cur:,.2f}"
+                )
+                # 오염 틱을 last_loop 로 채택하면 다음 루프에 고점이 그대로 올라간다
+                prev_last = float(last_loop.get(mk, 0.0) or 0.0)
+                new_last[mk] = prev_last if prev_last > 0.0 else cur
+                continue
+            state[key] = cur
+            mutated = True
+        elif mk in ("KR", "US"):
+            stock_v = _ledger_holdings_value_native(state, mk)
+            if _is_label_correction_equity_drop(peak, cur, stock_v, market=mk):
+                print(
+                    f"  📌 [Phase5·{mk}] 잔고 라벨 보정으로 고점 정정 "
+                    f"{peak:,.2f}{_unit(mk)} → {cur:,.2f}{_unit(mk)} (보유 {stock_v:,.2f})"
+                )
+                state[key] = cur
+                mutated = True
+                _release_phantom_market_circuit(state, mk)
+                pending = state.get(ACCOUNT_CIRCUIT_MARKET_PEAK_RESET_PENDING_KEY)
+                if not isinstance(pending, dict):
+                    pending = {}
+        new_last[mk] = cur
+
+    state[ACCOUNT_CIRCUIT_MARKET_PEAK_RESET_PENDING_KEY] = pending
+    state[PHASE5_LAST_LOOP_EQUITY_BY_MARKET_KEY] = new_last
+    mutated = True
+    if mutated:
+        save_state(path, state)
+
+
+def adjust_peak_equity_for_capital(
+    state: dict,
+    market: str,
+    delta_native: float,
+) -> float:
+    """
+    입·출금만큼 해당 시장 고점(``peak_equity_*``)을 가감. 반환은 보정 후 고점.
+
+    ``delta_native``: KR=원, US=USD, COIN=견적통화(업비트 원 / 바이낸스 USDT). 출금은 음수.
+    """
+    mk = str(market or "").strip().upper()
+    if mk not in ("KR", "US", "COIN"):
+        return 0.0
+    key = peak_equity_market_key(mk)
+    peak = get_phase5_peak_market_equity(state, mk)
+    new_peak = float(peak) + float(delta_native)
+    if new_peak < 0.0:
+        new_peak = 0.0
+    state[key] = float(new_peak)
+    return float(new_peak)
+
+
+def sync_account_circuit_mode(state: dict, mode: str, path: Path) -> bool:
+    """
+    서킷 모드가 바뀌면 이전 모드의 쿨다운·대기청산을 지운다.
+
+    비중 서킷 오발동 쿨다운이 시장별 MDD 전환 후에도 매수를 막는 것을 방지.
+    """
+    wanted = str(mode or "").strip().lower()
+    if wanted not in ("per_market_index", "per_market_mdd", "share", "total"):
+        wanted = "per_market_mdd"
+    prev = str(state.get(ACCOUNT_CIRCUIT_MODE_KEY, "") or "").strip().lower()
+    if prev == wanted:
+        return False
+    state[ACCOUNT_CIRCUIT_MODE_KEY] = wanted
+    cleared = []
+    if state.pop(PHASE5_MARKET_COOLDOWNS_KEY, None) is not None:
+        cleared.append("시장 쿨다운")
+    if state.pop(ACCOUNT_CIRCUIT_COOLDOWN_KEY, None) is not None:
+        cleared.append("전역 쿨다운")
+    if state.pop(PHASE5_PENDING_LIQUIDATION_MARKETS_KEY, None) is not None:
+        cleared.append("대기청산")
+    if state.get("phase5_pending_liquidation"):
+        state["phase5_pending_liquidation"] = False
+        cleared.append("레거시 pending")
+    state[ACCOUNT_CIRCUIT_PEAK_RESET_PENDING_KEY] = False
+    save_state(path, state)
+    extra = f" ({', '.join(cleared)})" if cleared else ""
+    print(f"  📌 [Phase5] 서킷 모드 {prev or '(없음)'} → {wanted}{extra} — 이전 쿨다운 해제")
+    return True
 
 
 def apply_phase5_share_anchor(

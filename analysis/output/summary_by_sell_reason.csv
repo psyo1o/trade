@@ -1,0 +1,8 @@
+﻿group,trades,win_rate_pct,avg_profit_pct,median_profit_pct,avg_hold_hours,post_exit_n,early_exit_pct,good_exit_pct,median_ret_20d_after_sell,avg_ret_20d_after_sell
+swing_exit,70,37.1,-0.74,-0.7,95.7,64,35.9,23.4,2.19,2.89
+time_stop,26,26.9,-1.84,-0.97,147.6,23,17.4,39.1,-3.4,-2.65
+other,25,64.0,6.92,2.9,313.4,23,39.1,43.5,2.13,1.34
+hard_stop,22,0.0,-8.39,-4.46,88.0,21,19.0,33.3,0.12,-4.09
+manual,9,44.4,-0.5,-0.04,72.9,6,33.3,33.3,-0.74,12.96
+profit_lock,6,100.0,12.62,2.52,214.6,6,50.0,50.0,-0.7,-2.64
+phase5_circuit,2,100.0,15.57,15.57,166.8,2,50.0,0.0,6.46,6.46

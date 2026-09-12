@@ -1,0 +1,5 @@
+﻿group,trades,win_rate_pct,avg_profit_pct,median_profit_pct,avg_hold_hours,post_exit_n,early_exit_pct,good_exit_pct,median_ret_20d_after_sell,avg_ret_20d_after_sell
+SWING_FIB,101,37.6,-0.38,-0.58,113.9,91,33.0,28.6,1.35,1.26
+V6_SNIPER,27,40.7,4.84,-1.6,198.2,26,30.8,42.3,-1.33,2.23
+TREND_V8,24,29.2,-4.73,-1.74,125.0,20,25.0,30.0,0.14,-4.41
+V5_LEGACY,8,62.5,1.5,2.89,341.3,8,37.5,37.5,3.07,7.45

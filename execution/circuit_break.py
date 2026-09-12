@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-계좌 서킷 보조 — (1) 합산 고점 MDD (레거시), (2) **시장별 포트폴리오 비중** 하한.
+계좌 서킷 보조 — (1) 합산 고점 MDD (레거시), (2) **시장별 평가 MDD**(기본),
+(3) 시장별 포트폴리오 비중 하한(옵션).
 
-시장별 `guard.check_mdd_break`(약 -5%)와 별개.
-`run_bot`` Phase5 기본 모드는 **합산이 아니라** KR/US/COIN 각각의 전체 대비 비중(%)이
-``config`` 하한 미만일 때 **해당 시장만** 청산한다 (API 한쪽 실패가 합산을 깨뜨리지 않도록).
+계좌 -5% ``check_mdd_break`` 매수 차단은 폐지. 보호는 Phase5(`account_circuit_mdd_pct`
+기본 15%)만 — 기본은 합산이 아니라 KR/US/COIN **각자 고점 대비 하락** 시 **해당 시장만** 청산.
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def drawdown_from_peak_pct(peak_equity: float, current_equity: float) -> float:
     """고점 대비 하락률(%) — ``peak`` 가 0 이하면 0 반환."""
     if peak_equity <= 0:
         return 0.0
-    return (peak_equity - float(current_equity)) / peak_equity * 100.0
+    return max(0.0, (peak_equity - float(current_equity)) / peak_equity * 100.0)
 
 
 def evaluate_total_account_circuit(
@@ -214,4 +214,58 @@ def evaluate_per_market_share_circuits(
             anchor_share=anc,
             anchor_min_ratio=float(anchor_min_ratio),
         )
+    return out
+
+
+def evaluate_per_market_equity_circuits(
+    *,
+    equities: Mapping[str, float],
+    peaks: Mapping[str, float],
+    market_ok: Mapping[str, bool],
+    trigger_drawdown_pct: float = 15.0,
+    trigger_drawdown_pct_by_market: Mapping[str, float] | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    KR/US/COIN 각각 **해당 시장 고점 대비 MDD**.
+
+    단위는 호출측과 동일해야 한다 (KR=원, US=USD, COIN=견적통화 원|USDT).
+    다른 시장 입출금·평가 변동은 이 시장 고점을 건드리지 않는다.
+    """
+    thr_map = trigger_drawdown_pct_by_market if isinstance(trigger_drawdown_pct_by_market, dict) else {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for mk in ("KR", "US", "COIN"):
+        if not bool(market_ok.get(mk, False)):
+            out[mk] = {
+                "market": mk,
+                "triggered": False,
+                "reason": "circuit_aux 미확인 — 시장 MDD 서킷 스킵",
+            }
+            continue
+        try:
+            thr = float(thr_map.get(mk, trigger_drawdown_pct) or trigger_drawdown_pct)
+        except (TypeError, ValueError):
+            thr = float(trigger_drawdown_pct)
+        peak = float(peaks.get(mk, 0.0) or 0.0)
+        cur = max(0.0, float(equities.get(mk, 0.0) or 0.0))
+        ev = evaluate_total_account_circuit(peak, cur, trigger_drawdown_pct=thr)
+        unit = "USD" if mk == "US" else "원"
+        if ev["triggered"]:
+            reason = (
+                f"{mk} 고점 {peak:,.2f}{unit} 대비 {ev['drawdown_pct']:.2f}% 하락 "
+                f"(임계 {thr:g}% — 시장 단위 서킷)"
+            )
+        else:
+            reason = (
+                f"{mk} 고점 대비 {ev['drawdown_pct']:.2f}% 하락 — 임계({thr:g}%) 이내"
+            )
+        out[mk] = {
+            "market": mk,
+            "triggered": bool(ev["triggered"]),
+            "peak": peak,
+            "current": cur,
+            "drawdown_pct": float(ev["drawdown_pct"]),
+            "trigger_drawdown_pct": thr,
+            "floor_equity": float(ev["floor_equity"]),
+            "reason": reason,
+        }
     return out

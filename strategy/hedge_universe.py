@@ -9,11 +9,11 @@ grep 키워드
     아래 ``HEDGE_ASSETS_KR`` / ``HEDGE_ASSETS_US`` / ``HEDGE_ASSETS_COIN`` 튜플만 고치면 됩니다.
     ``run_bot._run_kr_buy_cycle`` / ``_run_us_buy_cycle`` / ``coin_buy_cycle`` 이 자동 반영합니다.
 
-연동 규칙 (``run_bot.py``)
-    * 매수 후보에 헷지 티커 **무조건 포함** (``_merge_hedge_into_buy_targets``)
-    * Phase4 ``market_buy_allowed == false`` → 일반 주식 제거, **헷지만** 매수 검토
-    * ``MAX_POSITIONS`` 슬롯 **우회** (예수금·``portfolio_heat_max_pct`` 는 그대로)
-    * Phase3 AI 필터 **생략** (``false_breakout_prob = 0``)
+연동 규칙 (`run_bot.py` / buy_cycle)
+    * BULL/SIDEWAYS 등 정상 장: 매수 후보에 헷지 티커 **병합** 후 일반 V8/SWING 경로로 검토
+    * Phase4 `market_buy_allowed == false` 또는 **BEAR** → 신규 매수 **전면 차단**(헷지 포함·현금 관망)
+    * `MAX_POSITIONS` 헷지 우회 **없음** (`can_open_new`와 동일)
+    * Phase3 AI: 헷지도 일반과 동일하게 필터 적용
 
 문서
     ``docs/HEDGE_UNIVERSE.md``, ``README.md`` Phase4·헷지 절

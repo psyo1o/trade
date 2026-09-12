@@ -34,14 +34,113 @@ class TestKisParsers(unittest.TestCase):
         self.assertEqual(as_row_dict(None), {})
 
     def test_parse_kr_cash_total(self):
-        cash, total = parse_kr_cash_total([{"prvs_rcdl_excc_amt": "1000", "tot_evlu_amt": "1200"}], _to_float)
-        self.assertEqual(cash, 1000)
+        # 보유 필드 없음(scts=0) → 표시 예수=총평=NAV
+        cash, total = parse_kr_cash_total(
+            [{"prvs_rcdl_excc_amt": "1000", "tot_evlu_amt": "1200"}], _to_float
+        )
+        self.assertEqual(cash, 1200)
         self.assertEqual(total, 1200)
         cash2, total2 = parse_kr_cash_total({"prvs_rcdl_excc_amt": "500"}, _to_float)
         self.assertEqual(cash2, 500)
         self.assertEqual(total2, 500)
 
-    def test_parse_us_cash_fallback(self):
+    def test_parse_kr_orderable_cash_is_d2(self):
+        from api.kis_parsers import parse_kr_orderable_cash
+
+        self.assertEqual(
+            parse_kr_orderable_cash(
+                {"prvs_rcdl_excc_amt": "0", "dnca_tot_amt": "447377"},
+                _to_float,
+            ),
+            0,
+        )
+
+    def test_parse_kr_cash_post_sell_d2_boosts_total_when_nass_stale(self):
+        """매도 후 보유 0·D+2에 대금 → 표시 예수=총평=NAV (MTS 순자산)."""
+        cash, total = parse_kr_cash_total(
+            {
+                "prvs_rcdl_excc_amt": "667000",
+                "dnca_tot_amt": "350510",
+                "scts_evlu_amt": "0",
+                "tot_evlu_amt": "667000",
+                "nass_amt": "350510",
+            },
+            _to_float,
+        )
+        self.assertEqual(total, 667000)
+        self.assertEqual(cash, 667000)
+
+    def test_parse_kr_cash_prefers_dnca_over_d2(self):
+        """공식: tot_evlu = 유가+D+2. 당일 매수 후 D+2=0 이면 tot_evlu=보유만."""
+        cash, total = parse_kr_cash_total(
+            {
+                "prvs_rcdl_excc_amt": "0",
+                "dnca_tot_amt": "447377",
+                "scts_evlu_amt": "209880",
+                "tot_evlu_amt": "209880",
+                "nass_amt": "657257",
+            },
+            _to_float,
+        )
+        self.assertEqual(cash, 447377)
+        self.assertEqual(total, 657257)
+
+    def test_parse_kr_cash_prefers_dnca_even_if_d2_leftover(self):
+        """D+2가 잔돈만 남아도 표시 예수는 dnca, 총평은 nass."""
+        cash, total = parse_kr_cash_total(
+            {
+                "prvs_rcdl_excc_amt": "500",
+                "dnca_tot_amt": "447377",
+                "scts_evlu_amt": "209880",
+                "tot_evlu_amt": "210380",
+                "nass_amt": "657257",
+            },
+            _to_float,
+        )
+        self.assertEqual(cash, 447377)
+        self.assertEqual(total, 657257)
+
+    def test_parse_kr_cash_total_d2_zero_uses_dnca(self):
+        cash, total = parse_kr_cash_total(
+            {
+                "prvs_rcdl_excc_amt": "0",
+                "dnca_tot_amt": "447377",
+                "scts_evlu_amt": "209880",
+                "tot_evlu_amt": "657257",
+            },
+            _to_float,
+        )
+        self.assertEqual(cash, 447377)
+        self.assertEqual(total, 657257)
+
+    def test_parse_kr_cash_total_tot_equals_scts_uses_nass(self):
+        cash, total = parse_kr_cash_total(
+            {
+                "prvs_rcdl_excc_amt": "0",
+                "dnca_tot_amt": "0",
+                "scts_evlu_amt": "209880",
+                "tot_evlu_amt": "209880",
+                "nass_amt": "657257",
+            },
+            _to_float,
+        )
+        self.assertEqual(cash, 447377)
+        self.assertEqual(total, 657257)
+
+    def test_parse_kr_cash_stale_dnca_uses_nass_minus_scts(self):
+        """매수 직후 dnca가 안 줄고 nass만 맞으면 예수는 nass-유가."""
+        cash, total = parse_kr_cash_total(
+            {
+                "prvs_rcdl_excc_amt": "0",
+                "dnca_tot_amt": "658178",
+                "scts_evlu_amt": "309045",
+                "tot_evlu_amt": "309045",
+                "nass_amt": "658178",
+            },
+            _to_float,
+        )
+        self.assertEqual(total, 658178)
+        self.assertEqual(cash, 658178 - 309045)
         self.assertEqual(parse_us_cash_fallback([{"frcr_dncl_amt_2": "12.5"}], _to_float), 12.5)
         self.assertEqual(parse_us_cash_fallback({"frcr_buy_amt_smtl": "7.25"}, _to_float), 7.25)
 

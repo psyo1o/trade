@@ -22,38 +22,30 @@ def run_us_buy_cycle(
     total_us_equity: float,
     alpha_target_vol: float,
 ) -> float:
-    """미장 매수 루프 — 헷지 유니버스·Phase4·MAX_POSITIONS·AI 예외 포함."""
+    """미장 매수 루프 — 헷지 병합·Phase4/BEAR 전면 차단·MAX_POSITIONS·AI."""
     rb = _rb()
     state = ctx.state
     weather = ctx.weather
     macro_mult = ctx.macro_mult
     macro_snap = ctx.macro_snap
     buy_cycle_tag = ctx.buy_cycle_tag
-    hedge_only = rb._phase4_hedge_only_active(macro_snap, "US")
+    if not rb._macro_market_buy_allowed(macro_snap, "US"):
+        _us_why = (macro_snap.get("market_buy_block_reason") or {}).get("US", "")
+        print(f"  🚨 [Phase4 거시] 미장 신규 매수 강제 차단 — {_us_why}")
     buy_targets = rb._merge_hedge_into_buy_targets(rb.get_top_market_cap_tickers(150), "US")
     buy_targets = rb._apply_phase4_hedge_buy_targets(buy_targets, macro_snap, "US")
     if not buy_targets:
-        if hedge_only:
-            print(
-                f"  -> 🚨 미장 Phase4 글로벌 방어막: 헷지 후보 없음 — 매수 중단. "
-                f"({(macro_snap.get('market_buy_block_reason') or {}).get('US', '')})"
-            )
         return float(us_cash)
 
     us_index_change = rb.get_market_index_change("US")
-    print(f"  📊 [S&P500 지수] 변화율: {us_index_change:+.2f}% 날씨는 {weather['US']}")
+    print(f"  📊 [SPY 지수] 변화율: {us_index_change:+.2f}% 날씨는 {weather['US']}")
     if us_index_change <= rb.INDEX_CRASH_US:
-        if hedge_only:
-            print(
-                f"  📌 [US 헷지] S&P500 {us_index_change:+.2f}% 급락 — "
-                f"Phase4 헷지 전용 모드, 지수 차단 예외·매수 검토 계속"
-            )
-        else:
-            print(f"  🚫 [US 매수 중단] S&P500 {us_index_change:+.2f}% 급락 (기준: {rb.INDEX_CRASH_US}%)")
-            return float(us_cash)
+        print(f"  🚫 [US 매수 중단] SPY {us_index_change:+.2f}% 급락 (기준: {rb.INDEX_CRASH_US}%)")
+        return float(us_cash)
 
     if weather["US"] == rb.WEATHER_LABEL_BEAR:
-        print("  📌 [US] BEAR 날씨 — V8·SWING_FIB 일반 종목 매수 중단 (헷지만 검토)")
+        print("  📌 [US] BEAR 날씨 — 신규 매수 전면 차단 (헷지 포함 · 현금 관망)")
+        return float(us_cash)
 
     buy_targets = rb._sort_buy_targets_by_rs(buy_targets, "US")
     total_us = len(buy_targets)
@@ -102,68 +94,52 @@ def run_us_buy_cycle(
 
             strategy_type = "TREND_V8"
             entry_fib_level = 0.0
-            if hedge_only and rb._is_hedge_ticker(t, "US"):
-                _ref = (
-                    float(live_px_us)
-                    if live_px_us > 0
-                    else float(ohlcv[-1].get("c", 0) or 0)
-                )
-                if _ref <= 0:
-                    print(f"  ⏭️ {us_name}({t}): [US 헷지] 현재가 없음 (패스)")
-                    continue
-                sl_p = float(_ref) * 0.95
-                s_name = "HEDGE_PHASE4"
+            entry_decision = rb.decide_entry_signals(
+                ohlcv,
+                weather["US"],
+                t,
+                us_name,
+                idx,
+                total_us,
+                market="US",
+                reference_close=live_px_us if live_px_us > 0 else None,
+            )
+            is_buy = entry_decision.is_buy
+            sl_p = entry_decision.sl_p
+            s_name = entry_decision.signal_name
+            v8_ok = bool(is_buy) and rb._v8_trend_buy_allowed_in_weather(weather["US"])
+            if bool(is_buy) and not v8_ok:
                 print(
-                    f"  🛡️ [HEDGE-BUY] {us_name}({t}) Phase4 방어 — "
-                    f"V8/스윙·BEAR·지수급락 예외, 손절 ~${sl_p:.2f}"
+                    f"  ⏭️ {us_name}({t}): BEAR 시장 — V8 추세 매수 차단"
                 )
+            if v8_ok:
+                print(f"  ✅ [V8-BUY] {us_name}({t}) 진입")
             else:
-                entry_decision = rb.decide_entry_signals(
-                    ohlcv,
-                    weather["US"],
-                    t,
-                    us_name,
-                    idx,
-                    total_us,
-                    market="US",
-                    reference_close=live_px_us if live_px_us > 0 else None,
-                )
-                is_buy = entry_decision.is_buy
-                sl_p = entry_decision.sl_p
-                s_name = entry_decision.signal_name
-                v8_ok = bool(is_buy) and rb._v8_trend_buy_allowed_in_weather(weather["US"])
-                if bool(is_buy) and not v8_ok:
+                sw_ok = entry_decision.swing_ok
+                sw_fib = entry_decision.swing_fib
+                sw_why = entry_decision.swing_why
+                if sw_ok and not rb._swing_fib_buy_allowed_in_weather(weather["US"]):
                     print(
-                        f"  ⏭️ {us_name}({t}): BEAR 시장 — V8 추세 매수 차단"
+                        f"  ⏭️ {us_name}({t}): BEAR 시장 — SWING_FIB 눌림목 매수 차단"
                     )
-                if v8_ok:
-                    print(f"  ✅ [V8-BUY] {us_name}({t}) 진입")
+                    continue
+                if sw_ok:
+                    strategy_type = "SWING_FIB"
+                    entry_fib_level = float(sw_fib)
+                    _sw_o = float(ohlcv[-1].get("o", 0) or 0)
+                    _sw_c = float(live_px_us) if live_px_us > 0 else float(ohlcv[-1].get("c", 0) or 0)
+                    sl_p = rb.swing_entry_sl_p(_sw_c, sw_fib)
+                    s_name = "SWING_FIB"
+                    _sw_src = "KIS실시간" if live_px_us > 0 else "일봉종가"
+                    print(
+                        f"  ✅ [SWING-BUY] {us_name}({t}) entry_fib={entry_fib_level:.2f} "
+                        f"| 양봉({_sw_src} 시가 {_sw_o:.2f} < 종가 {_sw_c:.2f})"
+                    )
                 else:
-                    sw_ok = entry_decision.swing_ok
-                    sw_fib = entry_decision.swing_fib
-                    sw_why = entry_decision.swing_why
-                    if sw_ok and not rb._swing_fib_buy_allowed_in_weather(weather["US"]):
-                        print(
-                            f"  ⏭️ {us_name}({t}): BEAR 시장 — SWING_FIB 눌림목 매수 차단 (헷지만 허용)"
-                        )
-                        continue
-                    if sw_ok:
-                        strategy_type = "SWING_FIB"
-                        entry_fib_level = float(sw_fib)
-                        _sw_o = float(ohlcv[-1].get("o", 0) or 0)
-                        _sw_c = float(live_px_us) if live_px_us > 0 else float(ohlcv[-1].get("c", 0) or 0)
-                        sl_p = rb.swing_entry_sl_p(_sw_c, sw_fib)
-                        s_name = "SWING_FIB"
-                        _sw_src = "KIS실시간" if live_px_us > 0 else "일봉종가"
-                        print(
-                            f"  ✅ [SWING-BUY] {us_name}({t}) entry_fib={entry_fib_level:.2f} "
-                            f"| 양봉({_sw_src} 시가 {_sw_o:.2f} < 종가 {_sw_c:.2f})"
-                        )
-                    else:
-                        _prog = f"[{idx}/{total_us}]" if total_us > 0 else ""
-                        _disp = f"{us_name}({t})" if us_name and us_name != t else t
-                        print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
-                        continue
+                    _prog = f"[{idx}/{total_us}]" if total_us > 0 else ""
+                    _disp = f"{us_name}({t})" if us_name and us_name != t else t
+                    print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
+                    continue
 
             base_ratio = 1.0 / max(1, int(rb.MAX_POSITIONS_US))
             ratio, t_name = rb._position_ratio_with_vol_target(
@@ -254,6 +230,10 @@ def run_us_buy_cycle(
             else:
                 ctx.buy_fills += 1
                 rb._register_swing_risk_after_buy(state, t, ohlcv, "US")
+                try:
+                    rb._refresh_kis_display_snapshot_after_trade(state, "US")
+                except Exception as e:
+                    print(f"  ⚠️ [US] 매수 후 스냅샷 갱신 실패: {type(e).__name__}: {e}")
             us_cash = float(us_box[0])
         except Exception as e:
             print(f"  ❌ [US BUY 예외] {t}: {type(e).__name__}: {e}")

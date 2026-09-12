@@ -27,6 +27,19 @@ _NAVER_NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
 _ROOT_AI_KEYS_CACHE: Dict[str, str] | None = None
 
+# Google ListModels + generateContent 프로브(2026-08) 기준. 1.5·2.0-flash 는 404 폐기.
+GEMINI_MODEL_DEFAULT = "gemini-flash-lite-latest"
+GEMINI_MODEL_CANDIDATES: tuple[str, ...] = (
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+)
+
 
 def _to_float(v: Any, default: float = 0.0) -> float:
     try:
@@ -269,7 +282,10 @@ def _build_llm_prompt_news(news_text: str, strategy_type: str | None = None) -> 
     return _build_llm_prompt_news_v8(news_text)
 
 
-def _parse_llm_json(text: str) -> Tuple[int, str] | None:
+def _parse_llm_score_json(
+    text: str,
+    score_keys: tuple[str, ...] = ("false_breakout_prob", "liquidation_score"),
+) -> Tuple[int, str] | None:
     if not text:
         return None
     import json
@@ -278,11 +294,20 @@ def _parse_llm_json(text: str) -> Tuple[int, str] | None:
     raw = m.group(0) if m else text.strip()
     try:
         payload = json.loads(raw)
-        prob = int(payload.get("false_breakout_prob", 0))
-        reason = str(payload.get("rationale", "no_rationale"))
+        score_raw = 0
+        for key in score_keys:
+            if key in payload:
+                score_raw = payload[key]
+                break
+        prob = int(score_raw)
+        reason = str(payload.get("rationale", payload.get("reason", "no_rationale")))
         return max(0, min(100, prob)), reason
     except Exception:
         return None
+
+
+def _parse_llm_json(text: str) -> Tuple[int, str] | None:
+    return _parse_llm_score_json(text, ("false_breakout_prob",))
 
 
 def _openai_model_from_config(config: dict | None) -> str:
@@ -293,6 +318,35 @@ def _openai_model_from_config(config: dict | None) -> str:
     return "gpt-4o-mini"
 
 
+def _openai_prompt_score(
+    prompt: str,
+    config: dict | None,
+    model_name: str | None = None,
+) -> Tuple[int, str, bool]:
+    api_key = _get_secret("OPENAI_API_KEY", config)
+    if not api_key:
+        return 0, "skip:OPENAI_API_KEY 없음", False
+
+    mdl = (model_name or "").strip() or _openai_model_from_config(config)
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception:
+        return 0, "skip:openai 패키지 없음", False
+
+    client = OpenAI(api_key=api_key)
+    try:
+        resp = client.responses.create(model=mdl, input=prompt, temperature=0.1)
+        text = (resp.output_text or "").strip()
+        parsed = _parse_llm_score_json(text)
+        if parsed is None:
+            return 0, "skip:openai JSON 파싱 실패", False
+        prob, reason = parsed
+        return prob, reason, True
+    except Exception as e:
+        return 0, f"skip:{type(e).__name__}", False
+
+
 def _openai_news_prob(
     news_text: str,
     config: dict | None,
@@ -300,56 +354,74 @@ def _openai_news_prob(
     *,
     strategy_type: str | None = None,
 ) -> Tuple[int, str, bool]:
-    api_key = _get_secret("OPENAI_API_KEY", config)
-    if not api_key:
-        return 0, "skip:OPENAI_API_KEY 없음 → 위험도 0", False
-
     prompt = _build_llm_prompt_news(news_text, strategy_type=strategy_type)
-    mdl = (model_name or "").strip() or _openai_model_from_config(config)
-
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception:
-        return 0, "skip:openai 패키지 없음 → 위험도 0", False
-
-    client = OpenAI(api_key=api_key)
-    try:
-        resp = client.responses.create(model=mdl, input=prompt, temperature=0.1)
-        text = (resp.output_text or "").strip()
-        parsed = _parse_llm_json(text)
-        if parsed is None:
-            return 0, "skip:openai JSON 파싱 실패 → 위험도 0", False
-        prob, reason = parsed
-        return prob, reason, True
-    except Exception as e:
-        return 0, f"skip:{type(e).__name__} → 위험도 0", False
+    score, reason, ok = _openai_prompt_score(prompt, config, model_name)
+    if ok:
+        return score, reason, True
+    suffix = " → 위험도 0" if "skip:" in reason else ""
+    return 0, f"{reason}{suffix}" if reason else "skip:openai 실패 → 위험도 0", False
 
 
-def _gemini_news_prob(
-    news_text: str,
+def _gemini_model_from_config(config: dict | None, override: str = "") -> str:
+    if str(override or "").strip():
+        return str(override).strip()
+    if isinstance(config, dict):
+        for key in ("ai_gemini_model", "phase5_ai_liquidation_model"):
+            m = str(config.get(key, "") or "").strip()
+            if m:
+                return m
+    return GEMINI_MODEL_DEFAULT
+
+
+def _gemini_model_candidates(config: dict | None, model_name: str = "") -> list[str]:
+    primary = _gemini_model_from_config(config, model_name)
+    out: list[str] = []
+    for m in (primary, *GEMINI_MODEL_CANDIDATES):
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def _gemini_max_attempts(config: dict | None, override: int | None) -> int:
+    if override is not None and int(override) > 0:
+        return int(override)
+    if isinstance(config, dict):
+        try:
+            n = int(config.get("ai_gemini_max_model_attempts", 2) or 2)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    return 2
+
+
+def _gemini_prompt_score(
+    prompt: str,
     config: dict | None,
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = "",
     *,
-    strategy_type: str | None = None,
+    max_model_attempts: int | None = None,
 ) -> Tuple[int, str, bool]:
     api_key = _get_secret("GOOGLE_API_KEY", config)
     if not api_key:
-        return 0, "skip:GOOGLE_API_KEY 없음 → 위험도 0", False
+        return 0, "skip:GOOGLE_API_KEY 없음", False
 
-    prompt = _build_llm_prompt_news(news_text, strategy_type=strategy_type)
-    model_candidates = [
-        model_name,
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-    ]
+    model_candidates = _gemini_model_candidates(config, model_name)
+    attempt_limit = _gemini_max_attempts(config, max_model_attempts)
     last_err = ""
+    tried = 0
     for mdl in model_candidates:
+        if tried >= attempt_limit:
+            break
+        tried += 1
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent?key={api_key}"
             body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1}}
-            resp = requests.post(url, json=body, timeout=20)
+            resp = requests.post(url, json=body, timeout=30)
+            if resp.status_code == 429:
+                last_err = f"{mdl}:429_spending_cap"
+                # 동일 프로젝트 한도 — 다른 모델 재시도 무의미
+                break
             if resp.status_code == 404:
                 last_err = f"{mdl}:404"
                 continue
@@ -359,7 +431,7 @@ def _gemini_news_prob(
             data = resp.json()
             parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])
             text = str(parts[0].get("text", "") if parts else "").strip()
-            parsed = _parse_llm_json(text)
+            parsed = _parse_llm_score_json(text)
             if parsed is None:
                 last_err = f"{mdl}:empty_or_bad_json"
                 continue
@@ -368,9 +440,76 @@ def _gemini_news_prob(
         except Exception as e:
             last_err = f"{mdl}:{type(e).__name__}"
             continue
-
-    msg = f"skip:Gemini 실패 ({last_err}) → 위험도 0" if last_err else "skip:Gemini 실패 → 위험도 0"
+    if "429_spending_cap" in last_err:
+        msg = "skip:Gemini 월 지출 한도(429) — AI Studio spend cap 확인"
+    else:
+        msg = f"skip:Gemini 실패 ({last_err})" if last_err else "skip:Gemini 실패"
     return 0, msg, False
+
+
+def evaluate_llm_json_prompt(
+    prompt: str,
+    config: dict | None,
+    *,
+    provider: str = "gemini",
+    gemini_model: str = "",
+    openai_fallback: bool | None = None,
+    gemini_max_model_attempts: int | None = None,
+) -> Tuple[int, str, bool, str]:
+    """
+    매수 AI·Phase5 AI 공통 LLM 호출.
+
+    Returns:
+        (score 0~100, rationale, llm_success, engine)
+    """
+    provider_in = str(provider or "gemini").strip().lower()
+    fallback = True
+    if openai_fallback is not None:
+        fallback = bool(openai_fallback)
+    elif isinstance(config, dict):
+        if "phase5_ai_openai_fallback" in config:
+            fallback = bool(config.get("phase5_ai_openai_fallback"))
+        elif "ai_false_breakout_openai_fallback" in config:
+            fallback = bool(config.get("ai_false_breakout_openai_fallback"))
+
+    if provider_in == "openai":
+        score, rationale, ok = _openai_prompt_score(prompt, config, None)
+        return score, rationale, ok, "openai" if ok else "openai_fail"
+
+    score, rationale, ok = _gemini_prompt_score(
+        prompt,
+        config,
+        gemini_model,
+        max_model_attempts=gemini_max_model_attempts,
+    )
+    if ok:
+        return score, rationale, True, "gemini"
+
+    if fallback and _get_secret("OPENAI_API_KEY", config).strip():
+        score_o, rationale_o, ok_o = _openai_prompt_score(prompt, config, None)
+        if ok_o:
+            return (
+                score_o,
+                f"[Gemini 실패→OpenAI 폴백] {rationale_o}",
+                True,
+                "openai",
+            )
+    return score, rationale, False, "gemini_fail"
+
+
+def _gemini_news_prob(
+    news_text: str,
+    config: dict | None,
+    model_name: str = "",
+    *,
+    strategy_type: str | None = None,
+) -> Tuple[int, str, bool]:
+    prompt = _build_llm_prompt_news(news_text, strategy_type=strategy_type)
+    score, reason, ok = _gemini_prompt_score(prompt, config, model_name)
+    if ok:
+        return score, reason, True
+    suffix = " → 위험도 0" if reason.startswith("skip:") else ""
+    return 0, f"{reason}{suffix}" if reason else "skip:Gemini 실패 → 위험도 0", False
 
 
 def summarize_ai_rationale(text: str, max_chars: int = 160) -> str:

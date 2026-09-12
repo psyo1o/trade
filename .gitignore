@@ -30,8 +30,16 @@ ai_keys.txt
 # 국장 스크리너 출력 — 매 실행·스캔마다 변하므로 저장소에 포함하지 않음
 kr_targets.json
 bot_state.json
+bot_state.bak
+bot_state.json.bak*
+bot_state*.bak*
 bot_state_backup_*.json
+bot_state_backups/
+bot_state.before_*.json
+*.bak_repair_*
 trade_history.json
+backups/
+
 us_universe_cache.json
 gui_run_out.log
 gui_run_err.log
@@ -48,3 +56,7 @@ test_run_output.txt
 
 # OHLCV 캐시 (런타임)
 data/ohlcv_cache/
+
+# analysis 가격 캐시 (코드·docs·.gitkeep만 추적)
+analysis/cache/*.json
+!analysis/cache/.gitkeep

@@ -461,7 +461,7 @@ def run_us_cycle(ctx: TradingCycleContext) -> None:
         is_us_buy_time_post, _, _ = rb._is_us_buy_window_now(now_us_post)
         if rb.is_market_open("US"):
             if us_sell_fills > 0:
-                us_cash, total_us_equity = rb._refresh_us_cash_equity_after_sells()
+                us_cash, total_us_equity = rb._refresh_us_cash_equity_after_sells(state)
                 rb._sync_market_display_snapshot_after_sells(
                     "US", state, float(us_cash), float(total_us_equity)
                 )
@@ -487,13 +487,14 @@ def run_us_cycle(ctx: TradingCycleContext) -> None:
                 f"(매도단계 전 스냅샷 대비 반영)"
             )
 
-        # 매수는 MDD → Phase4 거시 체크 후에만 실행
-        if not rb.check_mdd_break("US", total_us_equity, state, rb.STATE_PATH):
-            print("  -> 🚨 미장 MDD 브레이크 작동 중. 신규 매수 중단.")
-        elif macro_mult <= 0:
+        # 매수는 Phase4 거시 → Phase5 쿨다운
+        from services import ledger_valuation as lv
+
+        total_us_equity = float(lv.market_equity_for_risk(state, "US") or total_us_equity)
+        if macro_mult <= 0:
             print(f"  -> 🚨 미장 Phase4 거시 방어막: 신규 매수 중단. ({macro_reason})")
         elif rb.in_account_circuit_cooldown(state, "US"):
-            print("  -> 🚨 미장 Phase5 비중 서킷 쿨다운 — 신규 매수 중단.")
+            print("  -> 🚨 미장 Phase5 서킷 쿨다운 — 신규 매수 중단.")
         else:
             # ⏳ [핵심] 미장 매수: NYSE 정규장 마감(16:00 ET) 직전 N분만 (기본 30분 → 15:30~15:59)
             now_ny = datetime.now(pytz.timezone("US/Eastern"))

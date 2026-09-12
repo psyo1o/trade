@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""스윙 러너 5MA 트레일링 — 발동·매도선·청산."""
+"""스윙 러너 10MA 트레일링 — 발동·매도선·청산."""
 from __future__ import annotations
 
 import unittest
@@ -12,12 +12,13 @@ from strategy.rules import (
     SWING_OVERSHOOT_TRAIL_EXIT_REASON_LOG,
     SWING_RUNNER_TRAIL_EXIT_REASON,
     SWING_RUNNER_TRAIL_EXIT_REASON_LOG,
+    SWING_RUNNER_TRAIL_HIGH_KEY,
     SWING_SCALE_OUT_R_MULT,
     check_swing_exit,
     check_swing_profit_lock_trailing_exit,
     get_swing_exit_display_price,
-    get_swing_ma5_price,
-    get_swing_ma5_trail_floor,
+    get_swing_ma10_price,
+    get_swing_ma10_trail_floor,
     get_swing_prev_day_low,
     get_swing_runner_trail_floor,
     is_swing_overshooting_runner,
@@ -55,13 +56,13 @@ class TestSwingRunnerTrailing(unittest.TestCase):
         }
         self.assertTrue(is_swing_runner_state(pos))
 
-    def test_ma5_last_bar(self):
+    def test_ma10_last_bar(self):
         closes = [float(x) for x in range(100, 110)]
         ohlcv = _ohlcv_closes(closes)
-        ma5 = get_swing_ma5_price(ohlcv)
-        self.assertAlmostEqual(ma5, sum(closes[-5:]) / 5.0, places=4)
+        ma10 = get_swing_ma10_price(ohlcv)
+        self.assertAlmostEqual(ma10, sum(closes[-10:]) / 10.0, places=4)
 
-    def test_exit_display_includes_ma5_for_runner(self):
+    def test_exit_display_includes_ma10_for_runner(self):
         closes = [float(100 + i) for i in range(60)]
         ohlcv = _ohlcv_closes(closes)
         buy = 100.0
@@ -74,18 +75,19 @@ class TestSwingRunnerTrailing(unittest.TestCase):
             "scale_out_done": True,
             "entry_initial_risk_1r": 5.0,
         }
-        ma5 = get_swing_ma5_price(ohlcv, reference_price=curr)
+        ma10 = get_swing_ma10_price(ohlcv, reference_price=curr)
         line = get_swing_exit_display_price(
             curr, pos, ohlcv, market="KR", ticker="005930"
         )
-        self.assertGreaterEqual(line, ma5)
-        self.assertGreater(ma5, buy)
+        self.assertGreaterEqual(line, ma10)
+        self.assertGreater(ma10, buy)
 
-    def test_check_swing_exit_full_on_ma5_break(self):
-        closes = [100.0] * 55 + [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+    def test_check_swing_exit_full_on_ma10_break(self):
+        # 10봉 SMA가 현재가보다 높아지도록 최근 봉 상승 후 현재가만 낮춤
+        closes = [100.0] * 50 + [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0]
         ohlcv = _ohlcv_closes(closes)
         curr = 101.0
-        ma5 = get_swing_ma5_price(ohlcv, reference_price=curr)
+        ma10 = get_swing_ma10_price(ohlcv, reference_price=curr)
         pos = {
             "buy_p": 100.0,
             "max_p": 108.0,
@@ -94,7 +96,7 @@ class TestSwingRunnerTrailing(unittest.TestCase):
             "scale_out_done": True,
             "entry_initial_risk_1r": 5.0,
         }
-        self.assertGreater(ma5, curr)
+        self.assertGreater(ma10, curr)
         action, reason = check_swing_exit(
             pos,
             pd.DataFrame(ohlcv),
@@ -108,8 +110,8 @@ class TestSwingRunnerTrailing(unittest.TestCase):
             or SWING_OVERSHOOT_TRAIL_EXIT_REASON in reason
         )
 
-    def test_profit_lock_trailing_runner_uses_ma5_not_breakeven(self):
-        closes = [100.0] * 55 + [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+    def test_profit_lock_trailing_runner_uses_ma10_not_breakeven(self):
+        closes = [100.0] * 50 + [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0]
         ohlcv = _ohlcv_closes(closes)
         pos = {
             "buy_p": 100.0,
@@ -128,7 +130,7 @@ class TestSwingRunnerTrailing(unittest.TestCase):
             or SWING_OVERSHOOT_TRAIL_EXIT_REASON_LOG in reason
         )
 
-    def test_ma5_trail_ratchet_does_not_drop(self):
+    def test_ma10_trail_ratchet_does_not_drop(self):
         closes = [float(100 + i) for i in range(60)]
         ohlcv = _ohlcv_closes(closes)
         pos = {
@@ -140,12 +142,30 @@ class TestSwingRunnerTrailing(unittest.TestCase):
             "entry_initial_risk_1r": 5.0,
         }
         high_px = float(closes[-1])
-        high_trail = get_swing_ma5_trail_floor(pos, ohlcv, reference_price=high_px)
+        high_trail = get_swing_ma10_trail_floor(pos, ohlcv, reference_price=high_px)
         self.assertGreater(high_trail, 0)
         low_px = high_px - 5.0
-        low_trail = get_swing_ma5_trail_floor(pos, ohlcv, reference_price=low_px)
+        low_trail = get_swing_ma10_trail_floor(pos, ohlcv, reference_price=low_px)
         self.assertEqual(low_trail, high_trail)
-        self.assertEqual(float(pos[SWING_MA5_TRAIL_HIGH_KEY]), high_trail)
+        self.assertEqual(float(pos[SWING_RUNNER_TRAIL_HIGH_KEY]), high_trail)
+
+    def test_legacy_ma5_key_read_for_trail_high(self):
+        closes = [float(100 + i) for i in range(60)]
+        ohlcv = _ohlcv_closes(closes)
+        pos = {
+            "buy_p": 100.0,
+            "max_p": 120.0,
+            "entry_fib_level": 95.0,
+            "strategy_type": "SWING_FIB",
+            "scale_out_done": True,
+            "entry_initial_risk_1r": 5.0,
+            SWING_MA5_TRAIL_HIGH_KEY: 200.0,
+        }
+        # 당일 MA10은 200보다 낮음 → 레거시 고점 유지, 신키에만 기록
+        trail = get_swing_ma10_trail_floor(pos, ohlcv, reference_price=float(closes[-1]))
+        self.assertEqual(trail, 200.0)
+        self.assertEqual(float(pos[SWING_RUNNER_TRAIL_HIGH_KEY]), 200.0)
+        self.assertEqual(float(pos[SWING_MA5_TRAIL_HIGH_KEY]), 200.0)
 
     def test_exit_display_ratchet_never_below_prior_sl(self):
         closes = [float(100 + i) for i in range(60)]

@@ -1,0 +1,4 @@
+﻿group,trades,win_rate_pct,avg_profit_pct,median_profit_pct,avg_hold_hours,post_exit_n,early_exit_pct,good_exit_pct,median_ret_20d_after_sell,avg_ret_20d_after_sell
+COIN,61,47.5,0.35,-0.01,122.7,48,31.2,39.6,0.79,0.59
+US,52,26.9,0.42,-2.2,169.5,50,30.0,14.0,1.86,2.53
+KR,47,38.3,-1.11,-1.93,133.7,47,34.0,42.6,-1.0,-0.24

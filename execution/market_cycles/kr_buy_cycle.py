@@ -22,41 +22,31 @@ def run_kr_buy_cycle(
     total_kr_equity: float,
     alpha_target_vol: float,
 ) -> int:
-    """국장 매수 루프 — 헷지 유니버스·Phase4·MAX_POSITIONS·AI 예외 포함."""
+    """국장 매수 루프 — 헷지 병합·Phase4/BEAR 전면 차단·MAX_POSITIONS·AI."""
     rb = _rb()
     state = ctx.state
     weather = ctx.weather
     macro_mult = ctx.macro_mult
     macro_snap = ctx.macro_snap
     buy_cycle_tag = ctx.buy_cycle_tag
-    hedge_only = rb._phase4_hedge_only_active(macro_snap, "KR")
+    rb._apply_vkospi_kr_buy_block(macro_snap)
     buy_targets = rb._apply_phase4_hedge_buy_targets(
         rb._merge_hedge_into_buy_targets(ctx.final_targets_kr, "KR"),
         macro_snap,
         "KR",
     )
     if not buy_targets:
-        if hedge_only:
-            print(
-                f"  -> 🚨 국장 Phase4 글로벌 방어막: 헷지 후보 없음 — 매수 중단. "
-                f"({(macro_snap.get('market_buy_block_reason') or {}).get('KR', '')})"
-            )
         return int(kr_cash)
 
     kr_index_change = rb.get_market_index_change("KR")
-    print(f"  📊 [KOSPI 지수] 변화율: {kr_index_change:+.2f}% 날씨는 {weather['KR']}")
+    print(f"  📊 [KODEX200 지수] 변화율: {kr_index_change:+.2f}% 날씨는 {weather['KR']}")
     if kr_index_change <= rb.INDEX_CRASH_KR:
-        if hedge_only:
-            print(
-                f"  📌 [KR 헷지] KOSPI {kr_index_change:+.2f}% 급락 — "
-                f"Phase4 헷지 전용 모드, 지수 차단 예외·매수 검토 계속"
-            )
-        else:
-            print(f"  🚫 [KR 매수 중단] KOSPI {kr_index_change:+.2f}% 급락 (기준: {rb.INDEX_CRASH_KR}%)")
-            return int(kr_cash)
+        print(f"  🚫 [KR 매수 중단] KODEX200 {kr_index_change:+.2f}% 급락 (기준: {rb.INDEX_CRASH_KR}%)")
+        return int(kr_cash)
 
     if weather["KR"] == rb.WEATHER_LABEL_BEAR:
-        print("  📌 [KR] BEAR 날씨 — V8·SWING_FIB 일반 종목 매수 중단 (헷지만 검토)")
+        print("  📌 [KR] BEAR 날씨 — 신규 매수 전면 차단 (헷지 포함 · 현금 관망)")
+        return int(kr_cash)
 
     total_kr = len(buy_targets)
     print(f"  -> 🇰🇷 국장 사냥감 {total_kr}개 정밀 분석 시작!")
@@ -106,72 +96,56 @@ def run_kr_buy_cycle(
 
             strategy_type = "TREND_V8"
             entry_fib_level = 0.0
-            if hedge_only and rb._is_hedge_ticker(t, "KR"):
-                _ref = (
-                    float(live_px_kr)
-                    if live_px_kr > 0
-                    else float(ohlcv_200[-1].get("c", 0) or 0)
-                )
-                if _ref <= 0:
-                    print(f"  ⏭️ {kr_name}({t}): [KR 헷지] 현재가 없음 (패스)")
-                    continue
-                sl_p = float(_ref) * 0.95
-                s_name = "HEDGE_PHASE4"
+            entry_decision = rb.decide_entry_signals(
+                ohlcv_200,
+                weather["KR"],
+                t,
+                kr_name,
+                idx,
+                total_kr,
+                market="KR",
+                reference_close=live_px_kr if live_px_kr > 0 else None,
+            )
+            is_buy = entry_decision.is_buy
+            sl_p = entry_decision.sl_p
+            s_name = entry_decision.signal_name
+            v8_ok = bool(is_buy) and rb._v8_trend_buy_allowed_in_weather(weather["KR"])
+            if bool(is_buy) and not v8_ok:
                 print(
-                    f"  🛡️ [HEDGE-BUY] {kr_name}({t}) Phase4 방어 — "
-                    f"V8/스윙·BEAR·지수급락 예외, 손절 ~{int(sl_p):,}원"
+                    f"  ⏭️ {kr_name}({t}): BEAR 시장 — V8 추세 매수 차단"
                 )
+            if v8_ok:
+                print(f"  ✅ [V8-BUY] {kr_name}({t}) 진입")
             else:
-                entry_decision = rb.decide_entry_signals(
-                    ohlcv_200,
-                    weather["KR"],
-                    t,
-                    kr_name,
-                    idx,
-                    total_kr,
-                    market="KR",
-                    reference_close=live_px_kr if live_px_kr > 0 else None,
-                )
-                is_buy = entry_decision.is_buy
-                sl_p = entry_decision.sl_p
-                s_name = entry_decision.signal_name
-                v8_ok = bool(is_buy) and rb._v8_trend_buy_allowed_in_weather(weather["KR"])
-                if bool(is_buy) and not v8_ok:
+                sw_ok = entry_decision.swing_ok
+                sw_fib = entry_decision.swing_fib
+                sw_why = entry_decision.swing_why
+                if sw_ok and not rb._swing_fib_buy_allowed_in_weather(weather["KR"]):
                     print(
-                        f"  ⏭️ {kr_name}({t}): BEAR 시장 — V8 추세 매수 차단"
+                        f"  ⏭️ {kr_name}({t}): BEAR 시장 — SWING_FIB 눌림목 매수 차단"
                     )
-                if v8_ok:
-                    print(f"  ✅ [V8-BUY] {kr_name}({t}) 진입")
+                    continue
+                if sw_ok:
+                    strategy_type = "SWING_FIB"
+                    entry_fib_level = float(sw_fib)
+                    _sw_o = float(ohlcv_200[-1].get("o", 0) or 0)
+                    _sw_c = (
+                        float(live_px_kr)
+                        if live_px_kr > 0
+                        else float(ohlcv_200[-1].get("c", 0) or 0)
+                    )
+                    sl_p = rb.swing_entry_sl_p(_sw_c, sw_fib)
+                    s_name = "SWING_FIB"
+                    _sw_src = "KIS실시간" if live_px_kr > 0 else "일봉종가"
+                    print(
+                        f"  ✅ [SWING-BUY] {kr_name}({t}) entry_fib={entry_fib_level:,.2f} "
+                        f"| 양봉({_sw_src} 시가 {_sw_o:,.0f} < 종가 {_sw_c:,.0f})"
+                    )
                 else:
-                    sw_ok = entry_decision.swing_ok
-                    sw_fib = entry_decision.swing_fib
-                    sw_why = entry_decision.swing_why
-                    if sw_ok and not rb._swing_fib_buy_allowed_in_weather(weather["KR"]):
-                        print(
-                            f"  ⏭️ {kr_name}({t}): BEAR 시장 — SWING_FIB 눌림목 매수 차단 (헷지만 허용)"
-                        )
-                        continue
-                    if sw_ok:
-                        strategy_type = "SWING_FIB"
-                        entry_fib_level = float(sw_fib)
-                        _sw_o = float(ohlcv_200[-1].get("o", 0) or 0)
-                        _sw_c = (
-                            float(live_px_kr)
-                            if live_px_kr > 0
-                            else float(ohlcv_200[-1].get("c", 0) or 0)
-                        )
-                        sl_p = rb.swing_entry_sl_p(_sw_c, sw_fib)
-                        s_name = "SWING_FIB"
-                        _sw_src = "KIS실시간" if live_px_kr > 0 else "일봉종가"
-                        print(
-                            f"  ✅ [SWING-BUY] {kr_name}({t}) entry_fib={entry_fib_level:,.2f} "
-                            f"| 양봉({_sw_src} 시가 {_sw_o:,.0f} < 종가 {_sw_c:,.0f})"
-                        )
-                    else:
-                        _prog = f"[{idx}/{total_kr}]" if total_kr > 0 else ""
-                        _disp = f"{kr_name}({t})" if kr_name and kr_name != t else t
-                        print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
-                        continue
+                    _prog = f"[{idx}/{total_kr}]" if total_kr > 0 else ""
+                    _disp = f"{kr_name}({t})" if kr_name and kr_name != t else t
+                    print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
+                    continue
 
             base_ratio = 1.0 / max(1, int(rb.MAX_POSITIONS_KR))
             ratio, t_name = rb._position_ratio_with_vol_target(
@@ -225,17 +199,16 @@ def run_kr_buy_cycle(
                 continue
 
             try:
-                if not (hedge_only and rb._is_hedge_ticker(t, "KR")):
-                    if ohlcv_200 and len(ohlcv_200) >= 2:
-                        last_close = float(ohlcv_200[-2]["c"])
-                        today_open = float(ohlcv_200[-1]["o"])
-                        if last_close > 0:
-                            gap_ratio = ((today_open - last_close) / last_close) * 100
-                            if gap_ratio >= 5.0:
-                                print(
-                                    f"  ⏭️ {kr_name}({t}): 갭상승 과다 ({gap_ratio:.2f}%) - 필터링 (패스)"
-                                )
-                                continue
+                if ohlcv_200 and len(ohlcv_200) >= 2:
+                    last_close = float(ohlcv_200[-2]["c"])
+                    today_open = float(ohlcv_200[-1]["o"])
+                    if last_close > 0:
+                        gap_ratio = ((today_open - last_close) / last_close) * 100
+                        if gap_ratio >= 5.0:
+                            print(
+                                f"  ⏭️ {kr_name}({t}): 갭상승 과다 ({gap_ratio:.2f}%) - 필터링 (패스)"
+                            )
+                            continue
             except Exception as gap_err:
                 print(f"  ⚠️ 갭상승 체크 중 오류: {gap_err}")
 
@@ -288,6 +261,10 @@ def run_kr_buy_cycle(
             else:
                 ctx.buy_fills += 1
                 rb._register_swing_risk_after_buy(state, t, ohlcv_200, "KR")
+                try:
+                    rb._refresh_kis_display_snapshot_after_trade(state, "KR")
+                except Exception as e:
+                    print(f"  ⚠️ [KR] 매수 후 스냅샷 갱신 실패: {type(e).__name__}: {e}")
             kr_cash = int(kr_box[0])
         except Exception as e:
             print(f"  ❌ [KR BUY 예외] {t}: {type(e).__name__}: {e}")

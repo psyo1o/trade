@@ -16,7 +16,11 @@ from typing import Any, Callable
 
 import pyupbit
 import yfinance as yf
-from api.kis_parsers import parse_kr_cash_total, parse_us_cash_fallback
+from api.kis_parsers import (
+    format_kr_output2_cash_fields,
+    parse_kr_cash_total,
+    parse_us_cash_fallback,
+)
 
 
 def resolve_display_current_price(
@@ -285,9 +289,19 @@ def build_account_snapshot_for_report(
             try:
                 kr_bal = with_backoff(deps["get_balance_with_retry"], "KR 잔고") or {}
                 out2 = kr_bal.get("output2", []) if isinstance(kr_bal, dict) else []
-                kr_cash, _ = parse_kr_cash_total(out2, deps["to_float"])
+                kr_cash, kr_nav = parse_kr_cash_total(out2, deps["to_float"])
+                if force_kis_labels:
+                    try:
+                        print(
+                            f"  📌 [KR raw] {format_kr_output2_cash_fields(out2, deps['to_float'])} "
+                            f"→ parse 예수 {int(kr_cash):,} · NAV {int(kr_nav):,}"
+                        )
+                    except Exception:
+                        pass
                 kr_m = deps["calc_kr_holdings_metrics"](kr_bal)
-                kr_total = int(kr_cash + float(kr_m.get("current", 0.0)))
+                kr_hold = float(kr_m.get("current", 0.0) or 0.0)
+                # 파서 NAV(nass·D+2 포함)를 버리고 cash+보유만 쓰면 매도 정산분이 증발함
+                kr_total = int(max(float(kr_cash) + kr_hold, float(kr_nav)))
                 kr_roi = kr_m.get("roi")
                 kr_cash_f, kr_total_f, kr_roi = _maybe_reject_off_hours_force_label_anomaly(
                     market="KR",

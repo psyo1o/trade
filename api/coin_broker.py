@@ -2,8 +2,8 @@
 """
 코인 거래소 단일 진입점 — ``market_preference`` 에 따라 업비트 또는 바이낸스(CCXT).
 
-* 예산·서킷·Phase5 는 기존처럼 **원화(KRW) 환산** 기준을 유지한다.
-* 바이낸스 현물은 주문·호가·캔들이 USDT 이며, 매수 예산만 ``krw_per_usdt`` 로 환산한다.
+* 매수 예산·합산/비중 서킷은 필요 시 **원화(KRW) 환산** (``krw_per_usdt``).
+* Phase5 **시장별 잔고 MDD(COIN)** 는 거래소 견적 통화: 업비트=원, 바이낸스=USDT.
 * GUI·텔레그램 코인 **가용·총평 숫자**(바이낸스)는 KRW 왕복 없이 ``binance_display_cash_and_total_usdt()`` 로 표시한다.
 """
 
@@ -47,6 +47,95 @@ def get_krw_per_usdt() -> float:
     except Exception as e:
         log.debug("USDKRW 추정 실패: %s", e)
     return 1350.0
+
+
+def coin_equity_quote_unit() -> str:
+    """Phase5 COIN 잔고 MDD 단위 — 바이낸스 ``USDT``, 업비트 ``KRW``."""
+    return "USDT" if coin_config.is_binance() else "KRW"
+
+
+def native_to_krw(native: float, *, krw_per_usdt: float | None = None) -> float:
+    """견적 통화 총평 → 원화(합산·비중 서킷용)."""
+    n = max(0.0, float(native or 0.0))
+    if coin_config.is_binance():
+        rate = float(krw_per_usdt) if krw_per_usdt and float(krw_per_usdt) > 0 else get_krw_per_usdt()
+        return n * float(rate)
+    return n
+
+
+def total_equity_native_from_balances(balances: list | None) -> float:
+    """코인 총평가(견적 통화). 업비트=원, 바이낸스=USDT(장부 USDT+포지션)."""
+    rows = balances if isinstance(balances, list) else []
+    if coin_config.is_binance():
+        usdt_row = next(
+            (b for b in rows if str(b.get("currency", "")).upper() == "USDT"),
+            None,
+        ) or {}
+        total = _float_bal(usdt_row.get("balance"))
+        for b in rows:
+            cur = str(b.get("currency") or "").upper()
+            if cur in ("KRW", "VTHO", "USDT"):
+                continue
+            t = held_ticker_row(b)
+            if not t:
+                continue
+            px = float(get_current_price(t) or 0.0)
+            if px > 0:
+                total += _float_bal(b.get("balance")) * px
+        return float(total)
+    krw_row = next(
+        (b for b in rows if str(b.get("currency", "")).upper() == "KRW"),
+        None,
+    ) or {}
+    total = _float_bal(krw_row.get("balance"))
+    for b in rows:
+        cur = str(b.get("currency") or "").upper()
+        if cur in ("KRW", "VTHO"):
+            continue
+        t = held_ticker_row(b)
+        if not t:
+            continue
+        px = float(get_current_price(t) or 0.0)
+        if px > 0:
+            total += _float_bal(b.get("balance")) * px
+    return float(total)
+
+
+def persist_circuit_aux_coin(
+    state: dict,
+    native: float,
+    *,
+    krw_per_usdt: float | None = None,
+) -> tuple[float, float]:
+    """``circuit_aux_last_coin_native`` + 항상 원화 ``circuit_aux_last_coin_krw`` 동시 기록."""
+    n = max(0.0, float(native or 0.0))
+    krw = native_to_krw(n, krw_per_usdt=krw_per_usdt)
+    state["circuit_aux_last_coin_native"] = float(n)
+    state["circuit_aux_last_coin_krw"] = float(krw)
+    state["circuit_aux_last_coin_unit"] = coin_equity_quote_unit()
+    return float(n), float(krw)
+
+
+def circuit_aux_coin_native(state: dict) -> float:
+    """Phase5 COIN 현재 잔고(견적 통화). native 없으면 원화 aux 폴백(업비트/구버전)."""
+    if not isinstance(state, dict):
+        return 0.0
+    try:
+        native = float(state.get("circuit_aux_last_coin_native", 0) or 0)
+    except (TypeError, ValueError):
+        native = 0.0
+    if native > 0:
+        return native
+    try:
+        krw = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
+    except (TypeError, ValueError):
+        krw = 0.0
+    if krw <= 0:
+        return 0.0
+    if coin_config.is_binance():
+        rate = get_krw_per_usdt()
+        return (krw / rate) if rate > 0 else 0.0
+    return krw
 
 
 def should_include_coin_balance_row(b: dict) -> bool:

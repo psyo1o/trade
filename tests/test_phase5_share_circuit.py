@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from execution.circuit_break import (
     evaluate_market_share_circuit,
+    evaluate_per_market_equity_circuits,
     evaluate_per_market_share_circuits,
     portfolio_total_krw_for_share,
 )
@@ -51,3 +52,27 @@ def test_anchor_raises_effective_floor():
     )
     assert ev["effective_floor_pct"] == 15.0
     assert ev["triggered"] is True
+
+
+def test_per_market_mdd_triggers_only_that_market():
+    out = evaluate_per_market_equity_circuits(
+        equities={"KR": 500_000, "US": 3500.0, "COIN": 800_000},
+        peaks={"KR": 1_000_000, "US": 3510.0, "COIN": 810_000},
+        market_ok={"KR": True, "US": True, "COIN": True},
+        trigger_drawdown_pct=15.0,
+    )
+    assert out["KR"]["triggered"] is True
+    assert out["US"]["triggered"] is False
+    assert out["COIN"]["triggered"] is False
+
+
+def test_us_growth_does_not_trigger_kr_mdd():
+    """미장 평가가 커져도 국장 고점 MDD 는 그대로."""
+    out = evaluate_per_market_equity_circuits(
+        equities={"KR": 1_000_000, "US": 10_000.0, "COIN": 800_000},
+        peaks={"KR": 1_050_000, "US": 3_500.0, "COIN": 810_000},
+        market_ok={"KR": True, "US": True, "COIN": True},
+        trigger_drawdown_pct=15.0,
+    )
+    assert out["KR"]["triggered"] is False
+    assert out["KR"]["drawdown_pct"] < 15.0

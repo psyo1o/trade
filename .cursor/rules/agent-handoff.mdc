@@ -1,0 +1,29 @@
+---
+description: 세션 시작 시 CURRENT/CHANGELOG를 보고 이어서 작업; 종료 시 문서 갱신
+alwaysApply: true
+---
+
+# AI 핸드오프 (세션 시작·종료)
+
+## 세션 시작 (읽기 순서)
+
+1. `AGENTS.md` — 저장소 작업 규칙 요약
+2. `docs/CURRENT.md` — 지금/다음/주의
+3. `docs/CHANGELOG.md` 상단 몇 항목 — 최근 변경
+4. 필요한 주제만 `docs/README.md` 목차로 연다
+
+히스토리 채팅만 믿지 말고 **문서·코드를 기준**으로 한다.
+
+## 세션 종료 (쓰기)
+
+`change-log-docs.mdc`와 동일하게:
+
+1. `docs/CHANGELOG.md` 맨 위 항목 추가
+2. `docs/CURRENT.md` 「지금/다음/주의」 갱신 (길게 쓰지 말 것)
+3. 관련 주제 docs·README·GUI 안내가 있으면 같이
+
+## 효율
+
+- 한 작업 = 한 CHANGELOG 항목 + CURRENT 한 블록 갱신
+- 대형 README 전체 읽기 금지 — 상수표·해당 §만
+- 비밀·계좌·토큰 문서화 금지

@@ -74,7 +74,57 @@ def get_us_ticker_exchange(ticker):
         return 'NASD'
 
 
-def _create_brokers():
+# KIS access_token 유효 기간(약 24h)보다 여유 있게 — 만료 전 재발급
+_TOKEN_FRESHNESS = timedelta(hours=11, minutes=50)
+
+
+def _normalize_access_token(raw) -> str:
+    return str(raw or "").replace("Bearer ", "").strip()
+
+
+def _token_data_is_fresh(token_data) -> bool:
+    """kis_token.json 이 재발급 없이 쓸 수 있는지."""
+    if not isinstance(token_data, dict) or not token_data.get("access_token"):
+        return False
+    try:
+        issue_time = datetime.fromtimestamp(float(token_data["timestamp"]))
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+    return datetime.now() < issue_time + _TOKEN_FRESHNESS
+
+
+def _apply_access_token(token: str) -> str:
+    """브로커·직통(KIS_TOKEN)에 동일 토큰을 심는다."""
+    global KIS_TOKEN, broker_kr, broker_us
+    clean = _normalize_access_token(token)
+    if not clean:
+        return ""
+    if broker_kr is not None:
+        broker_kr.access_token = clean
+    if broker_us is not None:
+        broker_us.access_token = clean
+    KIS_TOKEN = clean
+    return clean
+
+
+def _resolve_access_token(*, force_new: bool = False):
+    """유효 저장 토큰을 우선 재사용. force_new 또는 만료/없음일 때만 tokenP 발급.
+
+    KIS는 토큰 발급 1분 제한이 있어, 기동·잔고조회마다 새로 받으면 EGW00133 이 난다.
+    """
+    if not force_new:
+        existing = load_kis_token()
+        if _token_data_is_fresh(existing):
+            print("  -> ✅ 저장된 KIS 토큰 재사용 (신규 발급 생략)")
+            return existing
+    token_data = issue_new_kis_token()
+    if token_data and token_data.get("access_token"):
+        return token_data
+    print("⚠️ 토큰 발급 실패 - 기존 토큰 사용 시도")
+    return load_kis_token()
+
+
+def _create_brokers(*, force_new_token: bool = False):
     """Mojito 브로커 객체를 (재)생성합니다."""
     global broker_kr, broker_us
     try:
@@ -98,20 +148,10 @@ def _create_brokers():
 
             _bn.init_binance(_cfg)
 
-        # KIS 토큰 발급 (mojito는 자동 발급 안 함)
-        token_data = issue_new_kis_token()
-        if token_data and 'access_token' in token_data:
-            # Bearer 중복 방지: 이미 "Bearer "가 있으면 제거
-            token = token_data['access_token'].replace('Bearer ', '').strip()
-            broker_kr.access_token = token
-            broker_us.access_token = token
-        else:
-            print("⚠️ 토큰 발급 실패 - 기존 토큰 사용 시도")
-            token_data = load_kis_token()
-            if token_data and 'access_token' in token_data:
-                token = token_data['access_token'].replace('Bearer ', '').strip()
-                broker_kr.access_token = token
-                broker_us.access_token = token
+        # mojito는 자동 발급 안 함 — 유효 파일이 있으면 재사용 (1분 발급 제한 회피)
+        token_data = _resolve_access_token(force_new=force_new_token)
+        if token_data and token_data.get("access_token"):
+            _apply_access_token(token_data["access_token"])
     except Exception as e:
         print(f"🚨 브로커 객체 생성 실패: {e}")
         send_telegram(f"🚨 [긴급] 브로커 객체 생성에 실패했습니다. 키/계좌번호 설정을 확인하세요.\n{e}")
@@ -119,10 +159,10 @@ def _create_brokers():
         raise RuntimeError(f"브로커 객체 생성 실패: {e}") from e
 
 
-def _create_brokers_safe() -> bool:
+def _create_brokers_safe(*, force_new_token: bool = False) -> bool:
     """GUI·adjust_capital 등에서 실패 시 프로세스 종료 없이 False."""
     try:
-        _create_brokers()
+        _create_brokers(force_new_token=force_new_token)
         return True
     except RuntimeError as e:
         print(f"⚠️ 브로커 생성 실패: {e}")
@@ -169,7 +209,7 @@ def refresh_brokers_if_needed(force=False):
         else:
             print(f"     [이전 토큰] {old_token}")
 
-        if not _create_brokers_safe():
+        if not _create_brokers_safe(force_new_token=True):
             return
 
         new_token = str(broker_kr.access_token) if broker_kr and hasattr(broker_kr, 'access_token') else "없음"
@@ -180,31 +220,30 @@ def refresh_brokers_if_needed(force=False):
         print("  -> ✅ 브로커 재생성 완료")
         return
 
-    # 브로커가 없으면 생성
+    # 브로커가 없으면 생성 (유효 저장 토큰이면 발급 생략)
     if broker_kr is None or broker_us is None:
-        if not _create_brokers_safe():
+        if not _create_brokers_safe(force_new_token=False):
             return
         print("  -> ✅ 브로커 초기화 완료")
         return
 
-    # 토큰 만료 체크 (11시간 50분마다 재발급)
+    # 토큰 만료 체크 (11시간 50분마다 재발급) — 15분 사이클에서도 여기만 통과
     token_data = load_kis_token()
-    if token_data and 'timestamp' in token_data:
-        issue_time = datetime.fromtimestamp(token_data['timestamp'])
-        if datetime.now() >= issue_time + timedelta(hours=11, minutes=50):
-            print("  -> ⏳ 토큰 만료 임박 - 재발급 시작")
-            new_token = issue_new_kis_token()
-            if new_token and 'access_token' in new_token:
-                broker_kr.access_token = new_token['access_token']
-                broker_us.access_token = new_token['access_token']
-                print("  -> ✅ 토큰 재발급 완료")
-            else:
-                print("  -> ⚠️ 토큰 재발급 실패")
+    if _token_data_is_fresh(token_data):
+        # 직통 경로와 브로커 토큰이 어긋나지 않게 동기화
+        _apply_access_token(token_data["access_token"])
+        print("  -> ✅ 토큰 유효")
+    elif token_data and token_data.get("access_token"):
+        print("  -> ⏳ 토큰 만료 임박 - 재발급 시작")
+        new_token = issue_new_kis_token()
+        if new_token and new_token.get("access_token"):
+            _apply_access_token(new_token["access_token"])
+            print("  -> ✅ 토큰 재발급 완료")
         else:
-            print("  -> ✅ 토큰 유효")
+            print("  -> ⚠️ 토큰 재발급 실패")
     else:
         print("  -> ⚠️ 토큰 파일 없음 - 브로커 재생성")
-        _create_brokers_safe()
+        _create_brokers_safe(force_new_token=True)
 
 
 def get_us_cash_real(broker, *, refresh: bool = False):
@@ -225,12 +264,18 @@ def get_us_cash_real(broker, *, refresh: bool = False):
             return float(amt)
     base_url = getattr(broker, "base_url", "https://openapi.koreainvestment.com:9443")
     is_mock = "vps" in base_url or "vts" in base_url
+    # 브로커/파일 토큰 재사용 — 여기서 tokenP 를 또 치면 기동 직후 1분 제한에 걸린다
+    if not KIS_TOKEN:
+        KIS_TOKEN = _normalize_access_token(getattr(broker, "access_token", None))
+    if not KIS_TOKEN:
+        file_tok = load_kis_token() or {}
+        KIS_TOKEN = _normalize_access_token(file_tok.get("access_token"))
     if not KIS_TOKEN:
         try:
             auth_url = f"{base_url}/oauth2/tokenP"
             body = {"grant_type": "client_credentials", "appkey": _cfg["kis_key"], "appsecret": _cfg["kis_secret"]}
             res = requests.post(auth_url, json=body)
-            KIS_TOKEN = res.json().get("access_token")
+            KIS_TOKEN = _normalize_access_token(res.json().get("access_token"))
         except Exception as e:
             print(f"⚠️ 직통 토큰 발급 실패: {e}")
 
@@ -630,7 +675,12 @@ def execute_us_order_direct(broker, side, ticker, qty, price):
 
 
 def _fetch_kr_balance_uncached():
-    """국내 잔고 API 1회 (캐시 없음, tr_cont 에러 우회)."""
+    """국내 잔고 API 1회 (캐시 없음, tr_cont 에러 우회).
+
+    요청 파라미터는 한투 공식 샘플(TTTC8434R)과 같다.
+    ``FUND_STTL_ICLD_YN``/``PRCS_DVSN`` 을 바꿔도 예수·총평 필드 구성은 안 바뀐다.
+    표시 예수는 ``dnca_tot_amt``, 총평은 ``nass_amt`` 를 파서가 고른다.
+    """
     from api.kis_rate_limit import wait_for_slot
 
     try:
@@ -656,9 +706,9 @@ def _fetch_kr_balance_uncached():
                     "OFL_YN": "N",
                     "INQR_DVSN": "01",
                     "UNPR_DVSN": "01",
-                    "FUND_STTL_ICLD_YN": "N",
+                    "FUND_STTL_ICLD_YN": "N",  # 펀드결제분 — 예수 필드 구성과 무관
                     "FNCG_AMT_AUTO_RDPT_YN": "N",
-                    "PRCS_DVSN": "00",
+                    "PRCS_DVSN": "00",  # 전일매매포함(당일 매수 종목이 output1에 보이게)
                     "CTX_AREA_FK100": "",
                     "CTX_AREA_NK100": "",
                 }

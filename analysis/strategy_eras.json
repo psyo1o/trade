@@ -1,0 +1,66 @@
+[
+  {
+    "id": "v5_legacy",
+    "label": "V5 레거시",
+    "start": "2026-03-01",
+    "end": "2026-04-19",
+    "commits": ["738320e"],
+    "notes": "초기 봇·V5 추세돌파, 하드스탑 중심"
+  },
+  {
+    "id": "v8_multistrat",
+    "label": "V8 + 멀티전략",
+    "start": "2026-04-20",
+    "end": "2026-04-28",
+    "commits": ["8ad0da8", "7fe72ed", "e86d308"],
+    "notes": "V8 ATR 엔진, 스윙/V8 병행, 타임스탑·TWAP"
+  },
+  {
+    "id": "phase3_phase5",
+    "label": "Phase3 AI + Phase5 서킷",
+    "start": "2026-04-29",
+    "end": "2026-05-12",
+    "commits": ["88746c1", "37fb7cb", "52c6be5"],
+    "notes": "AI 휩쏘 필터, Phase5 트레일링 MDD·시장별 청산"
+  },
+  {
+    "id": "phase4_swing",
+    "label": "Phase4 + 스윙 리팩터",
+    "start": "2026-05-13",
+    "end": "2026-05-30",
+    "commits": ["a683528", "160534b", "16501b5", "2eb2f3f", "73b661b"],
+    "notes": "Hurst/RS/PCR, 스윙 Pullback, V8 -8%/-12% 캡"
+  },
+  {
+    "id": "market_cycles",
+    "label": "market_cycles 분리",
+    "start": "2026-06-01",
+    "end": "2026-06-11",
+    "commits": ["d1f13ae", "2e3b6da", "23547fa", "41d7abf"],
+    "notes": "KR/US/COIN 사이클 분리, 본절락 이원화, Phase4 헷지"
+  },
+  {
+    "id": "swing_bear_block",
+    "label": "스윙 BEAR 차단·진입 강화",
+    "start": "2026-06-12",
+    "end": "2026-07-18",
+    "commits": ["ab8ef3d"],
+    "notes": "RSI·정배열·BEAR 차단, 타임스탑 연장"
+  },
+  {
+    "id": "instant_out",
+    "label": "Instant Out 방어",
+    "start": "2026-07-19",
+    "end": "2026-08-19",
+    "commits": ["6f8fb2a"],
+    "notes": "매수 직후 예수 오염·Instant Out (HEAD)"
+  },
+  {
+    "id": "equity_circuit_local",
+    "label": "Equity 스냅샷 서킷 (로컬)",
+    "start": "2026-08-20",
+    "end": "2099-12-31",
+    "commits": [],
+    "notes": "Phase0~3 risk/display 분리·sanitize Rule1/2/3 (미커밋)"
+  }
+]

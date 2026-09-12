@@ -64,6 +64,7 @@ from api.kis_parsers import (
     extract_held_us_codes,
     parse_kr_cash_total,
     parse_kr_holdings_metrics,
+    parse_kr_orderable_cash,
     parse_us_cash_fallback,
     parse_us_holdings_metrics,
 )
@@ -148,6 +149,9 @@ from strategy.rules import (
     SWING_TIME_STOP_HOURS_EQUITY,
     SWING_TIME_STOP_HOURS_COIN,
     SWING_TIME_STOP_EXEMPT_PROFIT_PCT,
+    V8_TIME_STOP_HOURS_EQUITY,
+    V8_TIME_STOP_HOURS_COIN,
+    V8_TIME_STOP_EXEMPT_PROFIT_PCT,
     get_ohlcv_yfinance,
     get_ohlcv_stooq,
     get_ohlcv_pykrx,
@@ -178,46 +182,14 @@ import screener
 # 1. 시장·시총 보조 — 지수 등락률(급락 필터), S&P500 시총 상위(백업 티커 풀)
 # =====================================================================
 def get_market_index_change(market):
-    """시장 지수의 당일 변화율을 조회합니다."""
+    """시장 벤치마크 전일 대비 등락률(%). ``strategy.market_benchmark`` 와 Phase5·날씨 동일 티커."""
+    from strategy.market_benchmark import daily_change_pct
+
     try:
-        if market == "KR":
-            # 🚨 yfinance 대신 딜레이 없는 네이버 증권 API 사용 (KOSPI 실시간)
-            url = "https://m.stock.naver.com/api/index/KOSPI/price?pageSize=2&page=1"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            
-            response = requests.get(url, headers=headers, timeout=5)
-            data = response.json()
-            
-            # data[0]은 오늘(실시간), data[1]은 어제 데이터
-            if data and len(data) >= 2:
-                curr_close = float(data[0]['closePrice'].replace(',', ''))
-                prev_close = float(data[1]['closePrice'].replace(',', ''))
-                change = ((curr_close - prev_close) / prev_close) * 100
-                return change
-            return 0.0
-            
-        elif market == "US":
-            ticker = yf.Ticker("^GSPC")
-            hist = ticker.history(period="5d")
-            if len(hist) >= 2:
-                prev_close = hist['Close'].iloc[-2]
-                curr_close = hist['Close'].iloc[-1]
-                change = ((curr_close - prev_close) / prev_close) * 100
-                return change
-                
-        elif market == "COIN":
-            bt = coin_config.btc_benchmark_ticker()
-            oc = coin_broker.fetch_ohlcv(bt, "day", 3)
-            if oc and len(oc) >= 2:
-                prev_close = float(oc[-2]["c"])
-                curr_close = float(oc[-1]["c"])
-                if prev_close > 0:
-                    change = ((curr_close - prev_close) / prev_close) * 100
-                    return change
-                
+        change = daily_change_pct(market)
+        return float(change)
     except Exception as e:
         print(f"  ⚠️ [{market} 지수] 조회 실패: {e}")
-        
     return 0.0
 
 import requests
@@ -418,11 +390,27 @@ AI_FALSE_BREAKOUT_PROVIDER = str(config.get("ai_false_breakout_provider", "gemin
 
 # Phase 5 / Dry-run: config.json — test_mode=true 시 주문 대신 로그·텔레그램만
 TEST_MODE = bool(config.get("test_mode", False))
-# Phase5 계좌 서킷 — 기본: 시장별 포트폴리오 비중 하한(합산 MDD는 레거시, 기본 OFF)
+# Phase5 계좌 서킷 — 기본: 시장별 평가 MDD(합산·비중은 옵션)
 ACCOUNT_CIRCUIT_ENABLED = bool(config.get("account_circuit_enabled", True))
 ACCOUNT_CIRCUIT_USE_TOTAL = bool(config.get("account_circuit_use_total", False))
+ACCOUNT_CIRCUIT_USE_SHARE = bool(config.get("account_circuit_use_share", False))
+ACCOUNT_CIRCUIT_USE_INDEX = bool(config.get("account_circuit_use_index", False))
 ACCOUNT_CIRCUIT_MDD_PCT = float(config.get("account_circuit_mdd_pct", 15.0))
 ACCOUNT_CIRCUIT_COOLDOWN_H = float(config.get("account_circuit_cooldown_hours", 24.0))
+PHASE5_AI_LIQUIDATION_ENABLED = bool(config.get("phase5_ai_liquidation_enabled", True))
+PHASE5_AI_LIQUIDATION_THRESHOLD = int(config.get("phase5_ai_liquidation_threshold", 70))
+PHASE5_AI_LIQUIDATION_PROVIDER = str(
+    config.get("phase5_ai_liquidation_provider", config.get("ai_false_breakout_provider", "gemini"))
+    or "gemini"
+).strip().lower()
+PHASE5_AI_LIQUIDATION_MAX_RETRIES = int(config.get("phase5_ai_liquidation_max_retries", 1))
+PHASE5_AI_LIQUIDATION_RETRY_DELAY_SEC = float(config.get("phase5_ai_liquidation_retry_delay_sec", 2.0))
+PHASE5_AI_LLM_COOLDOWN_SEC = float(config.get("phase5_ai_llm_cooldown_sec", 3600.0))
+PHASE5_AI_GEMINI_MAX_MODEL_ATTEMPTS = int(config.get("phase5_ai_gemini_max_model_attempts", 1))
+PHASE5_RECONFIRM_DELAY_SEC = float(config.get("phase5_reconfirm_delay_sec", 0.0))  # legacy unused
+PHASE5_RECONFIRM_NEXT_CYCLE = bool(config.get("phase5_reconfirm_next_cycle", True))
+PHASE5_RECONFIRM_SECOND_REFRESH = bool(config.get("phase5_reconfirm_second_refresh", True))
+PHASE5_RECONFIRM_DIVERGENCE_PCT = float(config.get("phase5_reconfirm_divergence_pct", 8.0))
 ACCOUNT_CIRCUIT_ANCHOR_MIN_RATIO = float(config.get("account_circuit_share_anchor_min_ratio", 0.5))
 # KIS 잔고: ``on_trade``(기본)=매매·강제새로고침·입출금 시만 API / ``always``=기존처럼 자주 조회
 KIS_BALANCE_SYNC_MODE = str(config.get("kis_balance_sync_mode", "on_trade")).strip().lower()
@@ -456,9 +444,9 @@ PORTFOLIO_HEAT_MAX_PCT = float(config.get("portfolio_heat_max_pct", 0.06))
 # Phase 4: VIX / Fear&Greed 거시 방어막 (매 루프 `get_macro_guard_snapshot(config)` 로 적용)
 # config: macro_guard_enabled, macro_us_put_call_*, macro_coin_whale_*, macro_krw_fx_zscore_*
 
-# 📊 [지수 급락 기준] 각 시장의 신규 매수 중단 임계값
-INDEX_CRASH_KR = -3.0     # 국장 KOSPI 급락 기준 (%)
-INDEX_CRASH_US = -1.8     # 미장 S&P500 급락 기준 (%)
+# 📊 [지수 급락 기준] 벤치마크(069500.KS / SPY / BTC) 전일 대비 — Phase5와 동일 티커
+INDEX_CRASH_KR = -3.0     # 국장 KODEX200 급락 기준 (%)
+INDEX_CRASH_US = -1.8     # 미장 SPY 급락 기준 (%)
 INDEX_CRASH_COIN = -3.5   # 코인 BTC 급락 기준 (%)
 
 WEATHER_LABEL_BEAR = "🌧️ BEAR"
@@ -470,7 +458,7 @@ def _v8_trend_buy_allowed_in_weather(weather_label: str) -> bool:
 
 
 def _swing_fib_buy_allowed_in_weather(weather_label: str) -> bool:
-    """BEAR 시장에서는 일반 종목 SWING_FIB 눌림목 매수 차단 (헷지는 buy_cycle 별도 경로)."""
+    """BEAR 시장에서는 SWING_FIB 눌림목 매수 차단 (헷지 예외 없음 — BEAR는 전면 현금 관망)."""
     return str(weather_label or "").strip() != WEATHER_LABEL_BEAR
 
 # 업비트 코인 시장가 매수 — 가용 잔고 캡(수수료·반올림 오차로 InsufficientFundsBid 방지)
@@ -1177,11 +1165,13 @@ def get_real_weather(broker_kr, broker_us):
     if not suppress_kr_us_yahoo:
         try:
             from utils.yfinance_guard import yf_call
+            from strategy.market_benchmark import benchmark_ticker
 
+            kr_sym = benchmark_ticker("KR")
             df_kr = yf_call(
-                lambda: yf.Ticker("069500.KS").history(period="2mo"),
+                lambda: yf.Ticker(kr_sym).history(period="2mo"),
                 label="weather_kr",
-                ticker="069500.KS",
+                ticker=kr_sym,
             )
             if df_kr is None:
                 df_kr = pd.DataFrame()
@@ -1208,11 +1198,13 @@ def get_real_weather(broker_kr, broker_us):
     if not suppress_kr_us_yahoo:
         try:
             from utils.yfinance_guard import yf_call
+            from strategy.market_benchmark import benchmark_ticker
 
+            us_sym = benchmark_ticker("US")
             df_us = yf_call(
-                lambda: yf.Ticker("SPY").history(period="2mo"),
+                lambda: yf.Ticker(us_sym).history(period="2mo"),
                 label="weather_us",
-                ticker="SPY",
+                ticker=us_sym,
             )
             if df_us is None:
                 df_us = pd.DataFrame()
@@ -1720,6 +1712,7 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
     total_kr_equity = prev_kr_equity
     total_us_equity = prev_us_equity
     total_coin_equity = prev_coin_equity
+    total_coin_native = float(coin_broker.circuit_aux_coin_native(state) or 0)
     kr_cash_live = 0.0
     us_cash_live = 0.0
 
@@ -1840,36 +1833,16 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
 
     try:
         balances = coin_broker.get_balances() or []
+        total_coin_native = float(coin_broker.total_equity_native_from_balances(balances))
         if coin_config.is_binance():
             kpx = float(coin_broker.get_krw_per_usdt())
-            usdt_row = next((b for b in balances if str(b.get("currency", "")).upper() == "USDT"), None) or {}
-            usdt_total = _to_float(usdt_row.get("balance", 0), 0.0)
-            total_coin_equity = float(usdt_total * kpx)
-            for b in balances:
-                if str(b.get("currency", "")).upper() in ("USDT", "VTHO"):
-                    continue
-                t = coin_broker.held_ticker_row(b)
-                if not t:
-                    continue
-                curr_p = coin_broker.get_current_price(t)
-                if curr_p:
-                    total_coin_equity += float(_to_float(b.get("balance", 0))) * float(curr_p) * kpx
+            total_coin_equity = float(coin_broker.native_to_krw(total_coin_native, krw_per_usdt=kpx))
         else:
-            krw_row = next((b for b in balances if str(b.get("currency", "")).upper() == "KRW"), None) or {}
-            krw_on_book = _to_float(krw_row.get("balance", 0), 0.0)
-            total_coin_equity = float(krw_on_book)
-            for b in balances:
-                if b.get("currency") in ("KRW", "VTHO"):
-                    continue
-                t = coin_broker.held_ticker_row(b)
-                if not t:
-                    continue
-                curr_p = coin_broker.get_current_price(t)
-                if curr_p:
-                    total_coin_equity += float(_to_float(b.get("balance", 0))) * float(curr_p)
+            total_coin_equity = float(total_coin_native)
         result["coin_ok"] = True
     except Exception as e:
         print(f"  ⚠️ [circuit_aux 갱신] 코인 조회 실패: {e}")
+        # total_coin_native / total_coin_equity 는 직전값 유지 — coin_ok=False
 
     # 장외에는 KR/US를 표시 스냅샷 기준으로 고정해 불안정한 야간 KIS 응답을 차단.
     try:
@@ -1888,24 +1861,29 @@ def refresh_circuit_aux_from_brokers(state: dict, path: Path) -> dict:
         pass
 
     if result["kr_ok"]:
-        kr_part = lv._kis_snap_bucket(state, "KR")
-        cash_kr = float(kr_cash_live) if kr_cash_live > 0 else float(kr_part.get("cash", 0) or 0)
-        lv.write_kis_display_snapshot_part(
-            state, "KR", cash=cash_kr, total=float(total_kr_equity)
-        )
+        # 비장중: live 오염으로 snap을 덮지 않음 (마감 후 이중합산 재발 방지)
+        if is_market_open("KR") and kr_cash_live > 0:
+            stock_kr = max(0.0, float(total_kr_equity) - float(kr_cash_live))
+            lv.persist_display_cash_total(
+                "KR", state, float(kr_cash_live), stock_kr, force=False
+            )
+        # 비장중은 last_kis_display_snapshot 유지 — write 생략
     if result["us_ok"]:
-        us_part = lv._kis_snap_bucket(state, "US")
-        cash_us = float(us_cash_live) if us_cash_live > 0 else float(us_part.get("cash", 0) or 0)
-        lv.write_kis_display_snapshot_part(
-            state, "US", cash=cash_us, total=float(total_us_equity)
-        )
+        if is_market_open("US") and us_cash_live > 0:
+            stock_us = max(0.0, float(total_us_equity) - float(us_cash_live))
+            lv.persist_display_cash_total(
+                "US", state, float(us_cash_live), stock_us, force=False
+            )
     if result["coin_ok"]:
-        state["circuit_aux_last_coin_krw"] = float(total_coin_equity)
+        coin_broker.persist_circuit_aux_coin(state, float(total_coin_native))
+        total_coin_equity = float(state.get("circuit_aux_last_coin_krw", 0) or total_coin_equity)
     save_state(path, state)
     result["totals"] = {
         "kr_krw": float(total_kr_equity),
         "usd_total": float(total_us_equity),
         "coin_krw": float(total_coin_equity),
+        "coin_native": float(total_coin_native),
+        "coin_unit": coin_broker.coin_equity_quote_unit(),
     }
     return result
 
@@ -3640,44 +3618,31 @@ def _merge_hedge_into_buy_targets(buy_targets: list[str], market: str) -> list[s
 def _apply_phase4_hedge_buy_targets(
     buy_targets: list[str], macro_snap: dict, market: str
 ) -> list[str]:
-    """Phase4(``market_buy_allowed`` false) 시 일반 종목 제거, 헷지만 남김."""
+    """Phase4(``market_buy_allowed`` false) 시 신규 매수 전면 차단(헷지 포함·현금 관망).
+
+    허용 시에는 후보 목록을 그대로 반환(헷지 병합은 ``_merge_hedge_into_buy_targets``).
+    """
     if _macro_market_buy_allowed(macro_snap, market):
         return list(buy_targets or [])
-    hedge_set = {normalize_ticker(h) for h in _hedge_tickers_for_market(market)}
-    filtered = [
-        t for t in (buy_targets or []) if normalize_ticker(t) in hedge_set
-    ]
-    if filtered:
-        mk_u = str(market or "").strip().upper()
-        if mk_u == "COIN":
-            print(
-                "  🚨 [Phase 4 발동] 일반 코인 매수 차단 -> "
-                "하락장 헷지 자산(금 토큰)만 매수 검토"
-            )
-        else:
-            print(
-                "  🚨 [Phase 4 발동] 주식 매수 차단 -> 하락장 헷지 자산만 매수 검토"
-            )
-        print(
-            f"  🛡️ [헷지 유니버스 {mk_u}] "
-            f"{format_hedge_universe_summary(market)} "
-            f"(수정: strategy/hedge_universe.py)"
-        )
-    return filtered
+    mk_u = str(market or "").strip().upper()
+    why = (macro_snap.get("market_buy_block_reason") or {}).get(mk_u, "")
+    print(
+        f"  🚨 [Phase 4 발동] {mk_u} 신규 매수 전면 차단 (헷지 포함 · 현금 관망)"
+        + (f" — {why}" if why else "")
+    )
+    return []
 
 
 def _can_open_new_respecting_hedge_bypass(
     ticker: str, state: dict, market: str, max_positions: int
 ) -> bool:
-    """헷지 티커는 ``MAX_POSITIONS`` 슬롯 검사를 우회(예수금·portfolio heat는 별도)."""
-    if _is_hedge_ticker(ticker, market):
-        return True
+    """MAX_POSITIONS 검사 — 헷지 우회 없음(``can_open_new``와 동일)."""
     return can_open_new(ticker, state, max_positions=max_positions)
 
 
 def _phase4_hedge_only_active(macro_snap: dict, market: str) -> bool:
-    """Phase4로 일반 주식 매수가 막힌 상태(헷지 전용 모드)."""
-    return not _macro_market_buy_allowed(macro_snap, market)
+    """레거시 스텁 — Phase4 헷지 전용 모드는 폐지(항상 False)."""
+    return False
 
 
 def _refresh_kis_display_snapshot_after_trade(state: dict, market: str) -> None:
@@ -3688,16 +3653,17 @@ def _refresh_kis_display_snapshot_after_trade(state: dict, market: str) -> None:
             kc, te = _refresh_kr_cash_equity_after_sells()
             _sync_market_display_snapshot_after_sells("KR", state, kc, te)
         elif mk == "US":
-            uc, te = _refresh_us_cash_equity_after_sells()
+            uc, te = _refresh_us_cash_equity_after_sells(state)
             _sync_market_display_snapshot_after_sells("US", state, uc, te)
         elif mk == "COIN":
             bal_read.invalidate("COIN")
             balances = coin_broker.get_balances() or []
             krw_on, krw_bal = _compute_coin_krw_balances(balances)
+            native = float(_compute_total_coin_equity_native_from_balances(balances, float(krw_on)))
             total = int(_compute_total_coin_equity_from_balances(balances, float(krw_on)))
             coin_m = _calc_coin_holdings_metrics(balances, state.get("positions"))
             save_last_coin_display_snapshot(int(krw_bal), total, coin_m.get("roi"))
-            state["circuit_aux_last_coin_krw"] = float(total)
+            coin_broker.persist_circuit_aux_coin(state, native)
             save_state(STATE_PATH, state)
     except Exception as e:
         print(f"  ⚠️ [{mk}] 매매 후 표시 스냅샷 갱신 실패: {type(e).__name__}: {e}")
@@ -3713,16 +3679,41 @@ def _sync_market_display_snapshot_after_sells(
     from services import ledger_valuation as lv
 
     mk = str(market or "").strip().upper()
+    stock = max(0.0, float(total_equity) - float(cash))
     roi = None
+    prev_part = lv._kis_snap_bucket(state, mk)
+    prev_total = float(prev_part.get("total", 0) or 0)
     try:
         if mk == "KR":
             bal = ensure_dict(bal_read.kr_balance_raw(refresh=False))
+            stock = float(_calc_kr_holdings_metrics(bal).get("current", 0.0) or stock)
             roi = _calc_kr_holdings_metrics(bal).get("roi")
         elif mk == "US":
             bal = ensure_dict(bal_read.us_balance_raw(refresh=False))
+            stock = float(_calc_us_holdings_metrics(bal).get("current", 0.0) or stock)
             roi = _calc_us_holdings_metrics(bal).get("roi")
+        else:
+            roi = None
+        cash, total_equity = lv._sanitize_kis_cash_total_persist(
+            mk, state, float(cash), float(stock)
+        )
+        min_pt = 10_000.0 if mk == "KR" else 50.0
+        min_sold = 25_000.0 if mk == "KR" else 25.0
+        if prev_total >= min_pt and float(total_equity) < prev_total * 0.90:
+            prev_cash = float(prev_part.get("cash", 0) or 0)
+            prev_stock = max(0.0, prev_total - prev_cash)
+            stock_sold = max(0.0, prev_stock - float(stock))
+            if stock_sold < min_sold:
+                risk_total = lv.market_equity_for_risk(state, mk)
+                if risk_total >= prev_total * 0.90:
+                    total_equity = risk_total
+                    cash = max(0.0, risk_total - float(stock))
+                    print(
+                        f"  📌 [{mk}] 매매 후 총평 — risk fallback "
+                        f"{total_equity:,.2f}{'원' if mk == 'KR' else ''}"
+                    )
     except Exception:
-        pass
+        roi = None
     lv.write_kis_display_snapshot_part(
         state,
         mk,
@@ -3735,29 +3726,22 @@ def _sync_market_display_snapshot_after_sells(
     if mk == "KR":
         print(
             f"  📌 [KR] KIS 예수·총평 스냅샷 갱신 → 가용 {int(cash):,}원 · "
-            f"총평 {int(total_equity):,}원 (매도 후 GUI·텔레 반영)"
+            f"총평 {int(total_equity):,}원 (매매 후 GUI·텔레 반영)"
         )
     else:
         print(
             f"  📌 [US] KIS 예수·총평 스냅샷 갱신 → 가용 ${float(cash):,.2f} · "
-            f"총평 ${float(total_equity):,.2f} (매도 후 GUI·텔레 반영)"
+            f"총평 ${float(total_equity):,.2f} (매매 후 GUI·텔레 반영)"
         )
-
-
-def _benchmark_ticker_for_rs(market: str) -> str:
-    mk = str(market or "").strip().upper()
-    if mk == "KR":
-        return "^KS11"
-    if mk == "COIN":
-        return coin_config.btc_benchmark_ticker()
-    return "^GSPC"
 
 
 def _sort_buy_targets_by_rs(tickers: list[str], market: str) -> list[str]:
     if not tickers:
         return []
     try:
-        bench = _benchmark_ticker_for_rs(market)
+        from strategy.market_benchmark import benchmark_ticker
+
+        bench = benchmark_ticker(market)
         mk = str(market or "").strip().upper()
 
         def _fetch(ticker: str) -> list:
@@ -3800,6 +3784,34 @@ def _position_ratio_with_vol_target(
     return br, "1/N 고정"
 
 
+def _apply_vkospi_kr_buy_block(macro_snap: dict) -> None:
+    """KR 전용 VKOSPI 동적 변동성 스파이크 블락. **국장 매수 루프에서만** 호출.
+
+    현재 > 20MA×1.3 이고 현재 ≥ 20.0 일 때만 국장 신규 매수 차단.
+    조회 실패·예외는 조용히 패스. US/COIN 불변.
+    """
+    try:
+        from api.macro_data import vkospi_dynamic_spike_state, vkospi_is_dynamic_spike
+
+        st = vkospi_dynamic_spike_state()
+        if not st:
+            return
+        cur = float(st["current"])
+        ma20 = float(st["ma20"])
+        if not vkospi_is_dynamic_spike(cur, ma20):
+            return
+        macro_snap.setdefault("market_buy_allowed", {})["KR"] = False
+        macro_snap.setdefault("market_buy_block_reason", {})["KR"] = (
+            f"VKOSPI 단기 급등(현재 {cur:.1f} / 20MA {ma20:.1f})"
+        )
+        print(
+            f"  🚨 [Phase4 거시] VKOSPI 단기 급등 감지 "
+            f"(현재: {cur:.1f} / 20일 평균: {ma20:.1f}) — 국장 신규 매수 강제 차단"
+        )
+    except Exception:
+        pass
+
+
 def _build_market_context(state: dict) -> tuple[dict, float, str, dict]:
     """시장 날씨/거시 컨텍스트 계산 + 계좌 서킷 점검."""
     weather = get_real_weather(kis_api.broker_kr, kis_api.broker_us)
@@ -3828,12 +3840,7 @@ def _build_market_context(state: dict) -> tuple[dict, float, str, dict]:
                 f"환율Z={fx_z if fx_z is not None else 'n/a'} "
                 f"당일={rising_txt} spot={spot_txt}"
             )
-        for mk in ("KR", "US", "COIN"):
-            if not _macro_market_buy_allowed(_macro_snap, mk):
-                print(
-                    f"  🚫 [Phase4 글로벌] {mk} 신규 매수 차단 — "
-                    f"{(_macro_snap.get('market_buy_block_reason') or {}).get(mk, '')}"
-                )
+        # 시장별 매수 차단 로그는 KR/US/COIN 매수 루프에서만 출력
     else:
         print(f"  🛡️ [Phase4 거시] 비활성 | {macro_reason}")
 
@@ -3990,18 +3997,30 @@ def _prepare_kr_market_cycle_inputs(state: dict) -> tuple[dict, int, int, list[d
     """KR 매매 루프 입력값 준비(기존 로직 동일)."""
     bal = ensure_dict(get_balance_with_retry())
     kr_balance_data = bal.get("output2", [])
-    kr_cash, total_kr_equity = parse_kr_cash_total(kr_balance_data, _to_float)
+    kr_cash_disp, total_kr_equity = parse_kr_cash_total(kr_balance_data, _to_float)
+    kr_orderable = parse_kr_orderable_cash(kr_balance_data, _to_float)
 
     from services import ledger_valuation as lv
 
-    lv.write_kis_display_snapshot_part(
-        state, "KR", cash=float(kr_cash), total=float(total_kr_equity)
+    stock = float(_calc_kr_holdings_metrics(bal).get("current", 0.0) or 0.0)
+    kr_cash_disp, _total_disp = lv.persist_display_cash_total(
+        "KR", state, float(kr_cash_disp), stock
     )
+    total_kr_equity = int(lv.market_equity_for_risk(state, "KR"))
+    if total_kr_equity <= 0:
+        total_kr_equity = int(_total_disp)
     save_state(STATE_PATH, state)
 
     kr_output1 = _get_kr_output1(bal)
     held_kr = _extract_held_kr_codes_from_output1(kr_output1)
-    return bal, kr_cash, total_kr_equity, kr_output1, held_kr
+    # D+2=0 을 표시 예수로 폴백하면 당일 매수 후 주문가능 초과가 난다. 보유 있으면 0.
+    if kr_orderable > 0:
+        kr_cash = int(kr_orderable)
+    elif stock <= 0:
+        kr_cash = int(kr_cash_disp)
+    else:
+        kr_cash = 0
+    return bal, kr_cash, int(total_kr_equity), kr_output1, held_kr
 
 
 def _refresh_kr_cash_equity_after_sells() -> tuple[int, int]:
@@ -4014,7 +4033,7 @@ def _refresh_kr_cash_equity_after_sells() -> tuple[int, int]:
     return int(kr_cash), int(total_kr_equity)
 
 
-def _refresh_us_cash_equity_after_sells() -> tuple[float, float]:
+def _refresh_us_cash_equity_after_sells(state: dict | None = None) -> tuple[float, float]:
     """미장 매도 루프 직후·매수 직전: **실 KIS 잔고**로 예수·총자산 갱신."""
     _kis_post_trade_balance_pause()
     bal_read.invalidate("US")
@@ -4024,7 +4043,72 @@ def _refresh_us_cash_equity_after_sells() -> tuple[float, float]:
     us_cash = _recover_us_cash_from_output2_if_needed(us_cash, out2)
     us_stock_value = _compute_us_stock_value_from_output(us_bal, out2)
     total_us_equity = float(us_cash + us_stock_value)
-    return float(us_cash), total_us_equity
+    if state is not None:
+        us_cash, total_us_equity = _reconcile_us_equity_from_snapshot(
+            state, us_cash, us_stock_value
+        )
+    return float(us_cash), float(total_us_equity)
+
+
+def _reconcile_us_equity_after_sell(
+    *,
+    prev_cash: float,
+    prev_total: float,
+    prev_stock: float,
+    cash: float,
+    stock: float,
+) -> tuple[float, float]:
+    """매도 직후 KIS 예수 API에 체결대금이 아직 없을 때 총평 급감 방지."""
+    live_total = float(cash) + float(stock)
+    stock_sold = max(0.0, float(prev_stock) - float(stock))
+    pt = float(prev_total)
+    pc = float(prev_cash)
+    if stock_sold >= 25.0 and pt > 0 and live_total < pt * 0.97 and float(cash) < pc + stock_sold * 0.5:
+        adj_cash = pc + stock_sold
+        adj_total = adj_cash + float(stock)
+        print(
+            "  📌 [US] 매도 후 예수·총평 보정 — "
+            f"체결대금 API 반영 전 추정 (조회 ${live_total:.2f} → "
+            f"가용 ${adj_cash:.2f} · 총평 ${adj_total:.2f})"
+        )
+        return adj_cash, adj_total
+    prev_stock_f = float(prev_stock)
+    # prev_stock==0(전량매도 직후 스냅샷)이어도 0→0 유지를 stable 로 본다
+    stock_stable = abs(float(stock) - prev_stock_f) < max(25.0, prev_stock_f * 0.08)
+    cash_dropped = pc > 0 and float(cash) < pc * 0.85
+    if pt > 0 and live_total < pt * 0.97 and cash_dropped and stock_stable:
+        adj_cash = pt - float(stock)
+        adj_total = pt
+        print(
+            "  📌 [US] 매도 후 예수·총평 보정 — "
+            f"정산 지연 지속 추정 (조회 ${live_total:.2f} → "
+            f"가용 ${adj_cash:.2f} · 총평 ${adj_total:.2f})"
+        )
+        return adj_cash, adj_total
+    return float(cash), live_total
+
+
+def _reconcile_us_equity_from_snapshot(
+    state: dict,
+    cash: float,
+    stock: float,
+) -> tuple[float, float]:
+    """``last_kis_display_snapshot.us`` 직전값으로 매도 정산 지연 보정."""
+    from services import ledger_valuation as lv
+
+    part = lv._kis_snap_bucket(state, "US")
+    prev_cash = float(part.get("cash", 0) or 0)
+    prev_total = float(part.get("total", 0) or 0)
+    if prev_total < 50.0:
+        return float(cash), float(cash) + float(stock)
+    prev_stock = max(0.0, prev_total - prev_cash)
+    return _reconcile_us_equity_after_sell(
+        prev_cash=prev_cash,
+        prev_total=prev_total,
+        prev_stock=prev_stock,
+        cash=float(cash),
+        stock=float(stock),
+    )
 
 
 def _prefetch_kr_sell_ohlcv_if_needed(kr_output1: list[dict], held_kr: list[str], positions_count: int) -> None:
@@ -4131,10 +4215,25 @@ def _compute_coin_krw_balances(balances) -> tuple[float, float]:
 
 
 def _compute_total_coin_equity_from_balances(balances, krw_on_book: float) -> float:
-    """코인 총평가금 계산(원화 기준; 바이낸스는 USDT×환율)."""
-    total_coin_equity = float(krw_on_book)
-    kpx = float(coin_broker.get_krw_per_usdt()) if coin_config.is_binance() else 1.0
-    for b in balances:
+    """코인 총평가금(원화). 바이낸스는 견적 USDT×환율 — 합산·예산용."""
+    native = _compute_total_coin_equity_native_from_balances(balances, krw_on_book)
+    if coin_config.is_binance():
+        return float(coin_broker.native_to_krw(native))
+    return float(native)
+
+
+def _compute_total_coin_equity_native_from_balances(balances, quote_on_book: float) -> float:
+    """코인 총평가(견적 통화). quote_on_book: 업비트=원 예수, 바이낸스=무시(잔고에서 재계산).
+
+    Phase5 MDD·GUI와 맞추려면 ``coin_broker.total_equity_native_from_balances`` 를 우선.
+    """
+    try:
+        return float(coin_broker.total_equity_native_from_balances(balances))
+    except Exception:
+        pass
+    # 폴백: 기존 루프 (quote_on_book 은 업비트 KRW 예수)
+    total = float(quote_on_book)
+    for b in balances or []:
         if b.get("currency") in ["KRW", "VTHO"]:
             continue
         if coin_config.is_binance() and str(b.get("currency", "")).upper() == "USDT":
@@ -4144,9 +4243,8 @@ def _compute_total_coin_equity_from_balances(balances, krw_on_book: float) -> fl
             continue
         curr_p = coin_broker.get_current_price(t)
         if curr_p:
-            qv = float(_to_float(b.get("balance", 0))) * float(curr_p)
-            total_coin_equity += qv * kpx if coin_config.is_binance() else qv
-    return float(total_coin_equity)
+            total += float(_to_float(b.get("balance", 0))) * float(curr_p)
+    return float(total)
 
 
 def _count_coin_positions_for_sell_loop(balances, positions: dict) -> int:
@@ -4568,7 +4666,7 @@ def _format_swing_exit_log_suffix(
 def _check_swing_trailing_exit(
     curr_p: float, pos_info: dict, ohlcv, state: dict, ticker: str
 ) -> tuple[bool, str]:
-    """스윙 트레일링 — 비러너 본절 락 / 러너 5MA 이탈. 하드·5MA FULL은 ``check_swing_exit`` 와 연동."""
+    """스윙 트레일링 — 비러너 본절 락 / 러너 10MA 이탈. 하드·10MA FULL은 ``check_swing_exit`` 와 연동."""
     m = _market_from_ticker(ticker)
     exit_line = get_swing_exit_display_price(
         curr_p, pos_info, ohlcv, market=m, ticker=ticker
@@ -4579,14 +4677,12 @@ def _check_swing_trailing_exit(
     )
 
 
-# 타임스탑 — KR/US는 **영업시간** 누적, COIN은 24/7 연속시간
-#   V8 주식: 72h(≈3영업일) + 유예 +4% | V8 코인: 48h + 유예 +4%
-#   SWING 주식: 72h(≈3영업일) + 유예 +2% | SWING 코인: 48h + 유예 +2%
+# 타임스탑 — KR/US는 **거래일 24h**(휴장일 pause), COIN은 24/7 연속시간
+#   V8: 336h(14거래일) + 유예 +4% | SWING: 72h(3일) + 유예 +2%
+#   상수 단일 출처: strategy.rules (여기서 덮어쓰면 README·GUI와 어긋남)
 # (보유시각: buy_date 우선, 없으면 buy_time)
-V8_TIME_STOP_HOURS_EQUITY = 72.0
-V8_TIME_STOP_HOURS_COIN = 48.0
-V8_TIME_STOP_EXEMPT_PROFIT_PCT = 4.0
-# SWING_TIME_STOP_* — strategy.rules 단일 출처 (아래 import 재노출)
+# V8_TIME_STOP_* / SWING_TIME_STOP_* — strategy.rules import 재노출
+
 # COIN SWING_FIB: 진입 직후 기술바닥 FULL 유예(잔파동 노이즈) — 하드컷 % 이하는 즉시 탈출
 COIN_SWING_ENTRY_NOISE_GRACE_HOURS = float(config.get("coin_swing_entry_noise_grace_hours", 2.0))
 COIN_SWING_ENTRY_HARD_CUT_PCT = float(config.get("coin_swing_entry_hard_cut_pct", -3.0))
@@ -4701,11 +4797,6 @@ def _ai_false_breakout_buy_gate(
     ``strategy_type`` — ``TREND_V8`` / ``SWING_FIB`` 등을 ``ai_filter``에 넘겨 듀얼 프롬프트 분기.
     """
     if not AI_FALSE_BREAKOUT_ENABLED:
-        return True
-    if _is_hedge_ticker(ticker, market_tag):
-        print(
-            f"  [AI PASS] {ticker} - 헷지 자산 (Phase3 필터 생략, false_breakout_prob=0)"
-        )
         return True
     st = str(strategy_type or "TREND_V8").upper()
     ai_eval = evaluate_false_breakout_filter(
@@ -4837,6 +4928,21 @@ def run_trading_bot():
     weather, macro_mult, macro_reason, macro_snap = _build_market_context(state)
     _alpha_target_vol = float(config.get("alpha_target_vol", 0.02))
     state = load_state(STATE_PATH)
+    # 국장·미장 시가/종가 경계 아카이브 (15분 틱 edge)
+    try:
+        from execution.state_backup import maybe_archive_on_session_edges
+
+        _sess_fired = maybe_archive_on_session_edges(
+            state,
+            state_path=STATE_PATH,
+            history_path=TRADE_HISTORY_PATH,
+            kr_open=bool(is_market_open("KR")),
+            us_open=bool(is_market_open("US")),
+        )
+        if _sess_fired:
+            print(f"  💾 [세션 백업] {', '.join(_sess_fired)}")
+    except Exception as _e_sess_bak:
+        print(f"  ⚠️ [세션 백업] 스킵: {_e_sess_bak}")
     _buy_cycle_tag = order_idem.cycle_tag_15m_kst()
     _rec_fixes = order_idem.reconcile_positions_for_cycle(state, _buy_cycle_tag, STATE_PATH)
     if _rec_fixes > 0:

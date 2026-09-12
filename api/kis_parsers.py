@@ -64,12 +64,73 @@ def as_row_dict(output2):
     return {}
 
 
-def parse_kr_cash_total(output2, to_float):
-    """KR output2에서 예수금/총평가를 추출."""
+def parse_kr_orderable_cash(output2, to_float) -> int:
+    """주문가능 예수 — ``prvs_rcdl_excc_amt`` (D+2 가수도). 매수 예산용."""
     row = as_row_dict(output2)
-    cash = int(to_float(row.get("prvs_rcdl_excc_amt", 0)))
-    total = int(to_float(row.get("tot_evlu_amt", cash)))
+    return int(to_float(row.get("prvs_rcdl_excc_amt", 0)))
+
+
+def parse_kr_cash_total(output2, to_float):
+    """KR output2에서 **표시용** 예수금/총평가를 추출.
+
+    한투 주식잔고조회(TTTC8434R) output2 공식 의미:
+
+    * ``dnca_tot_amt`` — 예수금총금액 (D+0~D+2 포함). GUI·Phase5 예수.
+    * ``nxdy_excc_amt`` — D+1 예수
+    * ``prvs_rcdl_excc_amt`` — D+2 예수 (주문가능). 당일 매수 직후 0이 될 수 있음.
+    * ``scts_evlu_amt`` — 유가평가
+    * ``tot_evlu_amt`` — **유가평가 + D+2 예수만**. 당일 매수 후 D+2=0 이면 보유평가만 남음.
+    * ``nass_amt`` — 순자산 (예수총액+유가). 총평가 표시에 적합.
+
+    매도 직후 MTS는 예수(dnca)만 낮고 D+2·순자산은 매도대금 포함인 경우가 많다.
+    보유(scts)가 거의 없으면 ``total`` 에 D+2/``tot_evlu`` 상한을 반영한다.
+
+    개발자센터 앱 설정·``FUND_STTL_ICLD_YN`` 으로는 이 필드 구성이 바뀌지 않는다.
+    """
+    row = as_row_dict(output2)
+    d2 = int(to_float(row.get("prvs_rcdl_excc_amt", 0)))
+    dnca = int(to_float(row.get("dnca_tot_amt", 0)))
+    nxdy = int(to_float(row.get("nxdy_excc_amt", 0)))
+    scts = int(to_float(row.get("scts_evlu_amt", 0)))
+    tot = int(to_float(row.get("tot_evlu_amt", 0)))
+    nass = int(to_float(row.get("nass_amt", 0)))
+    cash = dnca if dnca > 0 else max(d2, nxdy, 0)
+    if nass > 0:
+        total = nass
+        implied = max(0, nass - max(scts, 0))
+        if scts > 0 and implied >= 0 and cash > int(implied * 1.15):
+            cash = implied
+    else:
+        total = max(tot, cash + scts, cash)
+        if scts > 0 and tot > 0 and tot <= int(scts * 1.02) and cash > 0:
+            total = max(total, cash + scts)
+    if cash <= 0 and total > scts > 0:
+        cash = total - scts
+    if scts > 0 and cash > 0 and total > 0 and cash + scts > int(total * 1.08):
+        cash = max(0, total - scts)
+    # 보유≈0: 매도대금이 D+2/tot_evlu 에만 잡히고 nass·dnca 가 정체인 경우
+    min_hold = 10_000
+    if scts < min_hold:
+        total = max(total, tot, d2, nxdy, dnca, cash)
+        # 전액 현금: 표시 예수 = 총자산 (MTS 순자산과 동일). 주문가능은 parse_kr_orderable_cash(D+2) 별도.
+        if scts <= 0 and total > cash:
+            cash = total
     return cash, total
+
+
+def format_kr_output2_cash_fields(output2, to_float) -> str:
+    """디버그용 — dnca/D+2/nass 등 raw 한 줄."""
+    row = as_row_dict(output2)
+    keys = (
+        "dnca_tot_amt",
+        "nxdy_excc_amt",
+        "prvs_rcdl_excc_amt",
+        "scts_evlu_amt",
+        "tot_evlu_amt",
+        "nass_amt",
+    )
+    parts = [f"{k}={int(to_float(row.get(k, 0))):,}" for k in keys]
+    return " · ".join(parts)
 
 
 def parse_us_cash_fallback(output2, to_float):

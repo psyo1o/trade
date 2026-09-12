@@ -25,6 +25,9 @@ if str(ROOT) not in sys.path:
 from execution.circuit_break import estimate_usdkrw  # noqa: E402
 from execution.guard import (  # noqa: E402
     PEAK_TOTAL_EQUITY_KEY,
+    adjust_peak_equity_for_capital,
+    apply_phase5_share_anchor,
+    get_phase5_peak_market_equity,
     load_state,
     save_state,
 )
@@ -56,6 +59,24 @@ def _parse_amount_krw(raw: str) -> float:
 
 # GUI 등에서 재사용
 parse_capital_amount_krw = _parse_amount_krw
+
+_MARKET_LABELS = {"KR": "국장", "US": "미장", "COIN": "코인", "ALL": "합산"}
+
+
+def normalize_capital_market(raw: str | None) -> str:
+    s = str(raw or "KR").strip().upper()
+    aliases = {
+        "KR": "KR",
+        "국장": "KR",
+        "US": "US",
+        "미장": "US",
+        "COIN": "COIN",
+        "코인": "COIN",
+        "ALL": "ALL",
+        "합산": "ALL",
+        "TOTAL": "ALL",
+    }
+    return aliases.get(s, "KR") if s in aliases else "KR"
 
 
 def _refresh_aux_snapshot() -> None:
@@ -101,9 +122,14 @@ def apply_capital_peak_adjustment(
     amount_krw: float,
     state_path: Path | None = None,
     source_label: str = "adjust_capital.py",
+    market: str = "KR",
 ) -> tuple[bool, str]:
     """
-    ``circuit_aux_*`` 갱신 후 ``peak_total_equity`` 입·출금 보정 및 ``capital_adjustments`` 기록.
+    ``circuit_aux_*`` 갱신 후 고점 입·출금 보정 및 ``capital_adjustments`` 기록.
+
+    ``market``: ``KR`` / ``US`` / ``COIN`` / ``ALL``.
+    시장을 지정하면 해당 ``peak_equity_*`` 와 합산 고점을 함께 가감하고,
+    비중 앵커를 현재 스냅샷으로 다시 잡는다.
 
     Returns
         ``(True, 요약 메시지)`` 또는 ``(False, 오류 메시지)``.
@@ -111,6 +137,7 @@ def apply_capital_peak_adjustment(
     path = state_path or STATE_PATH
     if amount_krw <= 0:
         return False, "금액은 0보다 커야 합니다."
+    mk = normalize_capital_market(market)
 
     _refresh_aux_snapshot()
 
@@ -130,9 +157,11 @@ def apply_capital_peak_adjustment(
             )
         new_peak = old_peak - amount_krw
         kind = "withdraw"
+        delta = -amount_krw
     else:
         new_peak = old_peak + amount_krw
         kind = "deposit"
+        delta = amount_krw
 
     if new_peak < 0.0:
         return (
@@ -145,9 +174,70 @@ def apply_capital_peak_adjustment(
 
     from services import ledger_valuation as lv
 
+    rate = estimate_usdkrw()
+    market_peak_note = ""
+    if mk in ("KR", "US", "COIN"):
+        if mk == "US":
+            delta_native = (delta / rate) if rate > 0 else 0.0
+            unit = "USD"
+        elif mk == "COIN":
+            from api import coin_broker as _cb
+
+            if _cb.coin_equity_quote_unit() == "USDT":
+                kpx = float(_cb.get_krw_per_usdt() or 0) or float(rate) or 1.0
+                delta_native = (delta / kpx) if kpx > 0 else 0.0
+                unit = "USDT"
+            else:
+                delta_native = delta
+                unit = "원"
+        else:
+            delta_native = delta
+            unit = "원"
+        old_m = get_phase5_peak_market_equity(state, mk)
+        if old_m <= 0.0:
+            if mk == "KR":
+                old_m = float(lv.kis_display_total(state, "KR") or 0)
+            elif mk == "US":
+                old_m = float(lv.kis_display_total(state, "US") or 0)
+            else:
+                from api import coin_broker as _cb2
+
+                old_m = float(_cb2.circuit_aux_coin_native(state) or 0)
+                if old_m <= 0:
+                    old_m = float(state.get("circuit_aux_last_coin_krw", 0) or 0)
+            state[f"peak_equity_{mk}"] = float(old_m)
+        new_m = adjust_peak_equity_for_capital(state, mk, delta_native)
+        market_peak_note = (
+            f"{_MARKET_LABELS.get(mk, mk)} 고점: {old_m:,.2f}{unit} → {new_m:,.2f}{unit}"
+        )
+        try:
+            apply_phase5_share_anchor(
+                state,
+                kr_krw=float(lv.kis_display_total(state, "KR") or 0),
+                us_krw=float(lv.kis_display_total(state, "US") or 0) * rate,
+                coin_krw=float(state.get("circuit_aux_last_coin_krw", 0) or 0),
+                path=path,
+                market_ok={"KR": True, "US": True, "COIN": True},
+            )
+        except Exception:
+            pass
+    elif mk == "ALL":
+        try:
+            apply_phase5_share_anchor(
+                state,
+                kr_krw=float(lv.kis_display_total(state, "KR") or 0),
+                us_krw=float(lv.kis_display_total(state, "US") or 0) * rate,
+                coin_krw=float(state.get("circuit_aux_last_coin_krw", 0) or 0),
+                path=path,
+                market_ok={"KR": True, "US": True, "COIN": True},
+            )
+        except Exception:
+            pass
+
     entry = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "kind": kind,
+        "market": mk,
         "amount_krw": float(amount_krw),
         "peak_before_krw": float(old_peak),
         "peak_after_krw": float(new_peak),
@@ -180,6 +270,9 @@ def apply_capital_peak_adjustment(
         lines.append(
             f"ℹ️ 장부에 합산 고점이 없거나 0이라, 추정 총자산 {current_total:,.0f}원을 고점으로 간주했습니다."
         )
+    lines.append(f"대상 시장: {_MARKET_LABELS.get(mk, mk)} ({mk})")
+    if market_peak_note:
+        lines.append(market_peak_note)
     lines.extend(
         [
             f"이전 합산 고점: {old_peak:,.0f} 원 → 보정 후: {new_peak:,.0f} 원",
@@ -191,9 +284,9 @@ def apply_capital_peak_adjustment(
 
 
 def main() -> int:
-    print("=== 합산 자산 고점(Phase 5 MDD) 수동 보정 ===\n")
+    print("=== Phase 5 고점 수동 보정 (시장별 입·출금) ===\n")
 
-    print("\n조작 종류를 선택하세요.")
+    print("조작 종류를 선택하세요.")
     print("  1 — 입금 (고점에 금액만큼 가산)")
     print("  2 — 출금 (고점에서 금액만큼 감산)\n")
 
@@ -201,6 +294,18 @@ def main() -> int:
     if choice not in ("1", "2"):
         print("오류: 1 또는 2만 입력 가능합니다.", file=sys.stderr)
         return 1
+
+    print("\n어느 시장 계좌로 입·출금했습니까?")
+    print("  1 — 국장 (KR)")
+    print("  2 — 미장 (US)")
+    print("  3 — 코인 (COIN)")
+    print("  4 — 합산만 (레거시 peak_total_equity)\n")
+    mk_choice = input("선택 (1~4): ").strip()
+    mk_map = {"1": "KR", "2": "US", "3": "COIN", "4": "ALL"}
+    if mk_choice not in mk_map:
+        print("오류: 1~4만 입력 가능합니다.", file=sys.stderr)
+        return 1
+    market = mk_map[mk_choice]
 
     try:
         amount_raw = input("금액 (원, 콤마 가능): ").strip()
@@ -210,7 +315,12 @@ def main() -> int:
         return 1
 
     withdraw = choice == "2"
-    ok, msg = apply_capital_peak_adjustment(withdraw=withdraw, amount_krw=amount, state_path=STATE_PATH)
+    ok, msg = apply_capital_peak_adjustment(
+        withdraw=withdraw,
+        amount_krw=amount,
+        state_path=STATE_PATH,
+        market=market,
+    )
     if not ok:
         print(msg, file=sys.stderr)
         return 1

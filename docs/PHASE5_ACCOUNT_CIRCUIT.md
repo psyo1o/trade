@@ -2,43 +2,94 @@
 
 **전제:** HTS/MTS 수동 매매 없음 — **봇만** 매매한다.
 
-**한 줄 요약 (2026-06):**
+> **잔고 스냅샷 오발동·근본 해결 로드맵:** [`EQUITY_SNAPSHOT_CIRCUIT_PLAN.md`](EQUITY_SNAPSHOT_CIRCUIT_PLAN.md)  
+> Phase5·MDD 판정은 **장부 risk 총평** (`market_equity_for_risk`) 우선. 스냅샷은 GUI·표시 전용.
 
-- **청산:** 기본은 **시장별(KR/US/COIN) 포트폴리오 비중** 하한 미만일 때 **해당 시장만** 전량 청산.
+> **2026-08-23:** 계좌 -5% `check_mdd_break` **매수 차단은 폐지**. `peak_equity_*`는 Phase5(기본 15%) 고점 추적용으로만 유지.
+
+**한 줄 요약 (2026-08):**
+
+- **청산:** 기본은 **시장별 잔고 MDD** — `peak_equity_KR/US/COIN` 대비 `account_circuit_mdd_pct`(기본 15%) 이상 하락하면 **해당 시장만** 전량 청산. 지수 MDD는 `account_circuit_use_index: true` 옵션.
+- **입출금:** GUI/스크립트에서 **어느 시장 계좌인지** 고르면 그 시장 고점만 가감. 미장 입금이 국장 서킷을 건드리지 않음.
+- **비중 서킷:** `account_circuit_use_share: true` 일 때만 (예전 기본).
 - **합산 MDD 서킷:** `account_circuit_use_total: true` 일 때만 (레거시).
 - **KIS 잔고 API:** 평상시 **장부+현재가** 표시, **매매·강제 새로고침·입출금** 때만 실조회 (`kis_balance_sync_mode: on_trade`).
 
 ---
 
-## 1. 시장별 비중 서킷 (기본)
+## 1. 시장별 잔고 MDD 서킷 (기본)
+
+> 지수 MDD는 아래 「옵션」 또는 `account_circuit_use_index`.
+
+### 판정 (잔고)
+
+| 항목 | 설명 |
+|------|------|
+| 고점 | `peak_equity_{시장}` (KR=원, US=USD, COIN=업비트 원 / 바이낸스 USDT) |
+| 현재 | KR/US=`market_equity_for_risk`, COIN=`circuit_aux_last_coin_native` |
+| 발동 | 고점 대비 DD ≥ `account_circuit_mdd_pct` (기본 15%) |
+| 장외 | KR/US는 장중에만 |
+| 보유 0 | 스킵 |
+
+코드: `evaluate_per_market_equity_circuits` · `_run_per_market_mdd_circuits`
+
+## 1-opt. 시장별 지수 MDD 서킷 (옵션)
 
 ### 판정
 
 | 항목 | 설명 |
 |------|------|
-| 합산 대상 | `circuit_aux` 가 **OK인 시장만** 합산 (API 실패 시장 제외 → 오발동 방지) |
-| 비중 | `시장 평가액(KRW) / OK 시장 합계 × 100` |
-| 하한 | `config` 의 `account_circuit_min_share_kr_pct` 등 (기본 KR·US **8%**, COIN **5%**) |
-| 앵커 | 주차(서울)마다 `phase5_share_anchor` 저장, `비중 < 앵커×anchor_min_ratio` 도 발동 가능 |
+| 벤치마크 | US **SPY** / KR **069500.KS** / COIN **거래소 BTC** |
+| 고점 | 최근 **6mo** 일봉 종가 최고값 |
+| 현재 | 최신 종가 (yfinance) |
+| 발동 | `(고점 - 현재) / 고점 × 100 >= account_circuit_mdd_pct` (기본 15%) |
+| 장외 | KR/US는 **장중**에만 판정 (기존과 동일) |
+| API 실패 | 해당 시장 스킵 (발동 안 함) |
 
-코드: `execution/circuit_break.py` → `evaluate_per_market_share_circuits`  
-루프: `run_bot._maybe_run_account_circuit`
+코드: `execution/phase5_index_circuit.py`  
+루프: `execution/phase5_ops._run_per_market_index_circuits`
 
 ### 발동 시 동작
 
-1. 텔레그램: `🚨 [Phase5 {시장} 비중 서킷]`
-2. **해당 시장만** `_phase5_liquidate_market(시장)` (lane `phase5`)
-3. `account_circuit_market_cooldowns.{시장}` → **그 시장 신규 매수만** 24h 차단 (기본 `account_circuit_cooldown_hours`)
-4. `phase5_pending_liquidation_markets` 에 시장 추가 → 비장중이면 장 개시 후 재시도
+1. 텔레그램: `🚨 [Phase5 {시장} 지수 서킷]`
+2. yfinance **2차 재조회** 후에도 임계 초과
+3. **AI 청산 심사** — 보유·지수·계좌 맥락 → `liquidation_score` 0~100 (기본 **≥70** 청산). LLM 무응답 시 재시도(기본 3회) → 실패 시 보류
+4. **해당 시장만** 전량 청산 · 24h 매수 쿨다운
 
-**다른 시장(예: 코인만 하한 미만)은 국·미 포지션을 건드리지 않음.**
+코드: `phase5_index_circuit.py`, `phase5_ai_liquidation.py`, `phase5_ops._ai_gate_phase5_liquidation`
+
+**config:** `phase5_ai_liquidation_enabled`, `phase5_ai_liquidation_threshold`, `phase5_ai_liquidation_provider`, `phase5_ai_liquidation_max_retries`
+
+### 레거시 계좌 MDD
+
+`peak_equity_*`·`market_equity_for_risk` 기반 Phase5는 **폐지**. 입출금 고점 보정(`adjust_capital`)은 레거시 키 유지용.
+
+### 입출금
+
+GUI **고점 보정** 탭 또는 `adjust_capital.py` 에서 **국장/미장/코인**을 고른 뒤 금액을 넣는다.
+
+- 국장 입금 100만 → `peak_equity_KR` +100만, `peak_total_equity` +100만
+- 미장 입금 100만 → `peak_equity_US` +(100만/환율) USD, 합산 고점 +100만
+- 비중 앵커(`phase5_share_anchor`)도 현재 스냅샷으로 다시 잡음 (비중 모드 쓸 때)
 
 ### 로그 예
 
 ```
-🛡️ [Phase5·KR] 비중 6.2% / 하한 8.0% → 발동 | KR 비중 6.2% < 하한 8.0% — 시장 단위 서킷
-🛡️ [Phase5·US] 비중 52.0% / 하한 26.0% → 정상 | ...
+🛡️ [Phase5·KR] 658,357원 (고점 658,357원) DD=0.00% → 정상 | KR 고점 대비 0.00% 하락 — 임계(15%) 이내
+🛡️ [Phase5·US] $3,463 (고점 $3,515) DD=1.48% → 정상 | ...
 ```
+
+---
+
+## 1-b. 시장별 비중 서킷 (옵션)
+
+`config.json`:
+
+```json
+"account_circuit_use_share": true
+```
+
+합산 대비 비중이 하한 미만이면 해당 시장 청산. **다른 시장 입금·평가 상승만으로도** 비중이 내려가 오발동할 수 있어 기본은 끈다.
 
 ---
 
@@ -134,19 +185,52 @@ Phase5 청산 직후 로그 ` [쿨다운 적용] 379810 | 사유: Phase5 서킷 
 
 ---
 
+## 5-b. Risk 총평 vs Display 스냅샷 (Phase 1)
+
+| 용도 | 함수 / 저장소 | sanitize |
+|------|--------------|----------|
+| **Phase5 15% 서킷** | `market_equity_for_risk()` | 사용 안 함 |
+| **5% MDD 매수 중단** | **폐지** (`check_mdd_break` 스텁 항상 True) | — |
+| **매수 배정·비중** | KR/US 사이클 → risk 총평 | 사용 안 함 |
+| **GUI·텔레·리포트** | `last_kis_display_snapshot` | `persist_display_cash_total()` |
+
+코드: `services/ledger_valuation.py` — `market_equity_for_risk`, `persist_display_cash_total`  
+상세 로드맵: [`EQUITY_SNAPSHOT_CIRCUIT_PLAN.md`](EQUITY_SNAPSHOT_CIRCUIT_PLAN.md)
+
+### 청산 직전 재검증 (2026-08-24 → 2026-08-28 3단계)
+
+KR/US가 MDD로 **1차 발동**되면 즉시 청산하지 않고:
+
+1. `invalidate` + KIS `refresh=True` 강제 재조회  
+2. `market_equity_for_risk` 재계산 → MDD **2차** 판정  
+3. **타당성 게이트** — US=SPY / KR=069500.KS / COIN=거래소 BTC 최근 최대 DD와 계좌 DD 비교(차이 >12pp면 보류). 1루프 내 15%+ 절벽·무보유도 보류.  
+4. 위를 모두 통과할 때만 청산 / 재조회·타당성 실패 시 **보류** + 텔레그램
+
+코드: `phase5_ops._reconfirm_phase5_triggers_before_liquidation`, `phase5_plausibility.evaluate_phase5_liquidation_plausibility`
+
+### 매도 정산 지연 (2026-08-28)
+
+`market_equity_for_risk`: ledger `cash+stock` 이 `snap_total` 보다 5%+ 낮으면 **snap_total** 반환 (시간 유예 없음).
+
+---
+
 ## 6. `circuit_aux` · Phase5 보조
 
 | 키 | 용도 |
 |----|------|
 | `last_kis_display_snapshot` | 국·미 예수·총평 **영구 저장** (KIS 실조회 시 갱신) |
-| `circuit_aux_last_coin_krw` | 코인 총평(원) |
+| `circuit_aux_last_coin_native` | 코인 총평(견적 통화) — **Phase5 MDD** (업비트 원 / 바이낸스 USDT) |
+| `circuit_aux_last_coin_krw` | 코인 총평(원) — 합산·비중용 (바이낸스=native×환율) |
+| `peak_equity_COIN_unit` | `"KRW"` \| `"USDT"` — COIN 고점 단위 |
 | `last_kr_cash_krw` / `last_us_cash_usd` | 레거시 예수 폴백 (`display_cash_from_state`) |
 | `phase5_share_anchor` | 주차별 시장 비중 앵커 |
 | `_phase5_aux_sync` | 루프마다 `kr_ok` / `us_ok` / `coin_ok`; **장부+시세** 루프 시 `ledger_only: true` 와 `kr_krw` / `usd_total` (Phase5 비중 판정용 추정 총평) |
 
 `on_trade` 모드: `refresh_circuit_aux_from_brokers` 대신 `update_circuit_aux_from_ledger` 로 **장부+시세 추정** (코인은 거래소 조회 병행).
 
-Phase5 비중 계산은 `ledger_valuation.kis_display_total()` 을 사용한다. `ledger_only` 루프에서는 `_phase5_aux_sync` 의 추정 총평을 우선해 **스냅샷 총평이 낡아도** 보유 시세 변동을 반영한다. KIS 실조회·강제 새로고침 후에는 스냅샷과 추정값이 다시 맞춰진다.
+Phase5·매수 배정은 **`market_equity_for_risk()`** (장부 예수 + 보유)를 쓴다. (구 5% `check_mdd_break` 매수 차단은 폐지.)  
+`ledger_only` 루프에서는 `_phase5_aux_sync` 의 risk 추정값을 우선한다.  
+**표시용** `last_kis_display_snapshot` 은 GUI·텔레 전용 — 서킷 입력으로 쓰지 않는다.
 
 ---
 
@@ -156,12 +240,13 @@ Phase5 비중 계산은 `ledger_valuation.kis_display_total()` 을 사용한다.
 {
   "account_circuit_enabled": true,
   "account_circuit_use_total": false,
+  "account_circuit_use_share": false,
+  "account_circuit_mdd_pct": 15,
   "account_circuit_min_share_kr_pct": 8,
   "account_circuit_min_share_us_pct": 8,
   "account_circuit_min_share_coin_pct": 5,
   "account_circuit_share_anchor_min_ratio": 0.5,
   "account_circuit_cooldown_hours": 24,
-  "account_circuit_mdd_pct": 15,
   "kis_balance_sync_mode": "on_trade",
   "coin_swing_entry_noise_grace_hours": 2.0,
   "coin_swing_entry_hard_cut_pct": -3.0
@@ -179,7 +264,7 @@ Phase5 비중 계산은 `ledger_valuation.kis_display_total()` 을 사용한다.
 ## 8. 코드 위치
 
 ```
-execution/circuit_break.py     # 비중·합산 MDD 판정
+execution/circuit_break.py     # 시장별 평가 MDD · 비중 · 합산 MDD 판정
 execution/guard.py               # 쿨다운·앵커·peak_total_equity
 execution/balance_policy.py    # on_trade / live sync 플래그
 execution/balance_read.py        # KIS TTL·stale·ledger_only
@@ -234,6 +319,8 @@ README §5-3 표와 동일 내용.
 | 증상 | 확인 |
 |------|------|
 | 비중 정상인데 청산됨 | `phase5_pending_liquidation*` · 레거시 boolean — 봇 재시작 후 prune 로그 확인 |
+| 입출금 직후 다른 시장 서킷 | 고점 보정에서 **해당 시장**을 골랐는지. 기본은 시장별 MDD라 다른 시장은 안 건드림 |
+| 국장 총평이 갑자기 20만 등으로 급감 | 스냅샷 급감 가드·`kis_display_total` 가드. 강제 KIS 새로고침 |
 | `output1 없음` / EGW00201 | `on_trade`·캐시·`kis_rate_limit` 동작, **강제 새로고침** 남용 줄이기, 환경 변수로 `BOT_KIS_MAX_CALLS_PER_SEC` 낮추기 |
 | 한 시장만 막혀야 하는데 전 시장 매수 불가 | `account_circuit_use_total` 이 true 인지, `account_circuit_cooldown_until` 존재 여부 |
 | 예수금 표시 어긋남 | 강제 KIS 새로고침 1회 또는 `adjust_capital` 로 live sync |
@@ -258,4 +345,6 @@ README §5-3 표와 동일 내용.
 | 2026-06 | KIS 잔고 **on_trade** + TTL 캐시 |
 | 2026-06 | 대기 청산 **stale prune** · 레거시 pending 플래그 정리 |
 | 2026-06 | 국·미 표시 **단일 스냅샷** · Phase5 `ledger_only` 추정 총평 · US force_kis 급증 가드 정리 |
-| 2026-06 | **COIN SWING** 진입 2h 기술바닥 FULL 유예 · -3% 하드컷 (`coin_swing_entry_*`) |
+| 2026-08 | **기본을 시장별 평가 MDD** 로 전환. 입출금은 시장 선택. 비중 서킷은 `account_circuit_use_share`. 총평 급감 가드. |
+| 2026-08-20 | 스냅샷·서킷 오발동 근본 해결 Phase0~3 (market_equity_for_risk, sanitize Rule1~3). 상세: EQUITY_SNAPSHOT_CIRCUIT_PLAN.md, docs/CHANGELOG.md |
+| 2026-08-21 | Phase5/MDD **장중 게이트**, US stale 현금 오탐 방어. 상세: docs/CHANGELOG.md |

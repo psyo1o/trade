@@ -453,13 +453,14 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
                 f"(매도단계 전 스냅샷 대비 반영)"
             )
 
-        # 매수는 MDD → Phase4 거시 체크 후에만 실행
-        if not rb.check_mdd_break("KR", total_kr_equity, state, rb.STATE_PATH):
-            print("  -> 🚨 국장 MDD 브레이크 작동 중. 신규 매수 중단.")
-        elif macro_mult <= 0:
+        # 매수는 Phase4 거시 → Phase5 쿨다운
+        from services import ledger_valuation as lv
+
+        total_kr_equity = int(lv.market_equity_for_risk(state, "KR") or total_kr_equity)
+        if macro_mult <= 0:
             print(f"  -> 🚨 국장 Phase4 거시 방어막: 신규 매수 중단. ({macro_reason})")
         elif rb.in_account_circuit_cooldown(state, "KR"):
-            print("  -> 🚨 국장 Phase5 비중 서킷 쿨다운 — 신규 매수 중단.")
+            print("  -> 🚨 국장 Phase5 서킷 쿨다운 — 신규 매수 중단.")
         else:
             # ⏳ [핵심] 국장 매수: KRX 정규장 마감(15:30 KST) 직전 N분만 (기본 30분 → 15:00~15:29)
             now_kr = datetime.now(pytz.timezone("Asia/Seoul"))

@@ -1,0 +1,35 @@
+---
+description: 코드 변경 시 CURRENT·CHANGELOG·관련 docs를 반드시 갱신
+alwaysApply: true
+---
+
+# 변경 내역·문서 반영 (필수)
+
+진입점: `AGENTS.md` · `docs/CURRENT.md` · `docs/CHANGELOG.md` · 목차 `docs/README.md`.
+
+## 필수 갱신 (매 작업 종료)
+
+1. **`docs/CHANGELOG.md`** — 맨 위(최신)에 항목 추가
+2. **`docs/CURRENT.md`** — 「지금/다음/주의」를 짧게 맞춤
+3. 주제 docs가 있으면 같이 (`docs/README.md` 지도 참고)
+4. 상수·게이트·전략 안내가 바뀌면 **루트 README** + **`run_gui._build_strategy_guide_text`** 도 맞출 것
+
+## CHANGELOG 형식
+
+```markdown
+## YYYY-MM-DD — 짧은 제목
+
+- **무엇을:** …
+- **왜:** …
+- **주요 파일:** `path/a.py`
+- **이어서 할 일 / 주의:** …
+- **테스트:** `pytest …`
+```
+
+- 날짜: 작업일 `YYYY-MM-DD`, 한국어, 비밀 금지
+- 커밋 전이라도 **문서를 먼저** 남긴다
+
+## 예외
+
+- 초미세 오타만 → CHANGELOG 한 줄로 묶기 가능
+- 사용자가 「문서 생략」을 명시한 경우만 생략

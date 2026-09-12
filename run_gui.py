@@ -7,8 +7,9 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
     * **실시간 작동 로그(봇 브리핑)** 는 탭 위젯 **아래**에 두어, 탭을 바꿔도 같은 자리에 보이게 한다(세로 ``QSplitter``).
     * ``import run_bot`` 시점에 ``config.json`` 이 로드되므로 **설정 변경 후 GUI 재시작** 필요.
     * **매매·전략 안내** 탭: V8·스윙·**하락장 헷지**(``strategy/hedge_universe.py``)·Phase 1~5 요약.
-    * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 ``peak_total_equity``·``capital_adjustments`` 반영 (백그라운드 스레드).
-    * 바이낸스 코인 상단 **예수금·총평가** 숫자는 ``binance_display_cash_and_total_usdt()`` 등. 보유/장부 단가는 USDT. 스냅샷·서킷은 엔진과 동일 원화 환산.
+    * **고점 보정 (입출금)** 탭: ``adjust_capital.py`` 와 동일하게 시장별 ``peak_equity_*``·합산 고점·``capital_adjustments`` 반영 (백그라운드 스레드).
+    * 바이낸스 코인 상단 **예수금·총평가** 숫자는 ``binance_display_cash_and_total_usdt()`` 등. 보유/장부 단가는 USDT.
+      Phase5 **시장별** COIN MDD도 견적 통화(업비트 원 / 바이낸스 USDT). 합산·비중·스냅샷 라벨은 원화 환산.
     * 매매는 시작 즉시 실행하지 않고, **KST :00 / :15 / :30 / :45** 정렬 스케줄에만 맞춰 `run_trading_bot`을 실행한다.
     * ``QTimer.singleShot`` 겹침으로 로그가 두 줄씩 나오는 것을 막기 위해 **단일 ``QTimer`` + 실행 중 가드**를 쓴다.
     * 네트워크 감시는 **백그라운드 스레드**에서 돌린다. 생존신고(heartbeat) 텔레그램은 **KST :00 / :30** 30분마다 예약하고, **해당 슬롯의 15분 매매 사이클이 끝난 뒤** 보낸다.
@@ -34,7 +35,8 @@ from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QTextEdit, QTableWidget, QTableWidgetItem,
                              QHeaderView, QTabWidget, QTabBar, QMessageBox, QSpinBox, QLineEdit,
-                             QRadioButton, QButtonGroup, QSizePolicy, QSplitter, QAbstractItemView)
+                             QRadioButton, QButtonGroup, QSizePolicy, QSplitter, QAbstractItemView,
+                             QComboBox)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QSize
 from PyQt5.QtGui import QFont
 from pathlib import Path
@@ -87,12 +89,15 @@ from run_bot import (
 from execution.guard import load_state, save_state
 from execution import ledger_apply as ledger_apply
 from strategy.rules import (
+    BREAKEVEN_LOCK_MULT,
     SWING_ENTRY_RSI_MIN,
     SWING_GAP_UP_MAX_PCT,
     SWING_MA60_MAX_EXTENSION_PCT_COIN,
     SWING_MA60_MAX_EXTENSION_PCT_KR,
     SWING_MA60_MAX_EXTENSION_PCT_US,
-    SWING_PROFIT_LOCK_ACTIVATE_PCT,
+    SWING_PROFIT_LOCK_ATR_MULT,
+    SWING_PROFIT_LOCK_PCT_MAX,
+    SWING_PROFIT_LOCK_PCT_MIN,
     SWING_RUNNER_TRAIL_MA_DAYS,
     SWING_SCALE_OUT_R_MULT,
     SWING_TIME_DECAY_GAP_CLOSE_PER_24H,
@@ -219,9 +224,9 @@ def _gui_market_code_from_label(market_label: str) -> str:
 def _build_strategy_guide_text() -> str:
     """GUI 매매·전략 안내 탭 — README §8·run_bot 엔진과 동기화된 전체 요약."""
     v8_eq = float(getattr(run_bot, "V8_TIME_STOP_HOURS_EQUITY", 72.0))
-    v8_coin = float(getattr(run_bot, "V8_TIME_STOP_HOURS_COIN", 48.0))
+    v8_coin = float(getattr(run_bot, "V8_TIME_STOP_HOURS_COIN", 72.0))
     sw_eq = float(getattr(run_bot, "SWING_TIME_STOP_HOURS_EQUITY", 72.0))
-    sw_coin = float(getattr(run_bot, "SWING_TIME_STOP_HOURS_COIN", 48.0))
+    sw_coin = float(getattr(run_bot, "SWING_TIME_STOP_HOURS_COIN", 72.0))
     v8_ex = float(getattr(run_bot, "V8_TIME_STOP_EXEMPT_PROFIT_PCT", 4.0))
     sw_ex = float(getattr(run_bot, "SWING_TIME_STOP_EXEMPT_PROFIT_PCT", 2.0))
     sw_r = float(SWING_SCALE_OUT_R_MULT)
@@ -255,22 +260,23 @@ def _build_strategy_guide_text() -> str:
         "- COIN: 24h 거래대금 상위 N (config upbit/binance_universe_top, 기본 10)\n"
         "  · 스테이블·페그 코인 자동 제외\n\n"
         "■ 2) 매수 전 공통 게이트 (V8·스윙 공통)\n"
-        "- Phase5: 합산 계좌 MDD 서킷 (peak_total_equity, 월요일 주차 고점)\n"
+        "- Phase5: 시장별 잔고 MDD(KR=원, US=USD, COIN=업비트 원/바이낸스 USDT) + AI\n"
+        "- Phase5(옵션): 합산 계좌 MDD 서킷 (peak_total_equity)\n"
         "- Phase4: 시장별 일반 주식 신규 매수 차단 (macro_mult=1.0, 예산 축소 없음)\n"
-        "  · US: SPY Put/Call ≥1.2 → US 일반 종목 차단 (헷지 3종은 예외)\n"
+        "  · US: SPY Put/Call ≥1.2 → US 신규 매수 전면 차단 (헷지 포함·현금 관망)\n"
         "  · COIN: BTC 고래 롱숏 ≤0.8 → COIN 전면 차단 (헷지 유니버스 없음)\n"
-        "  · KR: 환율 Z-Score ≥2.0 & 당일 상승 → KR 일반 종목 차단 (헷지 3종은 예외)\n"
-        "  · Phase4 발동 시 로그: 🚨 [Phase 4 발동] … 헷지 자산만 매수 검토\n"
+        "  · KR: 환율 Z-Score ≥2.0 & 당일 상승 → KR 신규 매수 전면 차단 (헷지 포함·현금 관망)\n"
+        "  · Phase4 발동 시 로그: 🚨 [Phase 4 발동] … 신규 매수 전면 차단 (헷지 포함 · 현금 관망)\n"
         "- 하락장 헷지 (안전자산 ETF, strategy/hedge_universe.py)\n"
         f"  · KR: {format_hedge_universe_summary('KR')}\n"
         f"{kr_hedge_detail}\n"
         f"  · US: {format_hedge_universe_summary('US')}\n"
         f"{us_hedge_detail}\n"
         "  · 스캔/유니버스 후보에 위 티커 항상 병합 (_merge_hedge_into_buy_targets)\n"
-        "  · MAX_POSITIONS 슬롯 우회(프리패스) — 예수금·Portfolio Heat 는 동일\n"
-        "  · Phase3 AI 필터 생략 (false_breakout_prob=0)\n"
-        "  · V8/스윙 진입 시그널·지수 급락·BEAR·섹터락 등 — BEAR 시 일반 종목 V8·SWING 모두 차단, 헷지만 예외\n"
-        "- Phase3: AI 뉴스 LLM (V8=엄격 / 스윙=Terminal Risk만, 헷지 제외)\n"
+        "  · MAX_POSITIONS 우회 없음(일반과 동일) — 예수금·Portfolio Heat 동일\n"
+        "  · Phase3 AI 필터: 헷지도 일반과 동일 적용\n"
+        "  · 정상 장: 후보 병합 후 일반 V8/SWING 검토. BEAR·Phase4·지수급락: 헷지 포함 전면 차단(현금 관망)\n"
+        "- Phase3: AI 뉴스 LLM (V8=엄격 / 스윙=Terminal Risk만, 헷지도 동일 적용)\n"
         "- Phase1: GICS 섹터 과다 보유 방지 (sector_lock)\n"
         "- Phase2: 매수·분할익절 TWAP (전량 청산은 시장가 1회)\n"
         "  · 매수 멱등: 15분 사이클·슬라이스별 order_key, buy_inflight 중복 차단\n"
@@ -282,8 +288,8 @@ def _build_strategy_guide_text() -> str:
         "  · 상세: docs/idempotency/ (PROGRESS·BALANCE_READS·SMOKE_TEST)\n"
         f"- Portfolio Heat: 시장별 Σ(비중×ATR%) < {heat_pct:.1f}% (기본 6%)\n"
         f"- 비중: min(1/N, alpha_target_vol/ATR%) — KR {max_kr} / US {max_us} / COIN {max_coin} 슬롯\n"
-        "  (헷지 티커만 MAX 슬롯 초과 시에도 매수 검토 계속)\n"
-        "- BEAR 날씨: V8·SWING_FIB 일반 종목 신규 차단 (헷지·Phase4 헷지 전용만 예외)\n"
+        "  (헷지도 MAX 슬롯 한도 동일 적용)\n"
+        "- BEAR 날씨: 신규 매수 전면 차단 (헷지 포함 · 현금 관망)\n"
         "- 이미 보유·쿨다운·최소주문·예수금 부족 시 패스\n\n"
         "■ 3) V8 추세 매수 — calculate_pro_signals (strategy_type=TREND_V8)\n"
         "- 최소 120봉 OHLCV (목표 캐시 200봉)\n"
@@ -323,13 +329,16 @@ def _build_strategy_guide_text() -> str:
         "  · HALF/FULL 후 continue / HOLD는 V8 Scale-Out 미진입(전략 격리)\n"
         "- 절반 익절: 오직 1.5R HALF(check_swing_exit). entry_atr×3.0 Scale-Out 금지\n"
         f"- 타임스탑: 주식 {sw_eq:.0f}h / 코인 {sw_coin:.0f}h, 유예 +{sw_ex:.1f}%\n"
-        "- FULL: 하드(피보·구름+시간가중) · 러너 5MA 이탈 · RSI +1~10%\n"
+        f"- FULL: 하드(피보·구름+시간가중) · 러너 {SWING_RUNNER_TRAIL_MA_DAYS}MA 이탈 · RSI +1~10%\n"
         f"- HALF: 수익≥{sw_r:.1f}R → 50% 익절 → 러너 후보\n"
         f"- 시간가중: 영업 {SWING_TIME_DECAY_START_TRADING_HOURS:.0f}h 후 24h마다 gap {decay_pct}% 상향\n"
-        f"- 본절락: max_p>{SWING_PROFIT_LOCK_ACTIVATE_PCT:.0f}% → 평단×1.005\n"
-        f"- 러너: scale_out 또는 max_p≥{sw_r:.1f}R → 5MA 트레일(고점 래칫)\n"
-        f"- 오버슈팅(러너·max_p≥{10:.0f}%): 매도선 max(하드,락,5MA,전일저가) · [SWING-SELL] 오버슈팅 캔들 트레일링 이탈\n"
-        "- 비러너 트레일: 본절락 이탈 / 러너: 5MA·오버슈팅 트레일 이탈\n"
+        f"- 본절락: max_p > ATR동적임계"
+        f"((entry_atr/평단)×100×{SWING_PROFIT_LOCK_ATR_MULT:.1f}, "
+        f"clip {SWING_PROFIT_LOCK_PCT_MIN:.1f}~{SWING_PROFIT_LOCK_PCT_MAX:.0f}%) "
+        f"→ 평단×{BREAKEVEN_LOCK_MULT:.3f}\n"
+        f"- 러너: scale_out 또는 max_p≥{sw_r:.1f}R → {SWING_RUNNER_TRAIL_MA_DAYS}MA 트레일(고점 래칫)\n"
+        f"- 오버슈팅(러너·max_p≥{10:.0f}%): 매도선 max(하드,락,{SWING_RUNNER_TRAIL_MA_DAYS}MA,전일저가) · [SWING-SELL] 오버슈팅 캔들 트레일링 이탈\n"
+        f"- 비러너 트레일: 본절락 이탈 / 러너: {SWING_RUNNER_TRAIL_MA_DAYS}MA·오버슈팅 트레일 이탈\n"
         "- V8식 hard_stop 루프는 스윙에 미적용\n\n"
         "■ 7) 타임스탑·쿨다운\n"
         "- KR/US 보유시간: 거래일 연속(장외 포함), 휴장일 Pause (XKRX/NYSE 캘린더)\n"
@@ -792,11 +801,12 @@ class CapitalAdjustThread(QThread):
 
     done = pyqtSignal(bool, str)
 
-    def __init__(self, withdraw: bool, amount_krw: float, state_path: Path):
+    def __init__(self, withdraw: bool, amount_krw: float, state_path: Path, market: str = "KR"):
         super().__init__()
         self._withdraw = withdraw
         self._amount = float(amount_krw)
         self._state_path = state_path
+        self._market = str(market or "KR")
 
     def run(self):
         try:
@@ -807,6 +817,7 @@ class CapitalAdjustThread(QThread):
                 amount_krw=self._amount,
                 state_path=self._state_path,
                 source_label="run_gui.py",
+                market=self._market,
             )
             self.done.emit(ok, msg)
         except Exception as e:
@@ -1146,7 +1157,7 @@ class BotDashboard(QMainWindow):
         
         print("🤖 [시스템 가동] GUI 대시보드 초기화 중...")
         
-        # 시작 시 1회 브로커/토큰 점검
+        # 시작 시 1회 브로커/토큰 점검 (유효 kis_token.json 있으면 신규 발급 안 함)
         print("  🔌 브로커 객체 초기화 중...")
         try:
             refresh_brokers_if_needed(force=False)
@@ -1399,7 +1410,7 @@ class BotDashboard(QMainWindow):
         
         tabs.addTab(ledger_tab, "장부 (현재 포지션)")
 
-        # 4. 매매·전략 안내 (타임스탑·매도선·러너 5MA)
+        # 4. 매매·전략 안내 (타임스탑·매도선·러너 10MA)
         guide_tab = QWidget()
         guide_layout = QVBoxLayout(guide_tab)
         guide_title = QLabel("📘 매매·전략 안내 (V8 · SWING · 헷지 · Phase 1~5)")
@@ -1417,7 +1428,8 @@ class BotDashboard(QMainWindow):
         capital_layout = QVBoxLayout(capital_tab)
         capital_help = QLabel(
             "<b style='color:#e2e8f0'>고점 보정 (수동 입·출금)</b><br>"
-            "<span style='color:#94a3b8'>예수금만 입·출금하면 Phase5 주차 고점과 실총액이 어긋날 수 있습니다. "
+            "<span style='color:#94a3b8'>국장·미장·코인 <b>어느 계좌로</b> 입·출금했는지 고르세요. "
+            "해당 시장 고점만 가감하므로 다른 시장 서킷이 오발동하지 않습니다. "
             "실행 시 실계좌 스냅샷 갱신 후 고점을 반영합니다.</span><br>"
             "<span style='color:#f87171'>주말 KIS 점검 구간에는 국·미 스냅샷이 제한될 수 있습니다.</span>"
         )
@@ -1435,6 +1447,16 @@ class BotDashboard(QMainWindow):
         kind_row.addWidget(self.capital_withdraw_radio)
         kind_row.addStretch()
         capital_layout.addLayout(kind_row)
+
+        mk_row = QHBoxLayout()
+        mk_row.addWidget(QLabel("시장:"))
+        self.capital_market_combo = QComboBox()
+        self.capital_market_combo.addItem("국장 (KR)", "KR")
+        self.capital_market_combo.addItem("미장 (US)", "US")
+        self.capital_market_combo.addItem("코인 (COIN)", "COIN")
+        self.capital_market_combo.addItem("합산만 (레거시)", "ALL")
+        mk_row.addWidget(self.capital_market_combo, stretch=1)
+        capital_layout.addLayout(mk_row)
 
         amt_row = QHBoxLayout()
         amt_row.addWidget(QLabel("금액 (원):"))
@@ -1487,11 +1509,13 @@ class BotDashboard(QMainWindow):
 
         withdraw = self.capital_withdraw_radio.isChecked()
         verb = "출금" if withdraw else "입금"
+        mk = str(self.capital_market_combo.currentData() or "KR")
+        mk_label = self.capital_market_combo.currentText()
         confirm = QMessageBox.question(
             self,
             "고점 보정 확인",
-            f"<b>{verb}</b> <b>{amount:,.0f}</b>원을 합산 고점에 반영합니다.<br><br>"
-            "실계좌 기준 <code>circuit_aux_*</code> 갱신 후 저장합니다. 계속할까요?",
+            f"<b>{mk_label}</b>에 <b>{verb}</b> <b>{amount:,.0f}</b>원을 반영합니다.<br><br>"
+            "해당 시장 고점과 합산 고점을 맞춘 뒤 실계좌 스냅샷을 갱신합니다. 계속할까요?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1510,7 +1534,7 @@ class BotDashboard(QMainWindow):
             return
 
         self.capital_apply_btn.setEnabled(False)
-        self._capital_thread = CapitalAdjustThread(withdraw, amount, STATE_PATH)
+        self._capital_thread = CapitalAdjustThread(withdraw, amount, STATE_PATH, mk)
         self._capital_thread.done.connect(
             self._on_capital_adjust_finished, Qt.QueuedConnection
         )

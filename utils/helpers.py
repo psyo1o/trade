@@ -14,6 +14,7 @@
     * ``record_trade`` 는 스레드 락(``configure_trade_history`` 로 주입)으로 ``trade_history.json`` 에 append.
 """
 import json
+from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -300,6 +301,7 @@ def record_trade(trade_info):
 
         with open(_trade_history_path, 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=2, ensure_ascii=False)
+        # 날짜 아카이브는 세션 경계(국·미 시가/종가)에서만 — execution.state_backup
 
 
 def ensure_binance_order_precision(

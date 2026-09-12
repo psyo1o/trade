@@ -28,7 +28,6 @@ def run_coin_buy_cycle(
     macro_mult = ctx.macro_mult
     macro_snap = ctx.macro_snap
     _buy_cycle_tag = ctx.buy_cycle_tag
-    hedge_only = rb._phase4_hedge_only_active(macro_snap, "COIN")
 
     try:
         if rb.coin_config.is_binance():
@@ -87,32 +86,20 @@ def run_coin_buy_cycle(
     scan_targets = rb._merge_hedge_into_buy_targets(scan_targets, "COIN")
     scan_targets = rb._apply_phase4_hedge_buy_targets(scan_targets, macro_snap, "COIN")
     if not scan_targets:
-        if hedge_only:
-            print(
-                f"  -> 🚨 코인 Phase4 글로벌 방어막: 헷지 후보 없음 — 매수 중단. "
-                f"({(macro_snap.get('market_buy_block_reason') or {}).get('COIN', '')})"
-            )
         return float(krw_bal)
 
     coin_index_change = rb.get_market_index_change("COIN")
     print(f"  📊 [BTC 지수] 변화율: {coin_index_change:+.2f}% 날씨는 {coin_weather}")
     if coin_index_change <= rb.INDEX_CRASH_COIN:
-        if hedge_only:
-            print(
-                f"  📌 [COIN 헷지] BTC {coin_index_change:+.2f}% 급락 — "
-                f"Phase4 헷지 전용 모드, 지수 차단 예외·매수 검토 계속"
-            )
-        else:
-            print(
-                f"  🚫 [COIN 매수 중단] BTC {coin_index_change:+.2f}% 급락 "
-                f"(기준: {rb.INDEX_CRASH_COIN}%)"
-            )
-            return float(krw_bal)
+        print(
+            f"  🚫 [COIN 매수 중단] BTC {coin_index_change:+.2f}% 급락 "
+            f"(기준: {rb.INDEX_CRASH_COIN}%)"
+        )
+        return float(krw_bal)
 
     if coin_weather == rb.WEATHER_LABEL_BEAR:
-        print(
-            "  📌 [COIN] BEAR 날씨 — V8·SWING_FIB 일반 종목 매수 중단 (헷지만 검토)"
-        )
+        print("  📌 [COIN] BEAR 날씨 — 신규 매수 전면 차단 (헷지 포함 · 현금 관망)")
+        return float(krw_bal)
 
     scan_targets = rb._sort_buy_targets_by_rs(scan_targets, "COIN")
     total_coin = len(scan_targets)
@@ -148,68 +135,52 @@ def run_coin_buy_cycle(
         live_px_coin = float(rb.coin_broker.get_current_price(t) or 0.0)
         coin_name = rb.get_coin_name(t)
 
-        if hedge_only and rb._is_hedge_ticker(t, "COIN"):
-            _ref = (
-                float(live_px_coin)
-                if live_px_coin > 0
-                else float(ohlcv[-1].get("c", 0) or 0)
-            )
-            if _ref <= 0:
-                print(f"  ⏭️ {coin_name}({t}): [COIN 헷지] 현재가 없음 (패스)")
-                continue
-            sl_p = float(_ref) * 0.95
-            s_name = "HEDGE_PHASE4"
+        entry_decision = rb.decide_entry_signals(
+            ohlcv,
+            coin_weather,
+            t,
+            coin_name,
+            idx,
+            total_coin,
+            market="COIN",
+            reference_close=live_px_coin if live_px_coin > 0 else None,
+        )
+        is_buy = entry_decision.is_buy
+        sl_p = entry_decision.sl_p
+        s_name = entry_decision.signal_name
+        v8_ok = bool(is_buy) and rb._v8_trend_buy_allowed_in_weather(coin_weather)
+        if bool(is_buy) and not v8_ok:
             print(
-                f"  🛡️ [HEDGE-BUY] {coin_name}({t}) Phase4 방어 — "
-                f"V8/스윙·BEAR·지수급락 예외, 손절 ~{_ref * 0.95:,.4f}"
+                f"  ⏭️ {t}: BEAR 시장 — V8 추세 매수 차단"
             )
+        if v8_ok:
+            print(f"  ✅ [V8-BUY] {t} 진입")
         else:
-            entry_decision = rb.decide_entry_signals(
-                ohlcv,
-                coin_weather,
-                t,
-                coin_name,
-                idx,
-                total_coin,
-                market="COIN",
-                reference_close=live_px_coin if live_px_coin > 0 else None,
-            )
-            is_buy = entry_decision.is_buy
-            sl_p = entry_decision.sl_p
-            s_name = entry_decision.signal_name
-            v8_ok = bool(is_buy) and rb._v8_trend_buy_allowed_in_weather(coin_weather)
-            if bool(is_buy) and not v8_ok:
+            sw_ok = entry_decision.swing_ok
+            sw_fib = entry_decision.swing_fib
+            sw_why = entry_decision.swing_why
+            if sw_ok and not rb._swing_fib_buy_allowed_in_weather(coin_weather):
                 print(
-                    f"  ⏭️ {t}: BEAR 시장 — V8 추세 매수 차단"
+                    f"  ⏭️ {coin_name}({t}): BEAR 시장 — SWING_FIB 눌림목 매수 차단"
                 )
-            if v8_ok:
-                print(f"  ✅ [V8-BUY] {t} 진입")
+                continue
+            if sw_ok:
+                strategy_type = "SWING_FIB"
+                entry_fib_level = float(sw_fib)
+                _sw_o = float(ohlcv[-1].get("o", 0) or 0)
+                _sw_c = live_px_coin if live_px_coin > 0 else float(ohlcv[-1].get("c", 0) or 0)
+                sl_p = rb.swing_entry_sl_p(_sw_c, sw_fib)
+                s_name = "SWING_FIB"
+                _sw_src = "실시간" if live_px_coin > 0 else "일봉종가"
+                print(
+                    f"  ✅ [SWING-BUY] {t} entry_fib={entry_fib_level:,.2f} "
+                    f"| 양봉({_sw_src} 시가 {_sw_o:,.0f} < 종가 {_sw_c:,.0f})"
+                )
             else:
-                sw_ok = entry_decision.swing_ok
-                sw_fib = entry_decision.swing_fib
-                sw_why = entry_decision.swing_why
-                if sw_ok and not rb._swing_fib_buy_allowed_in_weather(coin_weather):
-                    print(
-                        f"  ⏭️ {coin_name}({t}): BEAR 시장 — SWING_FIB 눌림목 매수 차단 (헷지만 허용)"
-                    )
-                    continue
-                if sw_ok:
-                    strategy_type = "SWING_FIB"
-                    entry_fib_level = float(sw_fib)
-                    _sw_o = float(ohlcv[-1].get("o", 0) or 0)
-                    _sw_c = live_px_coin if live_px_coin > 0 else float(ohlcv[-1].get("c", 0) or 0)
-                    sl_p = rb.swing_entry_sl_p(_sw_c, sw_fib)
-                    s_name = "SWING_FIB"
-                    _sw_src = "실시간" if live_px_coin > 0 else "일봉종가"
-                    print(
-                        f"  ✅ [SWING-BUY] {t} entry_fib={entry_fib_level:,.2f} "
-                        f"| 양봉({_sw_src} 시가 {_sw_o:,.0f} < 종가 {_sw_c:,.0f})"
-                    )
-                else:
-                    _prog = f"[{idx}/{total_coin}]" if total_coin else ""
-                    _disp = f"{coin_name}({t})" if coin_name and coin_name != t else t
-                    print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
-                    continue
+                _prog = f"[{idx}/{total_coin}]" if total_coin else ""
+                _disp = f"{coin_name}({t})" if coin_name and coin_name != t else t
+                print(f"   🔍 [스윙] {_prog} {_disp} ❌ 패스: {sw_why}")
+                continue
 
         base_ratio = 1.0 / max(1, int(rb.MAX_POSITIONS_COIN))
         ratio, t_name = rb._position_ratio_with_vol_target(

@@ -106,7 +106,7 @@ class TestSwingStopAboveEntry(unittest.TestCase):
         }
         ohlcv = [{"o": h, "h": h, "l": h - 2, "c": h, "v": 1e6} for h in range(100, 160)]
         line = get_swing_exit_display_price(101.0, pos, ohlcv, market="KR", ticker="005930")
-        self.assertAlmostEqual(line, 95.0)
+        self.assertAlmostEqual(line, 96.0)  # 절대손실 하드캡 buy*0.96
 
     def test_exit_display_breakeven_lock_above_threshold(self):
         buy = 100.0

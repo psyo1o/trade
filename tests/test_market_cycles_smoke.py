@@ -79,8 +79,7 @@ class TestMarketCyclesSmoke(unittest.TestCase):
                                 with patch.object(
                                     rb, "parse_kr_cash_total", return_value=(1_000_000, 4_000_000)
                                 ):
-                                    with patch.object(rb, "check_mdd_break", return_value=True):
-                                        with _patch_kr_cycle_state_io(rb):
+                                    with _patch_kr_cycle_state_io(rb):
                                             with patch(
                                                 "execution.market_cycles.kr_cycle.run_kr_buy_cycle",
                                                 return_value=900_000,
@@ -108,8 +107,7 @@ class TestMarketCyclesSmoke(unittest.TestCase):
                         with patch.object(
                             rb, "_is_kr_buy_window_now", return_value=(True, _now, _now)
                         ):
-                            with patch.object(rb, "check_mdd_break", return_value=True):
-                                with _patch_kr_cycle_state_io(rb):
+                            with _patch_kr_cycle_state_io(rb):
                                     with patch(
                                         "execution.market_cycles.kr_cycle.run_kr_buy_cycle",
                                         return_value=800_000,
