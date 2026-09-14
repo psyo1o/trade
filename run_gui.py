@@ -15,7 +15,7 @@ PyQt5 운영 GUI — ``run_bot`` 엔진을 탭·QTimer·스레드로 감싼다.
     * 네트워크 감시는 **백그라운드 스레드**에서 돌린다. 생존신고(heartbeat) 텔레그램은 **KST :00 / :30** 30분마다 예약하고, **해당 슬롯의 15분 매매 사이클이 끝난 뒤** 보낸다.
 
 로그
-    * ``RedirectText`` 가 ``utils.logger.get_quant_logger()`` 로 ``logs/bot.log`` 에도 한 줄씩 넘긴다.
+    * ``RedirectText`` 가 ``utils.logger.get_quant_logger()`` 로 월 폴더 ``bot.log`` 에도 한 줄씩 넘긴다.
 """
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)

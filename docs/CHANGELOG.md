@@ -7,6 +7,16 @@
 
 ---
 
+## 2026-09-14 — 로그: 연·월 폴더 보관 · 자동 삭제 폐지
+
+- **무엇을:** `logs/{YYYY}년/{M}월/bot.log` + 일자 `bot.YYYY-MM-DD.log`. `backupCount=0`(삭제 안 함). 기동 시 평면 `logs/bot.*.log` → 월 폴더 이동.
+- **왜:** 30일 삭제하지 말고 연/월로 남겨 두기.
+- **주요 파일:** `utils/logger.py`, `README.md`
+- **이어서 할 일 / 주의:** 봇 재시작 후 경로 확인. 기존 `logs/bot.log`는 수동 이동해도 됨.
+- **테스트:** —
+
+---
+
 ## 2026-09-11 — KR 마감 후 예수 이중합산 재발 방지
 
 - **무엇을:** sanitize **Rule1b**(예수=`현금+보유`/`직전총평`·보유 정체), 스냅샷 **상방 +5% 거부**, 비장중 snap freeze, `market_equity_for_risk` last_loop 대비 이중 점프 방어. 상태 복구: cash 436,653·total/aux/peak→~682,903 (`scripts/repair_kr_snapshot_double_count.py`).

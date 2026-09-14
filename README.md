@@ -915,7 +915,7 @@ VIX·Crypto Fear&Greed **예산 배수**(`block`/`reduce`)와 원/달러 **절�
 
 ## 10) 관측성: 로그를 읽는 법
 
-- **파일 로그:** `utils/logger.py` 의 일별 롤오버로 **`logs/bot.log`** 가 쌓이고, 자정 넘기면 이전 날짜 파일이 **`logs/bot.YYYY-MM-DD.log`** 형식으로 보관됩니다 (자동 삭제 없음).
+- **파일 로그:** `utils/logger.py` 의 일별 롤오버로 **`logs/{YYYY}년/{M}월/bot.log`** 에 쌓이고, 자정 넘기면 **`logs/{YYYY}년/{M}월/bot.YYYY-MM-DD.log`** 로 보관합니다 (**자동 삭제 없음**, `backupCount=0`). 기동 시 예전 `logs/bot.YYYY-MM-DD.log` 평면 파일은 연·월 폴더로 이동합니다.
 - **시장별:** `[KR …]`, `[US …]`, `[COIN …]` — 예산·예수·정수주 0·TWAP 미체결·BEAR+ADX 스킵 등.
 - **V8 스캔:** `🔍 [V8] [n/N] 종목 … ❌ 패스:` 또는 통과 시 `🔥 [V8] …`. Hurst 차단 시 `Hurst 차단 — 강한 횡보/역추세 (H=...<0.45)`.
 - **스윙 보조:** V8 실패 뒤 `🔍 [스윙] … ❌ 패스: 사유` 또는 `✅ [SWING-BUY] …` (BEAR 시 일반 종목은 스윙도 차단).
