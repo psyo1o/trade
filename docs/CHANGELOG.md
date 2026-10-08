@@ -7,6 +7,36 @@
 
 ---
 
+## 2026-09-18 — 토큰 갱신 시 전 경로 일괄 동기화
+
+- **무엇을:** `_apply_access_token`이 브로커·`KIS_TOKEN`·`kis_token.json`·`token.dat`를 한번에 맞춤. 스캐너 `get_fresh_token`도 `kis_api` 경로로 publish.
+- **왜:** 한쪽만 새 토큰을 쓰고 브로커/직통/스캐너가 옛값을 남는 어긋남 방지.
+- **주요 파일:** `api/kis_api.py`, `screener.py`
+- **이어서 할 일 / 주의:** 봇 재시작 후 잔고·스캐너 확인.
+- **테스트:** `python -m pytest tests/test_kis_token_reuse.py tests/test_screener_token.py -q`
+
+---
+
+## 2026-09-18 — 장기 중단 후 KIS 토큰 콜드 스타트 수정
+
+- **무엇을:** 브로커 생성 전 토큰 확보·`token.dat` 시드. 발급 실패 시 **만료 `kis_token.json` 폴백 금지**, mojito 발급분 harvest. 미래 timestamp 거부. 잔고 EGW00123·주문 note에 만료 시 `force` 재발급 1회.
+- **왜:** 오래 끈 뒤 기동 시 mojito가 새 토큰을 받은 다음, EGW00133으로 우리 발급이 실패하면 만료 파일로 덮어써 API가 전부 깨짐.
+- **주요 파일:** `api/kis_api.py`, `api/kis_parsers.py`, `execution/balance_read.py`, `execution/order_executor.py`
+- **이어서 할 일 / 주의:** 봇/GUI 재시작 후 잔고·스캐너 확인.
+- **테스트:** `pytest tests/test_kis_token_reuse.py tests/test_screener_token.py -q`
+
+---
+
+## 2026-09-18 — KR 스캐너: 실행마다 토큰 재조회·만료 재시도
+
+- **무엇을:** `screener.py` import 시 `ACCESS_TOKEN` 고정 제거. `run_night_screener`마다 `kis_token.json` 재읽기, `EGW00123`이면 재발급 후 1회 재시도. 스케줄 시각 docstring을 14:50에 맞춤.
+- **왜:** GUI 장기 기동 후 14:50 자동 스캐너만 만료 토큰 사용. 수동 `python screener.py`는 새 프로세스라 정상.
+- **주요 파일:** `screener.py`
+- **이어서 할 일 / 주의:** 봇/GUI 재시작 후 다음 14:50 확인.
+- **테스트:** `pytest tests/test_screener_token.py -q`
+
+---
+
 ## 2026-09-14 — 로그: 연·월 폴더 보관 · 자동 삭제 폐지
 
 - **무엇을:** `logs/{YYYY}년/{M}월/bot.log` + 일자 `bot.YYYY-MM-DD.log`. `backupCount=0`(삭제 안 함). 기동 시 평면 `logs/bot.*.log` → 월 폴더 이동.

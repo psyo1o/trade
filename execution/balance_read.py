@@ -196,6 +196,20 @@ def _get_raw(
     _last_api_mono[key] = now
     raw = fetcher()
 
+    # 장기 중단·콜드 스타트 후 만료 토큰이면 1회 강제 갱신 후 재조회
+    try:
+        from api.kis_parsers import kis_response_token_expired
+
+        if kis_response_token_expired(raw):
+            print(f"  🔑 [잔고-{key}] EGW00123 만료 — 토큰 재발급 후 1회 재조회")
+            from api import kis_api as ka
+
+            ka.refresh_brokers_if_needed(force=True)
+            _last_api_mono[key] = time.monotonic()
+            raw = fetcher()
+    except Exception:
+        pass
+
     if _kis_balance_cacheable(raw, key):
         _cache[key] = (now, raw)
         _persist_live_cash(key, raw)

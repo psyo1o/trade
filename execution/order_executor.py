@@ -111,7 +111,12 @@ def execute_kr_market_buy_twap(
 
             if not fill.ok and not rb.TEST_MODE:
                 msg_l = str(fill.note or "").lower()
-                if "credentials" in msg_l or "token" in msg_l:
+                if (
+                    "credentials" in msg_l
+                    or "token" in msg_l
+                    or "egw00123" in msg_l
+                    or "만료" in str(fill.note or "")
+                ):
                     print("  🔄 [토큰 오류] 토큰 갱신 후 TWAP 슬라이스 1회 재시도...")
                     rb.refresh_brokers_if_needed(force=True)
                     time.sleep(1)
@@ -273,7 +278,12 @@ def execute_us_market_buy_twap(
 
             if not fill.ok and not rb.TEST_MODE:
                 msg_l = str(fill.note or "").lower()
-                if "credentials" in msg_l or "token" in msg_l:
+                if (
+                    "credentials" in msg_l
+                    or "token" in msg_l
+                    or "egw00123" in msg_l
+                    or "만료" in str(fill.note or "")
+                ):
                     print("  🔄 [토큰 오류] 미장 TWAP 슬라이스 1회 재시도...")
                     rb.refresh_brokers_if_needed(force=True)
                     time.sleep(1)

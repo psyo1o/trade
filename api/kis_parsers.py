@@ -15,6 +15,19 @@ def kis_response_rate_limited(bal) -> bool:
     return False
 
 
+def kis_response_token_expired(bal) -> bool:
+    """접근토큰 만료(EGW00123) 여부."""
+    if not isinstance(bal, dict) or not bal:
+        return False
+    msg = str(bal.get("msg1") or bal.get("MSG1") or "")
+    cd = str(bal.get("msg_cd") or bal.get("MSG_CD") or "").strip()
+    if cd == "EGW00123":
+        return True
+    if "만료된 token" in msg or "만료된 토큰" in msg:
+        return True
+    return False
+
+
 def kis_response_transient(bal) -> bool:
     """짧은 백오프 재시도 대상(한도·MCI·OPSQ 등)."""
     if kis_response_rate_limited(bal):

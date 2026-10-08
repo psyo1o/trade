@@ -76,6 +76,8 @@ def get_us_ticker_exchange(ticker):
 
 # KIS access_token 유효 기간(약 24h)보다 여유 있게 — 만료 전 재발급
 _TOKEN_FRESHNESS = timedelta(hours=11, minutes=50)
+# 시계 오차 허용 — 미래 timestamp 는 영구 fresh 로 보이지 않게
+_TOKEN_FUTURE_SKEW = timedelta(minutes=5)
 
 
 def _normalize_access_token(raw) -> str:
@@ -83,34 +85,124 @@ def _normalize_access_token(raw) -> str:
 
 
 def _token_data_is_fresh(token_data) -> bool:
-    """kis_token.json 이 재발급 없이 쓸 수 있는지."""
+    """kis_token.json 이 재발급 없이 쓸 수 있는지.
+
+    ``timestamp`` 는 **발급 시각**(epoch). mojito ``token.dat`` 의 만료 epoch 와 의미가 다르다.
+    """
     if not isinstance(token_data, dict) or not token_data.get("access_token"):
         return False
     try:
         issue_time = datetime.fromtimestamp(float(token_data["timestamp"]))
     except (KeyError, TypeError, ValueError, OSError):
         return False
-    return datetime.now() < issue_time + _TOKEN_FRESHNESS
+    now = datetime.now()
+    if issue_time > now + _TOKEN_FUTURE_SKEW:
+        return False
+    return now < issue_time + _TOKEN_FRESHNESS
 
 
-def _apply_access_token(token: str) -> str:
-    """브로커·직통(KIS_TOKEN)에 동일 토큰을 심는다."""
+def _apply_access_token(token_or_data, *, persist: bool | None = None) -> str:
+    """갱신·동기화 토큰을 **전 경로**에 일괄 반영.
+
+    * ``broker_kr`` / ``broker_us``.access_token
+    * 직통 ``KIS_TOKEN``
+    * ``kis_token.json`` (``persist=True`` 일 때)
+    * mojito ``token.dat`` (항상 시드 — 이후 KoreaInvestment 재생성 시 이중 tokenP 방지)
+
+    ``token_or_data`` 가 dict 이면 기본 persist=True, str 이면 기본 persist=False
+    (이미 ``issue_new_kis_token`` 이 파일을 쓴 경우 등).
+    """
     global KIS_TOKEN, broker_kr, broker_us
-    clean = _normalize_access_token(token)
+    if isinstance(token_or_data, dict):
+        token_data = dict(token_or_data)
+        clean = _normalize_access_token(token_data.get("access_token"))
+        if persist is None:
+            persist = True
+    else:
+        clean = _normalize_access_token(token_or_data)
+        token_data = {
+            "access_token": clean,
+            "timestamp": datetime.now().timestamp(),
+            "expires_in": 86400,
+            "token_type": "Bearer",
+        }
+        if persist is None:
+            persist = False
     if not clean:
         return ""
+    token_data["access_token"] = clean
+    if not token_data.get("timestamp"):
+        token_data["timestamp"] = datetime.now().timestamp()
     if broker_kr is not None:
         broker_kr.access_token = clean
     if broker_us is not None:
         broker_us.access_token = clean
     KIS_TOKEN = clean
+    if persist:
+        try:
+            save_kis_token(token_data)
+        except Exception as e:
+            print(f"  ⚠️ kis_token.json 저장 실패: {e}")
+    _seed_mojito_token_dat(token_data)
     return clean
+
+
+def _seed_mojito_token_dat(token_data: dict) -> bool:
+    """유효 ``kis_token.json`` 을 mojito ``token.dat`` 에 심어 이중 tokenP 를 막는다.
+
+    mojito ``check_access_token`` 은 ``timestamp`` 를 **만료 epoch** 로 본다.
+    """
+    import pickle
+
+    if not _cfg or not isinstance(token_data, dict):
+        return False
+    clean = _normalize_access_token(token_data.get("access_token"))
+    if not clean:
+        return False
+    try:
+        issue_ts = float(token_data.get("timestamp") or 0)
+    except (TypeError, ValueError):
+        issue_ts = 0.0
+    if issue_ts <= 0:
+        issue_ts = datetime.now().timestamp()
+    try:
+        expires_in = int(token_data.get("expires_in") or 86400)
+    except (TypeError, ValueError):
+        expires_in = 86400
+    expires_in = max(3600, expires_in)
+    payload = {
+        "access_token": clean,
+        "expires_in": expires_in,
+        "token_type": token_data.get("token_type") or "Bearer",
+        # mojito: timestamp == expiry epoch
+        "timestamp": int(issue_ts) + expires_in,
+        "api_key": _cfg["kis_key"],
+        "api_secret": _cfg["kis_secret"],
+    }
+    try:
+        with open("token.dat", "wb") as f:
+            pickle.dump(payload, f)
+        return True
+    except Exception as e:
+        print(f"  ⚠️ mojito token.dat 시드 실패: {e}")
+        return False
+
+
+def _harvest_broker_access_token() -> str:
+    """mojito 가 이미 발급한 브로커 토큰을 흡수."""
+    for b in (broker_kr, broker_us):
+        clean = _normalize_access_token(getattr(b, "access_token", None) if b else None)
+        if clean:
+            return clean
+    return ""
 
 
 def _resolve_access_token(*, force_new: bool = False):
     """유효 저장 토큰을 우선 재사용. force_new 또는 만료/없음일 때만 tokenP 발급.
 
     KIS는 토큰 발급 1분 제한이 있어, 기동·잔고조회마다 새로 받으면 EGW00133 이 난다.
+    발급 실패 시 **만료된 kis_token.json 으로는 폴백하지 않는다**
+    (mojito 가 방금 받은 새 토큰을 덮어쓰는 레이스 방지).
     """
     if not force_new:
         existing = load_kis_token()
@@ -120,14 +212,29 @@ def _resolve_access_token(*, force_new: bool = False):
     token_data = issue_new_kis_token()
     if token_data and token_data.get("access_token"):
         return token_data
-    print("⚠️ 토큰 발급 실패 - 기존 토큰 사용 시도")
-    return load_kis_token()
+    # 신선할 때만 폴백 — 오래된 파일은 None (호출측이 mojito 토큰을 harvest)
+    existing = load_kis_token()
+    if _token_data_is_fresh(existing):
+        print("⚠️ 토큰 발급 실패 - 신선 저장 토큰 재사용")
+        return existing
+    print("⚠️ 토큰 발급 실패 - 만료/없음 파일은 쓰지 않음 (브로커 토큰 흡수 시도)")
+    return None
 
 
 def _create_brokers(*, force_new_token: bool = False):
-    """Mojito 브로커 객체를 (재)생성합니다."""
+    """Mojito 브로커 객체를 (재)생성합니다.
+
+    순서: 우리 토큰 확보 → token.dat 시드 → KoreaInvestment 생성 → 전 경로 publish.
+    장기 중단 후 mojito 가 먼저 tokenP 한 뒤 우리가 만료 파일로 덮어쓰던 레이스를 막는다.
+    """
     global broker_kr, broker_us
     try:
+        # 1) 우리 쪽 토큰을 먼저 확보 (신선하면 재사용, 아니면 tokenP)
+        token_data = _resolve_access_token(force_new=force_new_token)
+        if token_data and token_data.get("access_token"):
+            _seed_mojito_token_dat(token_data)
+
+        # 2) mojito 생성 — 시드가 유효하면 load, 아니면 자체 tokenP
         broker_kr = mojito.KoreaInvestment(
             api_key=_cfg["kis_key"], api_secret=_cfg["kis_secret"],
             acc_no=_cfg["kis_account"], exchange='서울'
@@ -148,10 +255,17 @@ def _create_brokers(*, force_new_token: bool = False):
 
             _bn.init_binance(_cfg)
 
-        # mojito는 자동 발급 안 함 — 유효 파일이 있으면 재사용 (1분 발급 제한 회피)
-        token_data = _resolve_access_token(force_new=force_new_token)
+        # 3) 전 경로 일괄 반영 (브로커·KIS_TOKEN·파일·token.dat)
         if token_data and token_data.get("access_token"):
-            _apply_access_token(token_data["access_token"])
+            # issue_new 가 이미 저장했을 수 있음 — 메모리·dat 동기화 중심
+            _apply_access_token(token_data, persist=False)
+        else:
+            harvested = _harvest_broker_access_token()
+            if harvested:
+                _apply_access_token(harvested, persist=True)
+                print("  -> ✅ mojito 발급 토큰을 전 경로에 동기화")
+            else:
+                print("  -> ⚠️ 브로커에 유효 토큰이 없습니다")
     except Exception as e:
         print(f"🚨 브로커 객체 생성 실패: {e}")
         send_telegram(f"🚨 [긴급] 브로커 객체 생성에 실패했습니다. 키/계좌번호 설정을 확인하세요.\n{e}")
@@ -198,7 +312,7 @@ def issue_new_kis_token():
 
 
 def refresh_brokers_if_needed(force=False):
-    """토큰을 확인하고 필요 시 재발급합니다."""
+    """토큰을 확인하고 필요 시 재발급합니다. 갱신 시 전 경로에 동일 토큰을 심습니다."""
     global broker_kr, broker_us
 
     if force:
@@ -230,15 +344,15 @@ def refresh_brokers_if_needed(force=False):
     # 토큰 만료 체크 (11시간 50분마다 재발급) — 15분 사이클에서도 여기만 통과
     token_data = load_kis_token()
     if _token_data_is_fresh(token_data):
-        # 직통 경로와 브로커 토큰이 어긋나지 않게 동기화
-        _apply_access_token(token_data["access_token"])
+        # 직통·브로커·token.dat 어긋남 방지
+        _apply_access_token(token_data, persist=False)
         print("  -> ✅ 토큰 유효")
     elif token_data and token_data.get("access_token"):
         print("  -> ⏳ 토큰 만료 임박 - 재발급 시작")
         new_token = issue_new_kis_token()
         if new_token and new_token.get("access_token"):
-            _apply_access_token(new_token["access_token"])
-            print("  -> ✅ 토큰 재발급 완료")
+            _apply_access_token(new_token, persist=False)
+            print("  -> ✅ 토큰 재발급 완료 (전 경로 동기화)")
         else:
             print("  -> ⚠️ 토큰 재발급 실패")
     else:
