@@ -7,6 +7,9 @@
 이 스크립트는 **기록된 합산 고점**에 입금액을 더하거나 출금액을 빼서
 다음 루프부터 동일 기준으로 MDD(-15% 등)가 계산되도록 한다.
 
+입력 단위는 시장 고점과 같다: 국장 **원**, 미장 **USD**, 코인 **USDT**(바이낸스)/원(업비트).
+합산 고점(원화)에는 환율로 환산한 금액을 가감한다.
+
 시작 시 ``run_bot.refresh_circuit_aux_from_brokers`` 로 ``circuit_aux_*`` 잔고 스냅샷을
 먼저 갱신해, 출금 한도·합산 총액이 실계좌와 맞도록 한다 (직후 봇 기동 시 Phase 5 오발동 완화).
 
@@ -57,10 +60,53 @@ def _parse_amount_krw(raw: str) -> float:
     return v
 
 
-# GUI 등에서 재사용
+# GUI 등에서 재사용 — 단위는 ``capital_amount_unit`` 기준(원·USD·USDT)
+parse_capital_amount = _parse_amount_krw
 parse_capital_amount_krw = _parse_amount_krw
 
 _MARKET_LABELS = {"KR": "국장", "US": "미장", "COIN": "코인", "ALL": "합산"}
+_UNIT_LABELS = {"KRW": "원", "USD": "USD", "USDT": "USDT"}
+
+
+def capital_amount_unit(market: str | None) -> str:
+    """입·출금 입력 단위 — Phase5 시장 고점과 같은 통화 (국장 KRW, 미장 USD, 코인 USDT/KRW)."""
+    mk = normalize_capital_market(market)
+    if mk == "US":
+        return "USD"
+    if mk == "COIN":
+        try:
+            from api import coin_broker as _cb
+
+            return "USDT" if _cb.coin_equity_quote_unit() == "USDT" else "KRW"
+        except Exception:
+            return "KRW"
+    return "KRW"
+
+
+def capital_unit_label(unit: str) -> str:
+    return _UNIT_LABELS.get(str(unit or "KRW").upper(), str(unit))
+
+
+def _fmt_amount(amount: float, unit: str) -> str:
+    u = str(unit or "KRW").upper()
+    if u == "KRW":
+        return f"{amount:,.0f}원"
+    return f"{amount:,.2f} {u}"
+
+
+def _krw_per_unit(unit: str) -> float:
+    """입력 단위 1당 원화 — 합산 고점(원화) 가감용."""
+    u = str(unit or "KRW").upper()
+    if u == "USD":
+        return float(estimate_usdkrw() or 0)
+    if u == "USDT":
+        try:
+            from api import coin_broker as _cb
+
+            return float(_cb.get_krw_per_usdt() or 0) or float(estimate_usdkrw() or 0)
+        except Exception:
+            return float(estimate_usdkrw() or 0)
+    return 1.0
 
 
 def normalize_capital_market(raw: str | None) -> str:
@@ -119,7 +165,8 @@ def _refresh_aux_snapshot() -> None:
 def apply_capital_peak_adjustment(
     *,
     withdraw: bool,
-    amount_krw: float,
+    amount: float | None = None,
+    amount_krw: float | None = None,
     state_path: Path | None = None,
     source_label: str = "adjust_capital.py",
     market: str = "KR",
@@ -128,18 +175,33 @@ def apply_capital_peak_adjustment(
     ``circuit_aux_*`` 갱신 후 고점 입·출금 보정 및 ``capital_adjustments`` 기록.
 
     ``market``: ``KR`` / ``US`` / ``COIN`` / ``ALL``.
-    시장을 지정하면 해당 ``peak_equity_*`` 와 합산 고점을 함께 가감하고,
+    ``amount`` 는 **시장 기준 통화**(``capital_amount_unit``: 국장 원, 미장 USD, 바이낸스 USDT).
+    ``amount_krw`` 는 레거시 원화 입력 — 미장·USDT 코인이면 환율로 나눠 반영한다.
+    시장 ``peak_equity_*`` 는 입력 통화 그대로, 합산 고점은 원화 환산액으로 가감하고
     비중 앵커를 현재 스냅샷으로 다시 잡는다.
 
     Returns
         ``(True, 요약 메시지)`` 또는 ``(False, 오류 메시지)``.
     """
     path = state_path or STATE_PATH
-    if amount_krw <= 0:
-        return False, "금액은 0보다 커야 합니다."
     mk = normalize_capital_market(market)
+    unit = capital_amount_unit(mk)
+    raw_native = float(amount) if amount is not None else None
+    raw_krw = float(amount_krw) if amount_krw is not None else None
+    if (raw_native is None or raw_native <= 0) and (raw_krw is None or raw_krw <= 0):
+        return False, "금액은 0보다 커야 합니다."
 
     _refresh_aux_snapshot()
+
+    fx = _krw_per_unit(unit)
+    if fx <= 0:
+        return False, f"{unit} 환율을 가져오지 못했습니다. 잠시 후 다시 시도하세요."
+    if raw_native is not None and raw_native > 0:
+        native_amt = raw_native
+        krw_amt = raw_native * fx
+    else:
+        krw_amt = float(raw_krw or 0)
+        native_amt = krw_amt / fx
 
     state = load_state(path)
     current_total = portfolio_total_krw_estimated(state)
@@ -150,18 +212,19 @@ def apply_capital_peak_adjustment(
         old_peak = current_total
 
     if withdraw:
-        if amount_krw > current_total:
+        if krw_amt > current_total:
             return (
                 False,
-                f"출금액 {amount_krw:,.0f}원이 현재 추정 총자산 {current_total:,.0f}원보다 큽니다.",
+                f"출금액 {_fmt_amount(native_amt, unit)}(≈{krw_amt:,.0f}원)이 "
+                f"현재 추정 총자산 {current_total:,.0f}원보다 큽니다.",
             )
-        new_peak = old_peak - amount_krw
+        new_peak = old_peak - krw_amt
         kind = "withdraw"
-        delta = -amount_krw
+        delta_native = -native_amt
     else:
-        new_peak = old_peak + amount_krw
+        new_peak = old_peak + krw_amt
         kind = "deposit"
-        delta = amount_krw
+        delta_native = native_amt
 
     if new_peak < 0.0:
         return (
@@ -175,24 +238,9 @@ def apply_capital_peak_adjustment(
     from services import ledger_valuation as lv
 
     rate = estimate_usdkrw()
+    unit_lbl = capital_unit_label(unit)
     market_peak_note = ""
     if mk in ("KR", "US", "COIN"):
-        if mk == "US":
-            delta_native = (delta / rate) if rate > 0 else 0.0
-            unit = "USD"
-        elif mk == "COIN":
-            from api import coin_broker as _cb
-
-            if _cb.coin_equity_quote_unit() == "USDT":
-                kpx = float(_cb.get_krw_per_usdt() or 0) or float(rate) or 1.0
-                delta_native = (delta / kpx) if kpx > 0 else 0.0
-                unit = "USDT"
-            else:
-                delta_native = delta
-                unit = "원"
-        else:
-            delta_native = delta
-            unit = "원"
         old_m = get_phase5_peak_market_equity(state, mk)
         if old_m <= 0.0:
             if mk == "KR":
@@ -208,7 +256,7 @@ def apply_capital_peak_adjustment(
             state[f"peak_equity_{mk}"] = float(old_m)
         new_m = adjust_peak_equity_for_capital(state, mk, delta_native)
         market_peak_note = (
-            f"{_MARKET_LABELS.get(mk, mk)} 고점: {old_m:,.2f}{unit} → {new_m:,.2f}{unit}"
+            f"{_MARKET_LABELS.get(mk, mk)} 고점: {old_m:,.2f} {unit_lbl} → {new_m:,.2f} {unit_lbl}"
         )
         try:
             apply_phase5_share_anchor(
@@ -238,7 +286,10 @@ def apply_capital_peak_adjustment(
         "ts": datetime.now().isoformat(timespec="seconds"),
         "kind": kind,
         "market": mk,
-        "amount_krw": float(amount_krw),
+        "amount_native": float(native_amt),
+        "amount_unit": unit,
+        "krw_per_unit": float(fx),
+        "amount_krw": float(krw_amt),
         "peak_before_krw": float(old_peak),
         "peak_after_krw": float(new_peak),
         "estimated_total_krw_at_adjust": float(current_total),
@@ -271,6 +322,13 @@ def apply_capital_peak_adjustment(
             f"ℹ️ 장부에 합산 고점이 없거나 0이라, 추정 총자산 {current_total:,.0f}원을 고점으로 간주했습니다."
         )
     lines.append(f"대상 시장: {_MARKET_LABELS.get(mk, mk)} ({mk})")
+    if unit == "KRW":
+        lines.append(f"반영 금액: {_fmt_amount(native_amt, unit)}")
+    else:
+        lines.append(
+            f"반영 금액: {_fmt_amount(native_amt, unit)} "
+            f"(합산 고점용 ≈{krw_amt:,.0f}원, 1 {unit}={fx:,.2f}원)"
+        )
     if market_peak_note:
         lines.append(market_peak_note)
     lines.extend(
@@ -307,9 +365,10 @@ def main() -> int:
         return 1
     market = mk_map[mk_choice]
 
+    unit = capital_amount_unit(market)
     try:
-        amount_raw = input("금액 (원, 콤마 가능): ").strip()
-        amount = parse_capital_amount_krw(amount_raw)
+        amount_raw = input(f"금액 ({capital_unit_label(unit)}, 콤마 가능): ").strip()
+        amount = parse_capital_amount(amount_raw)
     except ValueError as e:
         print(f"오류: {e}", file=sys.stderr)
         return 1
@@ -317,7 +376,7 @@ def main() -> int:
     withdraw = choice == "2"
     ok, msg = apply_capital_peak_adjustment(
         withdraw=withdraw,
-        amount_krw=amount,
+        amount=amount,
         state_path=STATE_PATH,
         market=market,
     )

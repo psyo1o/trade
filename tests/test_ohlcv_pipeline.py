@@ -161,6 +161,67 @@ class TestGetCachedOhlcvFallbackChain(unittest.TestCase):
             mock_kis.assert_not_called()
 
 
+class TestOhlcvMemCacheTtl(unittest.TestCase):
+    """장기 기동 — 메모리 일봉이 TTL 지나면 재조회 (매수 당시 일봉 고정 방지)."""
+
+    def setUp(self):
+        import run_bot
+
+        run_bot._ohlcv_cache.clear()
+        run_bot._ohlcv_cache_fetched_at.clear()
+
+    def tearDown(self):
+        import run_bot
+
+        run_bot._ohlcv_cache.clear()
+        run_bot._ohlcv_cache_fetched_at.clear()
+
+    def _seed_mem(self, age_sec: float):
+        import time as _time
+
+        import run_bot
+
+        run_bot._ohlcv_cache["AAPL"] = _ohlcv_rows(200, 100.0)
+        run_bot._ohlcv_cache_fetched_at["AAPL"] = _time.time() - age_sec
+
+    @patch("run_bot.kis_equities_weekend_suppress_window_kst", return_value=True)
+    @patch("run_bot.get_ohlcv_stooq", return_value=[])
+    @patch("utils.ohlcv_store.load_disk_ohlcv", return_value=None)
+    @patch("run_bot.get_ohlcv_yfinance")
+    def test_fresh_mem_reused(self, mock_yf, _disk, _stooq, _wknd):
+        import run_bot
+
+        self._seed_mem(60)
+        out = run_bot.get_cached_ohlcv("AAPL")
+        self.assertEqual(len(out), 200)
+        mock_yf.assert_not_called()
+
+    @patch("run_bot.kis_equities_weekend_suppress_window_kst", return_value=True)
+    @patch("run_bot.get_ohlcv_stooq", return_value=[])
+    @patch("utils.ohlcv_store.load_disk_ohlcv", return_value=None)
+    @patch("run_bot.get_ohlcv_yfinance")
+    def test_stale_mem_refetched(self, mock_yf, _disk, _stooq, _wknd):
+        import run_bot
+
+        self._seed_mem(run_bot.OHLCV_MEM_TTL_SEC + 60)
+        mock_yf.return_value = _ohlcv_rows(210, 150.0)
+        out = run_bot.get_cached_ohlcv("AAPL")
+        mock_yf.assert_called_once()
+        self.assertAlmostEqual(float(out[-1]["c"]), float(mock_yf.return_value[-1]["c"]))
+        self.assertTrue(run_bot._ohlcv_mem_fresh("AAPL"))
+
+    @patch("run_bot.kis_equities_weekend_suppress_window_kst", return_value=True)
+    @patch("run_bot.get_ohlcv_stooq", return_value=[])
+    @patch("utils.ohlcv_store.load_disk_ohlcv", return_value=None)
+    @patch("run_bot.get_ohlcv_yfinance", return_value=[])
+    def test_stale_mem_kept_when_refetch_fails(self, _yf, _disk, _stooq, _wknd):
+        import run_bot
+
+        self._seed_mem(run_bot.OHLCV_MEM_TTL_SEC + 60)
+        out = run_bot.get_cached_ohlcv("AAPL")
+        self.assertEqual(len(out), 200)
+
+
 class TestExitLinesWithSyntheticOhlcv(unittest.TestCase):
     def test_v8_exit_line_with_60_bars(self):
         from strategy.rules import get_final_exit_price

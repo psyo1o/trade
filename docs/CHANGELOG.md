@@ -7,6 +7,26 @@
 
 ---
 
+## 2026-10-09 — 고점 보정: 미장 USD·코인 USDT 직접 입력
+
+- **무엇을:** 고점 보정 금액을 시장 통화로 입력 (국장 원 · 미장 USD · 코인 USDT(바이낸스)/원(업비트)). 시장 `peak_equity_*`는 입력값 그대로, 합산 고점은 환율 환산액으로 가감. GUI 금액 라벨·예시·확인창이 시장 선택에 따라 단위 표시. `capital_adjustments`에 `amount_native`·`amount_unit`·`krw_per_unit` 기록. 레거시 `amount_krw` 인자는 환율로 나눠 계속 지원.
+- **왜:** Phase5 미장·코인 고점은 USD/USDT로 바꿨는데, GUI·`adjust_capital.py`는 여전히 원화 입력 → 환율로 나눠서 반영(입출금 달러 금액과 어긋남).
+- **주요 파일:** `adjust_capital.py`, `run_gui.py`, `README.md`, `docs/PHASE5_ACCOUNT_CIRCUIT.md`
+- **이어서 할 일 / 주의:** GUI 재시작 후 반영. 코인 단위는 활성 거래소 기준(바이낸스 USDT, 업비트 원).
+- **테스트:** `python -m pytest tests/test_adjust_capital_units.py tests/test_phase5_market_mdd.py tests/test_phase5_coin_native_unit.py -q` (19 passed)
+
+---
+
+## 2026-10-08 — 일봉 메모리 캐시 TTL: 장기 기동 시 매도선 고정 방지
+
+- **무엇을:** `get_cached_ohlcv` 메모리·디스크 일봉에 확보 시각 TTL(`OHLCV_MEM_TTL_SEC`, 기본 4h). 지나면 재조회, 재조회 전부 실패 시에만 직전 일봉 재사용. `prefetch_ohlcv`도 TTL 지난 종목은 다시 받음.
+- **왜:** 메모리 일봉이 만료 없이 남아, SHOP이 9/29 매수 때 받은 일봉(마지막 9/28)으로 10일간 계산됨. 러너 트레일(10MA·전일 저가)이 낮게 나와 매도선이 본절 락 $144.66에 머묾. 재시작 후 새 일봉으로 10/07 저가 $161.37이 정상 반영.
+- **주요 파일:** `run_bot.py`, `utils/ohlcv_store.py`, `README.md`
+- **이어서 할 일 / 주의:** 봇 재시작 후 반영. 보유 종목은 4시간마다 일봉 재조회(주말 포함) — 호출량 미미.
+- **테스트:** `python -m pytest tests/test_ohlcv_pipeline.py tests/test_swing_runner_trailing.py -q` (26 passed)
+
+---
+
 ## 2026-09-18 — 토큰 갱신 시 전 경로 일괄 동기화
 
 - **무엇을:** `_apply_access_token`이 브로커·`KIS_TOKEN`·`kis_token.json`·`token.dat`를 한번에 맞춤. 스캐너 `get_fresh_token`도 `kis_api` 경로로 publish.

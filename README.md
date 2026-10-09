@@ -136,7 +136,7 @@ py -3.11 adjust_capital.py
 
 5. **고점 보정 (입출금)**  
    - `adjust_capital.py` 와 **동일한 로직**을 백그라운드 스레드(`CapitalAdjustThread`)로 실행합니다.  
-   - **입금 / 출금** 선택, **시장(국장·미장·코인)** 선택, 원화 금액 입력 후 **「실행 (스냅샷 갱신 → 고점 반영)」** → 해당 `peak_equity_*` 와 `peak_total_equity` 갱신·`capital_adjustments` 기록.
+   - **입금 / 출금** 선택, **시장(국장·미장·코인)** 선택, **시장 통화** 금액(국장 원 · 미장 USD · 코인 USDT/원) 입력 후 **「실행 (스냅샷 갱신 → 고점 반영)」** → 해당 `peak_equity_*` 와 `peak_total_equity` 갱신·`capital_adjustments` 기록.
 
 ### 자동으로 도는 것들
 
@@ -349,6 +349,7 @@ KR/US **비장중:** KIS 보유 목록 API **생략** → `sync_all_positions`�
 
 - 예수금 입출금만으로 총자산이 바뀌면 Phase5 고점이 왜곡될 수 있어, **`peak_total_equity`** 를 수동으로 맞출 때 사용합니다.
 - 실행 시 **`refresh_circuit_aux_from_brokers`** 로 스냅샷을 맞춘 뒤 금액을 입력합니다.
+- 금액 단위는 시장 고점과 동일: 국장 **원**, 미장 **USD**, 코인 **USDT**(바이낸스)/원(업비트). 합산 고점에는 환율 환산액을 가감합니다.
 
 ### `config.json`
 
@@ -391,7 +392,7 @@ KR/US **비장중:** KIS 보유 목록 API **생략** → `sync_all_positions`�
 | `trade_history.json` | 매매 로그 | **제외** |
 | `us_universe_cache.json` | 미장 고베타 150종·GICS·`meta`(시총 출처 등), TTL 24h | **제외** |
 | `kr_targets.json` | 국장 스크리너 출력(자주 변함) | **제외** |
-| `data/ohlcv_cache/*.json` | 일봉 OHLCV 디스크 캐시(최대 약 3일, `utils/ohlcv_store.py`) | **제외** (`.gitignore`) |
+| `data/ohlcv_cache/*.json` | 일봉 OHLCV 디스크 캐시(매매 조회는 `OHLCV_MEM_TTL_SEC` 이내만 사용, `utils/ohlcv_store.py`) | **제외** (`.gitignore`) |
 | `조건검색/` | HTS 조건검색식 원본 — **최신 V8:** `v8조건검색 26.05(외국인수급제외 간결화).txt` (`.xml`/`.tdf` 동봉) | 선택적으로 커밋 |
 
 새로 클론한 저장소에는 위 제외 파일이 없을 수 있으니, **로컬에서 생성**하거나 스크리너/봇을 한 번 실행해 채우면 됩니다.
@@ -414,8 +415,10 @@ KR/US **비장중:** KIS 보유 목록 API **생략** → `sync_all_positions`�
 
 | 단계 | 내용 |
 |------|------|
-| 1 | 메모리 `_ohlcv_cache` — **≥200봉** 이고 `ohlcv_series_valid` 통과 시 반환 |
-| 2 | 디스크 `data/ohlcv_cache/{티커}.json` — 동일 검증 통과 시 사용, 실패 시 파일 삭제 |
+| 1 | 메모리 `_ohlcv_cache` — **≥200봉**·`ohlcv_series_valid` 통과·확보 후 **`OHLCV_MEM_TTL_SEC`(기본 4h)** 이내면 반환. 지나면 재조회(실패 시 직전 일봉 재사용) |
+| 2 | 디스크 `data/ohlcv_cache/{티커}.json` — 같은 TTL·검증 통과 시 사용, 실패 시 파일 삭제 |
+
+TTL 변경: `config.json`의 `ohlcv_mem_ttl_sec` 또는 환경변수 `BOT_OHLCV_MEM_TTL_SEC` (최소 600초).
 | 3 | **국장:** KIS 국내 일봉(`get_ohlcv_kis_domestic_daily`, `d` 포함) + **pykrx** → `select_validated_kr_ohlcv` |
 | 4 | **미장:** KIS 해외 일봉(`get_ohlcv_kis_us_daily`, `d` 포함) + **yfinance** → `select_validated_equity_ohlcv` |
 | 5 | **`stooq_apikey`:** 200봉 미만이면 Stooq 보강 |

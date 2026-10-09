@@ -488,8 +488,22 @@ us_name_dict = {"AAPL": "애플", "MSFT": "마이크로소프트", "NVDA": "엔�
 # =====================================================================
 # 🗄️ OHLCV 캐시 (루프 시작 시 한번에 조회, 이후 재사용)
 _ohlcv_cache = {}
+# 티커별 일봉 확보 시각(epoch) — 장기 기동 시 매수 당시 일봉으로 매도선이 고정되지 않게
+_ohlcv_cache_fetched_at: dict[str, float] = {}
 _ohlcv_cache_time = 0
 _kis_ohlcv_last_ts = 0.0
+OHLCV_MEM_TTL_SEC = max(
+    600.0,
+    float(
+        os.environ.get("BOT_OHLCV_MEM_TTL_SEC", "")
+        or config.get("ohlcv_mem_ttl_sec", 4 * 3600)
+    ),
+)
+
+
+def _ohlcv_mem_fresh(ticker: str) -> bool:
+    ts = float(_ohlcv_cache_fetched_at.get(str(ticker or "").strip(), 0.0) or 0.0)
+    return ts > 0 and (time.time() - ts) < OHLCV_MEM_TTL_SEC
 # 국장 KIS 일봉 연속 호출 간격(초). 전역 limiter와 병행 — 기본 0.35(실전 20건/초 여유)
 KIS_OHLCV_MIN_INTERVAL_SEC = float(config.get("kis_ohlcv_min_interval_sec", 0.35))
 
@@ -531,7 +545,12 @@ def prefetch_ohlcv(tickers, market="KR", broker=None):
     success, fail = 0, 0
     use_kis_first = market == "KR" and broker is not None
     for t in tickers:
-        if t in _ohlcv_cache and _ohlcv_cache[t] and len(_ohlcv_cache[t]) >= 14:
+        if (
+            t in _ohlcv_cache
+            and _ohlcv_cache[t]
+            and len(_ohlcv_cache[t]) >= 14
+            and _ohlcv_mem_fresh(t)
+        ):
             success += 1
             continue
         try:
@@ -563,12 +582,14 @@ def _store_ohlcv_cache(ticker: str, ohlcv: list) -> list:
         series = normalize_ohlcv_series(ohlcv)
         if series and len(series) >= 14 and ohlcv_series_valid(series):
             _ohlcv_cache[ticker] = series
+            _ohlcv_cache_fetched_at[ticker] = time.time()
             save_disk_ohlcv(ticker, series)
             return series
     except Exception:
         pass
     if ohlcv and len(ohlcv) >= 14:
         _ohlcv_cache[ticker] = ohlcv
+        _ohlcv_cache_fetched_at[ticker] = time.time()
     return ohlcv
 
 
@@ -587,6 +608,7 @@ def get_cached_ohlcv(ticker, broker=None, force_refresh: bool = False):
     """OHLCV 확보(200봉). 메모리·디스크 → 국장 KIS→pykrx → 미장 KIS→Stooq(키)→yfinance."""
     try:
         from utils.ohlcv_store import (
+            disk_ohlcv_saved_at,
             invalidate_disk_ohlcv,
             load_disk_ohlcv,
             normalize_ohlcv_series,
@@ -597,27 +619,28 @@ def get_cached_ohlcv(ticker, broker=None, force_refresh: bool = False):
         invalidate_disk_ohlcv = lambda _t: None  # type: ignore
         normalize_ohlcv_series = lambda r: r or []  # type: ignore
         ohlcv_series_valid = lambda r, **kw: bool(r)  # type: ignore
+        disk_ohlcv_saved_at = lambda _t: 0.0  # type: ignore
 
     t = str(ticker or "").strip()
     if force_refresh:
         _ohlcv_cache.pop(t, None)
+        _ohlcv_cache_fetched_at.pop(t, None)
         try:
             invalidate_disk_ohlcv(t)
         except Exception:
             pass
 
     mem = _ohlcv_cache.get(t) or []
-    if (
-        not force_refresh
-        and mem
-        and len(mem) >= 200
-        and ohlcv_series_valid(mem)
-    ):
+    mem_valid = bool(mem) and len(mem) >= 200 and ohlcv_series_valid(mem)
+    if not force_refresh and mem_valid and _ohlcv_mem_fresh(t):
         return mem
+    # 재조회 전부 실패 시에만 쓰는 직전 일봉
+    stale_mem = mem if mem_valid else []
 
-    disk = None if force_refresh else load_disk_ohlcv(t)
+    disk = None if force_refresh else load_disk_ohlcv(t, max_age_sec=OHLCV_MEM_TTL_SEC)
     if disk and len(disk) >= 200 and ohlcv_series_valid(disk):
         _ohlcv_cache[t] = disk
+        _ohlcv_cache_fetched_at[t] = disk_ohlcv_saved_at(t) or time.time()
         return disk
     if disk and not ohlcv_series_valid(disk):
         try:
@@ -730,6 +753,10 @@ def get_cached_ohlcv(ticker, broker=None, force_refresh: bool = False):
     if best:
         _store_ohlcv_cache(ticker, best)
         return best
+
+    if stale_mem:
+        print(f"     ⚠️ [{ticker}] OHLCV 재조회 실패 — 직전 메모리 일봉 재사용")
+        return stale_mem
 
     print(f"     🔴 [{ticker}] OHLCV 데이터 전체 실패 (200일 이상 확보 불가).")
     return []
@@ -2886,6 +2913,7 @@ def _heartbeat_fetch_ohlcv_for_holding(market: str, ticker: str) -> list:
             return ohlcv
         invalidate_disk_ohlcv(t)
         _ohlcv_cache.pop(t, None)
+        _ohlcv_cache_fetched_at.pop(t, None)
         if m == "KR":
             return get_cached_ohlcv(t, broker=kis_api.broker_kr, force_refresh=True) or []
         if m == "US":

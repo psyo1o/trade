@@ -66,10 +66,11 @@
 
 ### 입출금
 
-GUI **고점 보정** 탭 또는 `adjust_capital.py` 에서 **국장/미장/코인**을 고른 뒤 금액을 넣는다.
+GUI **고점 보정** 탭 또는 `adjust_capital.py` 에서 **국장/미장/코인**을 고른 뒤 **시장 통화**로 금액을 넣는다 (국장 원 · 미장 USD · 코인 USDT(바이낸스)/원(업비트)).
 
-- 국장 입금 100만 → `peak_equity_KR` +100만, `peak_total_equity` +100만
-- 미장 입금 100만 → `peak_equity_US` +(100만/환율) USD, 합산 고점 +100만
+- 국장 입금 100만원 → `peak_equity_KR` +100만, `peak_total_equity` +100만
+- 미장 입금 $1,000 → `peak_equity_US` +$1,000, 합산 고점 +($1,000×환율)
+- 바이낸스 입금 500 USDT → `peak_equity_COIN` +500 USDT, 합산 고점 +(500×원/USDT)
 - 비중 앵커(`phase5_share_anchor`)도 현재 스냅샷으로 다시 잡음 (비중 모드 쓸 때)
 
 ### 로그 예

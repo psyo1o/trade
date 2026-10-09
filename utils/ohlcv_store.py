@@ -270,6 +270,18 @@ def invalidate_disk_ohlcv(ticker: str) -> None:
         pass
 
 
+def disk_ohlcv_saved_at(ticker: str) -> float:
+    """디스크 캐시 저장 시각(epoch). 없거나 읽기 실패면 0."""
+    path = _cache_path(ticker)
+    if not path.is_file():
+        return 0.0
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return float(raw.get("saved_at", 0) or 0)
+    except Exception:
+        return 0.0
+
+
 def load_disk_ohlcv(ticker: str, *, max_age_sec: float = _DEFAULT_MAX_AGE_SEC) -> list | None:
     path = _cache_path(ticker)
     if not path.is_file():

@@ -801,10 +801,11 @@ class CapitalAdjustThread(QThread):
 
     done = pyqtSignal(bool, str)
 
-    def __init__(self, withdraw: bool, amount_krw: float, state_path: Path, market: str = "KR"):
+    def __init__(self, withdraw: bool, amount: float, state_path: Path, market: str = "KR"):
+        """``amount`` — 시장 기준 통화(국장 원, 미장 USD, 코인 USDT/원)."""
         super().__init__()
         self._withdraw = withdraw
-        self._amount = float(amount_krw)
+        self._amount = float(amount)
         self._state_path = state_path
         self._market = str(market or "KR")
 
@@ -814,7 +815,7 @@ class CapitalAdjustThread(QThread):
 
             ok, msg = adjust_capital.apply_capital_peak_adjustment(
                 withdraw=self._withdraw,
-                amount_krw=self._amount,
+                amount=self._amount,
                 state_path=self._state_path,
                 source_label="run_gui.py",
                 market=self._market,
@@ -1430,6 +1431,7 @@ class BotDashboard(QMainWindow):
             "<b style='color:#e2e8f0'>고점 보정 (수동 입·출금)</b><br>"
             "<span style='color:#94a3b8'>국장·미장·코인 <b>어느 계좌로</b> 입·출금했는지 고르세요. "
             "해당 시장 고점만 가감하므로 다른 시장 서킷이 오발동하지 않습니다. "
+            "금액은 <b>시장 통화</b>로 입력합니다 — 국장 원 · 미장 USD · 코인 USDT(바이낸스)/원(업비트). "
             "실행 시 실계좌 스냅샷 갱신 후 고점을 반영합니다.</span><br>"
             "<span style='color:#f87171'>주말 KIS 점검 구간에는 국·미 스냅샷이 제한될 수 있습니다.</span>"
         )
@@ -1459,11 +1461,13 @@ class BotDashboard(QMainWindow):
         capital_layout.addLayout(mk_row)
 
         amt_row = QHBoxLayout()
-        amt_row.addWidget(QLabel("금액 (원):"))
+        self.capital_amount_label = QLabel("금액 (원):")
+        amt_row.addWidget(self.capital_amount_label)
         self.capital_amount_edit = QLineEdit()
-        self.capital_amount_edit.setPlaceholderText("예: 1000000 또는 1,000,000")
         amt_row.addWidget(self.capital_amount_edit, stretch=1)
         capital_layout.addLayout(amt_row)
+        self.capital_market_combo.currentIndexChanged.connect(self._sync_capital_amount_unit)
+        self._sync_capital_amount_unit()
 
         self.capital_apply_btn = QPushButton("실행 (스냅샷 갱신 → 고점 반영)")
         self.capital_apply_btn.setObjectName("BtnCapitalApply")
@@ -1497,12 +1501,29 @@ class BotDashboard(QMainWindow):
         main_split.setSizes([580, 240])
         layout.addWidget(main_split, 1)
 
+    def _capital_amount_unit(self) -> str:
+        import adjust_capital
+
+        mk = str(self.capital_market_combo.currentData() or "KR")
+        return adjust_capital.capital_amount_unit(mk)
+
+    def _sync_capital_amount_unit(self, *_args):
+        """시장 선택에 맞춰 금액 단위(원·USD·USDT) 표시."""
+        import adjust_capital
+
+        unit = self._capital_amount_unit()
+        self.capital_amount_label.setText(f"금액 ({adjust_capital.capital_unit_label(unit)}):")
+        if unit == "KRW":
+            self.capital_amount_edit.setPlaceholderText("예: 1000000 또는 1,000,000")
+        else:
+            self.capital_amount_edit.setPlaceholderText(f"예: 500 또는 1,250.50 ({unit})")
+
     def _on_capital_adjust_clicked(self):
         import adjust_capital
 
         raw = self.capital_amount_edit.text().strip()
         try:
-            amount = adjust_capital.parse_capital_amount_krw(raw)
+            amount = adjust_capital.parse_capital_amount(raw)
         except ValueError as e:
             QMessageBox.warning(self, "입력 오류", str(e))
             return
@@ -1511,10 +1532,14 @@ class BotDashboard(QMainWindow):
         verb = "출금" if withdraw else "입금"
         mk = str(self.capital_market_combo.currentData() or "KR")
         mk_label = self.capital_market_combo.currentText()
+        unit = self._capital_amount_unit()
+        amt_txt = (
+            f"{amount:,.0f}원" if unit == "KRW" else f"{amount:,.2f} {unit}"
+        )
         confirm = QMessageBox.question(
             self,
             "고점 보정 확인",
-            f"<b>{mk_label}</b>에 <b>{verb}</b> <b>{amount:,.0f}</b>원을 반영합니다.<br><br>"
+            f"<b>{mk_label}</b>에 <b>{verb}</b> <b>{amt_txt}</b>을 반영합니다.<br><br>"
             "해당 시장 고점과 합산 고점을 맞춘 뒤 실계좌 스냅샷을 갱신합니다. 계속할까요?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
