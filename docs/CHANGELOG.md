@@ -7,6 +7,16 @@
 
 ---
 
+## 2026-10-13 — 오래된 단위 테스트를 현행 동작에 맞춤
+
+- **무엇을:** KR coalesce 테스트 기대값을 스냅 예수≈총평일 때 `현금 = 총평 − 보유`(817,644)로 수정하고 테스트 이름을 바꿈. OHLCV finalize 픽스처 날짜를 오늘 기준으로 생성. Phase5 지수 재검증 테스트에 `ACCOUNT_CIRCUIT_USE_INDEX=True`를 두고 KIS 잔고 경로는 호출되면 실패하게 막음. 수집이 깨진 본절 락 테스트는 삭제된 `SWING_PROFIT_LOCK_ACTIVATE_PCT` 대신 동적 임계 API에 맞춤.
+- **왜:** 운영 로직은 맞고, 테스트만 옛 기대값·2026-06-04 고정 일자·지수 플래그 미설정으로 실패했다.
+- **주요 파일:** `tests/test_ledger_label_coalesce.py`, `tests/test_ohlcv_series.py`, `tests/test_phase5_index_circuit.py`, `tests/test_profit_lock_breakeven.py`
+- **이어서 할 일 / 주의:** 운영 코드는 변경하지 않음. 라이브 API 호출 없음.
+- **테스트:** `BOT_OHLCV_LIVE_TEST=0 python3 -m pytest tests -q -m "not live"`
+
+---
+
 ## 2026-10-09 — 고점 보정: 미장 USD·코인 USDT 직접 입력
 
 - **무엇을:** 고점 보정 금액을 시장 통화로 입력 (국장 원 · 미장 USD · 코인 USDT(바이낸스)/원(업비트)). 시장 `peak_equity_*`는 입력값 그대로, 합산 고점은 환율 환산액으로 가감. GUI 금액 라벨·예시·확인창이 시장 선택에 따라 단위 표시. `capital_adjustments`에 `amount_native`·`amount_unit`·`krw_per_unit` 기록. 레거시 `amount_krw` 인자는 환율로 나눠 계속 지원.
