@@ -36,6 +36,20 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
         # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
         positions_count = rb._count_positions_in_state(held_kr, state.get("positions", {}))
         rb._prefetch_kr_sell_ohlcv_if_needed(kr_output1, held_kr, positions_count)
+        _kr_crash_snap = None
+        if str(getattr(rb, "KR_CRASH_EXIT_MODE", "off")).strip().lower() != "off" and held_kr:
+            from strategy.kr_crash_exit import in_kr_close_crash_window, load_kr_index_snapshot
+
+            _now_crash = datetime.now(pytz.timezone("Asia/Seoul"))
+            if in_kr_close_crash_window(_now_crash):
+                try:
+                    _kr_crash_snap = load_kr_index_snapshot()
+                except Exception as _crash_exc:
+                    print(f"  ⚠️ [KR-CRASH] 지수 조회 실패 — 청산 판단 생략: {_crash_exc}")
+                    _kr_crash_snap = None
+                if _kr_crash_snap is not None and not _kr_crash_snap.any_available():
+                    print("  ⚠️ [KR-CRASH] 지수 등락률 없음 — 급락 청산 스킵(매도 없음)")
+                    _kr_crash_snap = None
         for stock in kr_output1:
             t = rb.normalize_ticker(stock.get('pdno', ''))
             if not t:
@@ -66,7 +80,30 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
                     continue
             try:
                 ohlcv = rb.get_cached_ohlcv(t, broker=rb.kis_api.broker_kr)
-            
+
+                if _kr_crash_snap is not None:
+                    from execution.kr_crash_exit import apply_kr_crash_exit_for_holding
+
+                    try:
+                        _crash_res = apply_kr_crash_exit_for_holding(
+                            rb,
+                            state=state,
+                            stock=stock,
+                            ticker=t,
+                            ohlcv=ohlcv if isinstance(ohlcv, list) else None,
+                            snap=_kr_crash_snap,
+                            cycle_tag=_buy_cycle_tag,
+                        )
+                    except Exception as _crash_pos_exc:
+                        print(
+                            f"  ⚠️ [KR-CRASH] {t} 판단 예외 — 기존 매도 로직 유지: "
+                            f"{type(_crash_pos_exc).__name__}"
+                        )
+                        _crash_res = "noop"
+                    if _crash_res == "sold":
+                        kr_sell_fills += 1
+                        continue
+
                 if not ohlcv or not isinstance(ohlcv, list) or not ohlcv[-1] or 'c' not in ohlcv[-1]:
                     print(f"  ❌ [KR 매도 루프 예외] {t}: OHLCV 데이터 또는 종가(c) 정보 부족. 건너뜁니다.")
                     continue

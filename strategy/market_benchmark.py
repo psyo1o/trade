@@ -78,6 +78,28 @@ def fetch_benchmark_closes(market: str, *, period: str = "6mo") -> pd.Series | N
     return _fetch_yf_closes(sym, period=period)
 
 
+def index_daily_change_pct(symbol: str) -> float | None:
+    """야후 심볼 전일 종가 대비 등락률(%).
+
+    ``daily_change_pct`` 와 같은 일봉 두 개 비교. 실패·데이터 부족은 ``None``
+    (0.0 과 구분 — 급락 청산이 횡보로 오인하지 않게).
+    """
+    sym = str(symbol or "").strip()
+    if not sym:
+        return None
+    try:
+        closes = _fetch_yf_closes(sym, period="5d")
+        if closes is None or len(closes) < 2:
+            return None
+        prev_close = float(closes.iloc[-2])
+        curr_close = float(closes.iloc[-1])
+        if prev_close <= 0:
+            return None
+        return ((curr_close - prev_close) / prev_close) * 100.0
+    except Exception:
+        return None
+
+
 def daily_change_pct(market: str) -> float:
     mk = normalize_market(market)
     try:

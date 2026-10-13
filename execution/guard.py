@@ -1047,6 +1047,8 @@ def _classify_exit_cooldown_bucket(reason: str, profit_rate: float | None) -> st
     * ``time_stop`` — 타임스탑 (24h)
     * ``stop_loss`` — 하드스탑·손절 (24h)
     """
+    if "KR-CRASH" in (reason or "") or "지수 급락" in (reason or ""):
+        return "stop_loss"
     if _is_time_stop_exit(reason):
         return "time_stop"
     if _is_stop_loss_exit(reason, profit_rate):

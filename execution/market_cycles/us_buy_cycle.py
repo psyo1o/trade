@@ -206,6 +206,28 @@ def run_us_buy_cycle(
             ):
                 continue
 
+            # 실적 차단: off 는 조회 없음. shadow 는 로그만 남기고 아래 매수를 그대로 진행.
+            # 판단 예외는 fail-open — 예외로 매수 자체가 스킵되지 않게 한다.
+            from strategy.earnings_gate import us_earnings_entry_blocked
+
+            try:
+                _earn_block = us_earnings_entry_blocked(
+                    getattr(rb, "EARNINGS_BLOCK_MODE", "off"),
+                    t,
+                    float(curr_p),
+                    strategy_type,
+                    events_path=getattr(rb, "SHADOW_EVENTS_PATH", None),
+                )
+            except Exception as _earn_exc:
+                print(
+                    f"  ⚠️ [EARNINGS] {us_name}({t}) 판단 예외 — 매수 허용(fail-open): "
+                    f"{type(_earn_exc).__name__}"
+                )
+                _earn_block = False
+            if _earn_block:
+                print(f"  ⏭️ {us_name}({t}): [EARNINGS] 실적 임박 — 신규 매수 차단")
+                continue
+
             us_box = [float(us_cash)]
             entry_atr = float(rb.get_safe_atr(t, ohlcv) or 0.0)
             ok_us_buy = rb._execute_us_market_buy_twap(

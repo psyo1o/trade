@@ -46,6 +46,17 @@ KIS 토큰·봇 state 파일은 사용하지 않습니다.
 - **적절청산(good_exit):** 매도 후 20일 -5% 이하 → 손절·매도 타이밍 양호
 - **Phase5 / 하드스탑** 건은 `sell_bucket`으로 따로 집계
 
+## 섀도우 규칙 사후 평가
+
+운영 중 실적 차단·국장 급락 청산은 기본 **shadow** 라 주문하지 않고 `logs/shadow_events.jsonl` 에만 남깁니다.
+
+```bash
+py -3.11 analysis/run_shadow_review.py
+py -3.11 analysis/run_shadow_review.py --no-fetch
+```
+
+`analysis/output/shadow_outcomes.md` — 이벤트 가격 대비 이후 1/3/5 거래일 종가. 실적 차단은 가상 매수, 급락 청산은 가상 매도.
+
 ## 주의
 
 - 코인 OHLCV는 Upbit 마켓 코드에 따라 실패할 수 있음 → `post_exit_note=OHLCV 부족`
