@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -14,6 +15,8 @@ class TradingCycleContext:
     macro_reason: str
     macro_snap: dict[str, Any]
     buy_cycle_tag: str
+    # 사이클이 시작된 KST 시각. 국장 급락 청산 창(15:15–15:20)은 이 시각으로 판정한다.
+    cycle_started_kst: datetime | None = None
     # KR 전용 (타겟은 사이클 시작 시 조립)
     final_targets_kr: list[str] = field(default_factory=list)
     # 누적 (사이클 말 텔레·로그)

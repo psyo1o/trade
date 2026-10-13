@@ -17,10 +17,11 @@
 | `scale_out` | **TREND_V8** 1차 Scale-Out 50% (`entry_atr×3.0`) — **SWING_FIB 미사용** | ❌ (슬라이스 키만) | 0..n-1 |
 | `scale_out_2` | **TREND_V8** 2차 Scale-Out (`entry_atr×6.0`, 1차 후 잔량 50%) | ❌ | 0..n-1 |
 | `exit` | 타임스탑·하드스탑·샹들리에·스윙 트레일 전량 | ✅ | 0만 |
+| `kr_crash` | 국장 마감 창 지수 -3% 전량 (live). shadow 는 주문 없음 | ✅ | 0만 |
 | `manual` | GUI 수동 매도 | ✅ | 0 (부분도 0) |
 | `phase5` | 합산 서킷 `manual_sell` 위임 | ✅ | 0 |
 
-**COIN `SWING_FIB`:** `swing_full` 중 **기술바닥 이탈**(`스윙 기술바닥 이탈 …`)은 진입 **2h 미만** + 수익 **-3% 초과** 시 `coin_cycle`에서 **유예**(lane 미발행). **-3% 이하** 하드컷·**2h 이후**·HALF·5MA·RSI FULL은 유예 없음. 코드: `run_bot._coin_swing_entry_noise_defers_tech_floor_full`. README §5-3 · `docs/PHASE5_ACCOUNT_CIRCUIT.md` §10.
+**COIN `SWING_FIB`:** `swing_full` 중 **기술바닥 이탈**(`스윙 기술바닥 이탈 …`)은 진입 **2h 미만** + 수익 **-3% 초과** 시 `coin_cycle`에서 **유예**(lane 미발행). **-3% 이하** 하드컷·**2h 이후**·HALF·10MA·RSI FULL은 유예 없음. 코드: `run_bot._coin_swing_entry_noise_defers_tech_floor_full`. README §5-3 · `docs/PHASE5_ACCOUNT_CIRCUIT.md` §10.
 
 ## 잔고 검증
 

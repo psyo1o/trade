@@ -38,6 +38,7 @@ bot_state_backups/
 bot_state.before_*.json
 *.bak_repair_*
 trade_history.json
+shadow_events.jsonl
 backups/
 
 us_universe_cache.json

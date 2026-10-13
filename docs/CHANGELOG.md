@@ -17,6 +17,16 @@
 
 ---
 
+## 2026-10-13 — 섀도우 규칙: 미장 실적 차단·국장 급락 청산
+
+- **무엇을:** `earnings_block_mode`·`kr_crash_exit_mode` (`off|shadow|live`, 기본 shadow). 미장 신규 매수는 실적이 매수일 포함 10거래일(day 0~9) 안이면 차단 후보(조회 실패는 fail-open, 국장·코인 제외). 국장은 KST 15:15~15:20 회차에서 KODEX200 또는 상장시장 지수(KOSPI/KOSDAQ)가 -3% 이하면 해당 보유 전량 매도 후보(날짜당 1회). shadow 는 주문 없이 `shadow_events.jsonl` 과 `[SHADOW-EARNINGS]`·`[SHADOW-KRCRASH]` 로그만. live 는 기존 주문 경로. `python tools/analyze_shadow.py` 로 반사실 요약. README 의 V8 타임스탑 72시간·러너 10MA·절대손절 -4%(`ABSOLUTE_STOP_MAX_LOSS_MULT=0.96`) 문구를 코드와 맞춤.
+- **왜:** 규칙을 실주문에 넣기 전에 로그만으로 영향을 보려는 운영. 문서는 아직 14일·5MA로 남아 있었다.
+- **주요 파일:** `strategy/shadow_rules.py`, `strategy/shadow_report.py`, `tools/analyze_shadow.py`, `execution/market_cycles/us_buy_cycle.py`, `execution/market_cycles/kr_cycle.py`, `run_bot.py`, `README.md`
+- **이어서 할 일 / 주의:** 기본 shadow 라 재시작 후에도 주문은 그대로다. live 로 바꾸려면 `config.json` 수정 후 재시작. 로그는 루트 `shadow_events.jsonl`.
+- **테스트:** `python -m pytest tests/test_shadow_rules.py tests/test_market_benchmark.py tests/test_v8_time_stop.py tests/test_swing_runner_trailing.py tests/test_market_cycles_smoke.py -q`
+
+---
+
 ## 2026-10-09 — 고점 보정: 미장 USD·코인 USDT 직접 입력
 
 - **무엇을:** 고점 보정 금액을 시장 통화로 입력 (국장 원 · 미장 USD · 코인 USDT(바이낸스)/원(업비트)). 시장 `peak_equity_*`는 입력값 그대로, 합산 고점은 환율 환산액으로 가감. GUI 금액 라벨·예시·확인창이 시장 선택에 따라 단위 표시. `capital_adjustments`에 `amount_native`·`amount_unit`·`krw_per_unit` 기록. 레거시 `amount_krw` 인자는 환율로 나눠 계속 지원.

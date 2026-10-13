@@ -89,7 +89,7 @@ py -3.11 adjust_capital.py
 ### 매매·알림 시계
 
 - **매매 엔진:** **GUI**는 기동 직후 즉시 실행 없이, KST **`:00` / `:15` / `:30` / `:45`** 분기 스케줄에서만 `run_trading_bot()` 을 돌립니다. **`run_bot.py` 헤드리스**는 시작 시 **`run_trading_bot()` 1회**를 먼저 돌린 뒤, 같은 KST 분 슬롯에 이어서 스케줄합니다.
-- **텔레그램 생존신고(heartbeat):** **GUI**는 **기동 직후 발송 없음**. 다음 **KST `:00` / `:30`** 슬롯을 예약한 뒤, **해당 슬롯의 15분 매매 사이클(`:00/:15/:30/:45`)이 끝난 다음** `heartbeat_report()` 를 보냅니다(매매 15분 주기와 별도). **`run_bot.py` 단독(헤드리스)** 은 프로세스 시작 시 **`heartbeat_report()` 1회**를 보낸 뒤, **`schedule.every(4).hours`** 로 이어집니다(벽시계 `:00/:30` 정렬은 GUI 전용). 보유 한 줄은 **`종목 | 전략:V8|스윙 | 매수가 | 현재가(수익%) | 최고가(%) | 매도선(%) | 보유기간`** 형식이며, 국·미는 **`N일 N시간 (영업 N.Nh)`** 로 타임스탑과 동일한 영업시간을 함께 표시합니다. **매도선·스윙 5MA** 재계산에 쓰는 일봉은 **15분 매매 루프와 동일한 `get_cached_ohlcv`**(국·미 교차검증·날짜 정렬·꼬리 검증, 아래 [일봉 OHLCV](#일봉-ohlcv-확보-get_cached_ohlcv))입니다. 장부 `strategy_type`·`tier`·없으면 `trade_history` 최근 BUY 로 전략을 표시합니다. 주말 미장 **표시가**는 `normalize_us_current_p_api_for_display` 로 장부 폴백 시에도 **yfinance 종가**를 쓰도록 GUI와 동일 전처리를 맞춥니다. **코인** 보유 한 줄의 가격은 바이낸스 **USDT** 단위. 요약 줄의 **예수·총평**(바이낸스)은 ``coin_broker.binance_display_cash_and_total_usdt()`` 로 **가용 USDT + 코인 명목**을 직접 합산한다(KRW 왕복 없음). 업비트 요약은 **원**. 서킷·Phase5용 스냅샷은 여전히 원화 환산. 코인 TWAP 체결 알림도 같은 단위 규칙을 따른다.
+- **텔레그램 생존신고(heartbeat):** **GUI**는 **기동 직후 발송 없음**. 다음 **KST `:00` / `:30`** 슬롯을 예약한 뒤, **해당 슬롯의 15분 매매 사이클(`:00/:15/:30/:45`)이 끝난 다음** `heartbeat_report()` 를 보냅니다(매매 15분 주기와 별도). **`run_bot.py` 단독(헤드리스)** 은 프로세스 시작 시 **`heartbeat_report()` 1회**를 보낸 뒤, **`schedule.every(4).hours`** 로 이어집니다(벽시계 `:00/:30` 정렬은 GUI 전용). 보유 한 줄은 **`종목 | 전략:V8|스윙 | 매수가 | 현재가(수익%) | 최고가(%) | 매도선(%) | 보유기간`** 형식이며, 국·미는 **`N일 N시간 (영업 N.Nh)`** 로 타임스탑과 동일한 영업시간을 함께 표시합니다. **매도선·스윙 10MA** 재계산에 쓰는 일봉은 **15분 매매 루프와 동일한 `get_cached_ohlcv`**(국·미 교차검증·날짜 정렬·꼬리 검증, 아래 [일봉 OHLCV](#일봉-ohlcv-확보-get_cached_ohlcv))입니다. 장부 `strategy_type`·`tier`·없으면 `trade_history` 최근 BUY 로 전략을 표시합니다. 주말 미장 **표시가**는 `normalize_us_current_p_api_for_display` 로 장부 폴백 시에도 **yfinance 종가**를 쓰도록 GUI와 동일 전처리를 맞춥니다. **코인** 보유 한 줄의 가격은 바이낸스 **USDT** 단위. 요약 줄의 **예수·총평**(바이낸스)은 ``coin_broker.binance_display_cash_and_total_usdt()`` 로 **가용 USDT + 코인 명목**을 직접 합산한다(KRW 왕복 없음). 업비트 요약은 **원**. 서킷·Phase5용 스냅샷은 여전히 원화 환산. 코인 TWAP 체결 알림도 같은 단위 규칙을 따른다.
 
 ---
 
@@ -129,10 +129,10 @@ py -3.11 adjust_capital.py
    - **수량**은 실시간 보유 표와 같이 **실계좌 잔고**를 우선 표시합니다(`qty` 미기록·구형 장부도 동기화·조회로 맞춤).  
    - **수익률** 열은 **매수가 대비 장부 최고가(`max_p`)** 기준입니다(실시간 보유 표·상단 보유 ROI는 **현재가** 기준).  
    - 마지막 열 **「전략」** 은 헷지 유니버스 종목이면 **`헷지 · 코드(한글명)`**, 아니면 매수 시 `tier`·`strategy_type` 기준 **V8·스윙 전략명**을 보여 줍니다. `1/N 고정`·`vol-target` 같은 비중 라벨만 있는 구형 행은 화면에서 전략명으로 복원합니다.
-   - **매도선·최고가·보유시간**은 `build_holding_display_bundle` 한 경로로 표시합니다(일봉은 **`get_cached_ohlcv`**, 15분 매매 로그·텔레그램 생존신고와 동일). 스윙은 `get_swing_exit_display_price` 로 **매 사이클 재계산**(러너 구간 **5MA** 포함).
+   - **매도선·최고가·보유시간**은 `build_holding_display_bundle` 한 경로로 표시합니다(일봉은 **`get_cached_ohlcv`**, 15분 매매 로그·텔레그램 생존신고와 동일). 스윙은 `get_swing_exit_display_price` 로 **매 사이클 재계산**(러너 구간 **10MA** 포함).
 
 4. **매매·전략 안내**  
-   - 타임스탑, V8/스윙 매도선, **러너 5MA 트레일링**, **하락장 헷지**(정상 장 후보 병합·Phase4/BEAR 전면 차단, `strategy/hedge_universe.py`) — `strategy/rules.py`·`docs/HEDGE_UNIVERSE.md` 와 동기화.
+   - 타임스탑, V8/스윙 매도선, **러너 10MA 트레일링**, **하락장 헷지**(정상 장 후보 병합·Phase4/BEAR 전면 차단, `strategy/hedge_universe.py`) — `strategy/rules.py`·`docs/HEDGE_UNIVERSE.md` 와 동기화.
 
 5. **고점 보정 (입출금)**  
    - `adjust_capital.py` 와 **동일한 로직**을 백그라운드 스레드(`CapitalAdjustThread`)로 실행합니다.  
@@ -251,7 +251,7 @@ flowchart TD
 
 | | **`SWING_FIB`** | **`TREND_V8`** |
 |---|-----------------|----------------|
-| **1순위** | `check_swing_exit` — HALF(1.5R 50%) / FULL(피보·구름·5MA·RSI) | — |
+| **1순위** | `check_swing_exit` — HALF(1.5R 50%) / FULL(피보·구름·10MA·RSI) | — |
 | **HALF/FULL 후** | `continue` — 아래 V8 경로 **진입 안 함** | — |
 | **HOLD 이후** | **V8 Scale-Out 블록 절대 안 탐** | **Scale-Out** 1차 `entry_atr×3` → 2차 `entry_atr×6` (ATR 없을 때만 +30% fallback) |
 | **그 다음** | 타임스탑 → (수익≥0) `check_swing_profit_lock_trailing_exit` | 타임스탑 → (손실) hard_stop → (수익) 샹들리에 |
@@ -399,7 +399,7 @@ KR/US **비장중:** KIS 보유 목록 API **생략** → `sync_all_positions`�
 
 ### 일봉 OHLCV 확보 (`get_cached_ohlcv`)
 
-매수·매도·RS·날씨(ADX)·**스윙 매도선(5MA)·텔레그램 생존신고·GUI 장부**에 쓰는 **일봉**은 `run_bot.py` 의 **`get_cached_ohlcv(ticker, broker=None)`** 로 모읍니다. 목표는 **200봉**이며, 확보·저장 전에 **`utils/ohlcv_store.py`** 에서 **날짜 정렬·꼬리 검증·교차검증**을 합니다.
+매수·매도·RS·날씨(ADX)·**스윙 매도선(10MA)·텔레그램 생존신고·GUI 장부**에 쓰는 **일봉**은 `run_bot.py` 의 **`get_cached_ohlcv(ticker, broker=None)`** 로 모읍니다. 목표는 **200봉**이며, 확보·저장 전에 **`utils/ohlcv_store.py`** 에서 **날짜 정렬·꼬리 검증·교차검증**을 합니다.
 
 **핵심 규칙 (2026-06)**
 
@@ -409,7 +409,7 @@ KR/US **비장중:** KIS 보유 목록 API **생략** → `sync_all_positions`�
 | **꼬리 검증** | `ohlcv_series_valid` — 마지막 봉이 너무 옛날(14영업일 초과)이거나 꼬리 종가가 비정상이면 **디스크 캐시 삭제·재조회** |
 | **교차검증** | **미장:** KIS vs **yfinance**(Yahoo 기준). **국장:** KIS vs **pykrx**(없으면 yfinance). 괴리·비정상 시 **기준源 채택**, 일치 시 **KIS** |
 
-잘못 정렬된 KIS 캐시(예: ANET 꼬리가 1월 종가로 끝남)는 5MA·매도선이 본절락만 보이게 만들 수 있어, 위 검증으로 **저장·재사용을 막습니다**.
+잘못 정렬된 KIS 캐시(예: ANET 꼬리가 1월 종가로 끝남)는 10MA·매도선이 본절락만 보이게 만들 수 있어, 위 검증으로 **저장·재사용을 막습니다**.
 
 **조회 순서**
 
@@ -436,7 +436,7 @@ TTL 변경: `config.json`의 `ohlcv_mem_ttl_sec` 또는 환경변수 `BOT_OHLCV_
 |------------------|---------|---------|
 | `sell_loop` | 14 | 매도 루프·ATR |
 | `v8_exit` | 20 | V8 `get_final_exit_price` |
-| `swing` | 60 | 스윙 진입·피보·구름·매도선·러너 5MA(일봉 5일 SMA) |
+| `swing` | 60 | 스윙 진입·피보·구름·매도선·러너 10MA(일봉 10일 SMA) |
 | `v8_entry` | 120 | V8 `calculate_pro_signals` (120MA) |
 | `cache_target` | 200 | `get_cached_ohlcv` 목표·ma200 여유 |
 
@@ -538,7 +538,7 @@ A and B and ((C and D and E and F) or (G and H))
 | `SWING_TIME_STOP_HOURS_EQUITY` | 72.0 | ``SWING_TIME_STOP_HOURS`` 별칭 (국·미) |
 | `SWING_TIME_STOP_HOURS_COIN` | 72.0 | ``SWING_TIME_STOP_HOURS`` 별칭 (코인) |
 | `SWING_TIME_STOP_EXEMPT_PROFIT_PCT` | 2.0 | 스윙 타임스탑 유예 — 수익 ≥ 이 값(%) |
-| `V8_TIME_STOP_HOURS` | 72.0 | V8 타임스탑 — **KR/US/COIN 공통** (14일) |
+| `V8_TIME_STOP_HOURS` | 72.0 | V8 타임스탑 — **KR/US/COIN 공통** (72시간·영업 3일) |
 | `V8_TIME_STOP_HOURS_EQUITY` | 72.0 | ``V8_TIME_STOP_HOURS`` 별칭 (국·미) |
 | `V8_TIME_STOP_HOURS_COIN` | 72.0 | ``V8_TIME_STOP_HOURS`` 별칭 (코인) |
 | `V8_TIME_STOP_EXEMPT_PROFIT_PCT` | 4.0 | V8 타임스탑 유예 — 수익 ≥ 이 값(%) |
@@ -550,8 +550,9 @@ A and B and ((C and D and E and F) or (G and H))
 | `SWING_SCALE_OUT_R_MULT` | 1.5 | HALF: 현재 수익 ≥ **1.5R** (1R = 진입 시 평단−초기 하드 바닥) |
 | `SWING_TIME_DECAY_START_TRADING_HOURS` | 24 | 영업시간 24h 경과 후 시간가중 손절 시작 |
 | `SWING_TIME_DECAY_GAP_CLOSE_PER_24H` | 0.40 | 이후 영업 24h마다 (평단−바닥) gap의 40% 상향 조임 |
-| `SWING_RUNNER_TRAIL_MA_DAYS` | 5 | 러너 구간 트레일링 — 당일 5일 종가 SMA |
-| `SWING_RSI_FULL_*` | +1%~+10% 미만 | RSI FULL 허용 구간 (+10%↑는 락·5MA 트레일링) |
+| `SWING_RUNNER_TRAIL_MA_DAYS` | 10 | 러너 구간 트레일링 — 당일 10일 종가 SMA |
+| `ABSOLUTE_STOP_MAX_LOSS_MULT` | 0.96 | V8 매도선·스윙 하드 바닥 하한 — 평단 대비 **-4%** 보다 깊은 기술선은 이 값으로 끌어올림 |
+| `SWING_RSI_FULL_*` | +1%~+10% 미만 | RSI FULL 허용 구간 (+10%↑는 락·10MA 트레일링) |
 
 **실시간가 주입 (`run_bot.py` / 매도 루프)**
 
@@ -590,7 +591,7 @@ A and B and ((C and D and E and F) or (G and H))
 | **기술 손절** | `max(20일선 − ATR×1.0, 종가 − ATR×2.0)` — ATR 없으면 종가×0.90(-10%) |
 | **장부** | 체결 후 `buy_p`=실제 평단, `sl_p`=위에서 계산한 값, `strategy_type=TREND_V8` |
 
-스윙의 피보·구름과 달리 V8은 **ATR·이평·샹들리에**만 기준으로 하며, **평단 대비 고정 % 절대 캡은 사용하지 않습니다.**
+스윙의 피보·구름과 달리 V8 **진입** 손절은 ATR·이평 기준입니다. 청산 쪽 V8 매도선(`get_final_exit_price`)과 스윙 하드 바닥(`get_swing_hard_stop_floor`)은 반환 직전 ``ABSOLUTE_STOP_MAX_LOSS_MULT=0.96``(평단 **-4%**) 하한을 적용합니다. 기술선이 그보다 깊으면 그 가격으로 끌어올립니다.
 
 #### 포지션 사이징 (Position Sizing)
 
@@ -643,7 +644,7 @@ if cash < target_budget:
 
 ### 청산 (매도)
 
-- 장부 **`SWING_FIB`**(``strategy_type`` 또는 ``tier``·``SWING`` 포함)이면 먼저 **`check_swing_exit`** (`FULL` / `HALF` / `HOLD`)를 봅니다. **`HALF`·`FULL`** 이 나오면 스윙 규칙으로 부분·전량 매도 후 **`continue`** — **`HOLD`** 는 **V8 분할 익절(Scale-Out, `entry_atr×3.0`) 블록에 절대 진입하지 않음** (`_resolve_sell_loop_strategy_type` + ``if strategy_type == "TREND_V8":``). 이후 **타임스탑 → (수익≥0일 때) 트레일링** 만 탑니다. 스윙 절반 익절은 **`check_swing_exit`의 1.5R HALF** 만 사용합니다. **피보·구름·러너 5MA 이탈은 `check_swing_exit` FULL** — 손실 구간 V8식 `hard_stop` 루프는 스킵. 수익 구간 트레일링은 **`check_swing_profit_lock_trailing_exit`**: 비러너는 본절 락, **러너는 5MA 이탈**(`[SWING-SELL] 5MA 트레일링 이탈`). **V8 샹들리에는 쓰지 않습니다.**
+- 장부 **`SWING_FIB`**(``strategy_type`` 또는 ``tier``·``SWING`` 포함)이면 먼저 **`check_swing_exit`** (`FULL` / `HALF` / `HOLD`)를 봅니다. **`HALF`·`FULL`** 이 나오면 스윙 규칙으로 부분·전량 매도 후 **`continue`** — **`HOLD`** 는 **V8 분할 익절(Scale-Out, `entry_atr×3.0`) 블록에 절대 진입하지 않음** (`_resolve_sell_loop_strategy_type` + ``if strategy_type == "TREND_V8":``). 이후 **타임스탑 → (수익≥0일 때) 트레일링** 만 탑니다. 스윙 절반 익절은 **`check_swing_exit`의 1.5R HALF** 만 사용합니다. **피보·구름·러너 10MA 이탈은 `check_swing_exit` FULL** — 손실 구간 V8식 `hard_stop` 루프는 스킵. 수익 구간 트레일링은 **`check_swing_profit_lock_trailing_exit`**: 비러너는 본절 락, **러너는 10MA 이탈**(`[SWING-SELL] 10MA 트레일링 이탈`). **V8 샹들리에는 쓰지 않습니다.**
 - **`TREND_V8`** 만 **V8 매도 루프**의 **분할 익절(Scale-Out)** → 타임스탑 → 하드스탑 → 샹들리에 순을 탑니다.
   - **1차:** ``entry_atr×3.0`` 도달 시 50% → ``scale_out_done`` (ATR 없을 때만 +30% fallback) — **이후 Free Ride 본절 락** 활성화
   - **2차:** 1차 완료 후 ``entry_atr×6.0`` 도달 시 **잔량의 50%** → ``second_scale_out_done`` (멱등 lane ``scale_out_2``)
@@ -654,16 +655,16 @@ if cash < target_budget:
 
 | 구분 | 방향 | 동작 | 장부·화면 |
 |------|------|------|-----------|
-| **매도선(스윙)** | 가격이 **아래로** 이 선 이하 | 하드+본절락; **러너**는 **+5MA** 포함 표시 → 이탈 시 전량 | `sl_p`, GUI 손절가 열, 생존신고 `매도선` |
+| **매도선(스윙)** | 가격이 **아래로** 이 선 이하 | 하드+본절락; **러너**는 **+10MA** 포함 표시 → 이탈 시 전량 | `sl_p`, GUI 손절가 열, 생존신고 `매도선` |
 | **1차 익절(1.5R)** | 수익이 **1.5R** 이상 | `HALF` → **약 50%만** 익절, 잔량은 **러너** 후보 | 로그 `1.5R 1차 익절` (매도선과 별개) |
-| **러너 5MA** | 1차 익절 완료 또는 max_p≥1.5R | 현재가 **&lt; 5MA** → FULL `[SWING-SELL] 5MA 트레일링 이탈` | `check_swing_exit` · 트레일링 경로 연동 |
-| **오버슈팅 캔들** | 러너 **且** max_p 최고수익 **≥10%** | 매도선 **max(하드,락,5MA,전일저가)** 이탈 → `[SWING-SELL] 오버슈팅 캔들 트레일링 이탈` | `get_swing_runner_trail_floor` |
+| **러너 10MA** | 1차 익절 완료 또는 max_p≥1.5R | 현재가 **&lt; 10MA** → FULL `[SWING-SELL] 10MA 트레일링 이탈` | `check_swing_exit` · 트레일링 경로 연동 |
+| **오버슈팅 캔들** | 러너 **且** max_p 최고수익 **≥10%** | 매도선 **max(하드,락,10MA,전일저가)** 이탈 → `[SWING-SELL] 오버슈팅 캔들 트레일링 이탈` | `get_swing_runner_trail_floor` |
 
 **1R 정의:** 매수 체결 직후 `register_swing_entry_risk_fields` 가 장부에 기록 —  
 `entry_initial_risk_1r` = 평단 − `entry_initial_hard_floor`(진입 시점 피보·구름 기술 바닥, **시간가중 전**).  
 HALF 목표가 = `평단 + SWING_SCALE_OUT_R_MULT × 1R` (기본 **1.5R**).
 
-**기존 보유 종목:** 매도 루프마다 `get_swing_exit_display_price`·`get_swing_hard_stop_floor`(영업시간 `trading_hours_held` 반영)로 재계산하고 `sl_p`·`max_p` 를 갱신합니다. `entry_fib_level` 이 비어 있으면 `reconcile_swing_position` 이 60봉·평단으로 피보를 백필합니다. **1.5R HALF** 체결·멱등 정합(`swing_half` lane) 시 장부 **`scale_out_done=True`** 로 러너(5MA) 전환. GUI·텔레 매도선은 **`get_cached_ohlcv` 일봉**으로 동일 재계산합니다.
+**기존 보유 종목:** 매도 루프마다 `get_swing_exit_display_price`·`get_swing_hard_stop_floor`(영업시간 `trading_hours_held` 반영)로 재계산하고 `sl_p`·`max_p` 를 갱신합니다. `entry_fib_level` 이 비어 있으면 `reconcile_swing_position` 이 60봉·평단으로 피보를 백필합니다. **1.5R HALF** 체결·멱등 정합(`swing_half` lane) 시 장부 **`scale_out_done=True`** 로 러너(10MA) 전환. GUI·텔레 매도선은 **`get_cached_ohlcv` 일봉**으로 동일 재계산합니다.
 
 #### 스윙 매도선 표시·실행 (`get_swing_exit_display_price`)
 
@@ -671,10 +672,10 @@ HALF 목표가 = `평단 + SWING_SCALE_OUT_R_MULT × 1R` (기본 **1.5R**).
 |------|-------------|----------------|
 | 손실·저수익 | `max(피보·구름+시간가중)` | 하드 FULL → **`check_swing_exit`** |
 | max_p 최고수익 **> ATR 동적 임계** (비러너) | 위 + 평단×1.01 본절 락 | 본절 락 이탈 → **`check_swing_profit_lock_trailing_exit`** |
-| **러너** (1차 익절 완료 또는 max_p≥1.5R) | `max(하드, 본절락, **5MA**)` | 5MA 이탈 FULL → **`check_swing_exit`** · 동일 조건 **`check_swing_profit_lock_trailing_exit`** (`[SWING-SELL] 5MA 트레일링 이탈`) |
+| **러너** (1차 익절 완료 또는 max_p≥1.5R) | `max(하드, 본절락, **10MA**)` | 10MA 이탈 FULL → **`check_swing_exit`** · 동일 조건 **`check_swing_profit_lock_trailing_exit`** (`[SWING-SELL] 10MA 트레일링 이탈`) |
 | 수익 **≥1.5R**·HALF 미실행 | 로그 `1차익절(1.5R): …` | HALF → **`check_swing_exit`** (50%만) |
 
-**러너 판정:** `scale_out_done == true` **또는** `max_p − 평단 ≥ 1.5 × entry_initial_risk_1r`. 러너에서는 본절 락만으로 청산하지 않고 **5MA 하향 이탈**을 트레일링 기준으로 씁니다.
+**러너 판정:** `scale_out_done == true` **또는** `max_p − 평단 ≥ 1.5 × entry_initial_risk_1r`. 러너에서는 본절 락만으로 청산하지 않고 **10MA 하향 이탈**을 트레일링 기준으로 씁니다.
 
 GUI·텔레그램 **`sl_p`** = 위 **합성 표시선**(매 사이클 갱신). 실행은 행의 **담당 함수**대로 분리됩니다.
 
@@ -708,14 +709,14 @@ GUI·텔레그램 **`sl_p`** = 위 **합성 표시선**(매 사이클 갱신). �
 |----------|------|------|------|
 | 1 | **FULL** 하드스탑 | 현재가 < `get_swing_hard_stop_floor` (피보·구름 + **시간가중**) | 평단 위 후보만 ×0.97 보정 |
 | 2 | **HALF** 1차 익절 | `(현재가 − 평단) ≥ 1.5 × entry_initial_risk_1r` | 50% 분할, `scale_out_done` 후 **러너** 후보 |
-| 3 | **FULL** 러너 5MA | **러너**(`scale_out_done` 또는 max_p≥1.5R) **且** 현재가 < **5일 종가 SMA** | `5MA 트레일링 이탈` / `[SWING-SELL] 5MA 트레일링 이탈` |
-| 4 | **FULL** RSI | 데드크로스 **且** 수익 **+1% ~ +10% 미만** | +10%↑는 RSI 무시·락·5MA만 |
+| 3 | **FULL** 러너 10MA | **러너**(`scale_out_done` 또는 max_p≥1.5R) **且** 현재가 < **10일 종가 SMA** | `10MA 트레일링 이탈` / `[SWING-SELL] 10MA 트레일링 이탈` |
+| 4 | **FULL** RSI | 데드크로스 **且** 수익 **+1% ~ +10% 미만** | +10%↑는 RSI 무시·락·10MA만 |
 | — | **HOLD** | 위 미해당 | 아래 트레일링·타임스탑 |
 
 - HALF 시 로그·`trade_history` 예: `1.5R 1차 익절 (현재 1.62R≥1.5R, …)` — **50% 분할 매도**이므로 매도선과 별개입니다.
 - **폐기:** 볼밴 상단·고정 +5% HALF (`SWING_BB_HALF_*`, `SWING_HALF_FIXED_*`, `get_swing_half_target_price`).
 - FULL(피보·구름·RSI)과 HALF·RSI는 **매 사이클 OHLCV·실시간가로 재판정**합니다.
-- `HOLD` 이후 수익 구간: **러너**는 `check_swing_profit_lock_trailing_exit` 에서 **5MA 이탈** 전량, **비러너**는 최고수익이 **ATR 동적 임계** 초과 후 본절 락(평단×1.01) 이탈 전량 (`run_bot._check_swing_trailing_exit` 래퍼). 하드·5MA FULL은 위 표와 `check_swing_exit` 전담.
+- `HOLD` 이후 수익 구간: **러너**는 `check_swing_profit_lock_trailing_exit` 에서 **10MA 이탈** 전량, **비러너**는 최고수익이 **ATR 동적 임계** 초과 후 본절 락(평단×1.01) 이탈 전량 (`run_bot._check_swing_trailing_exit` 래퍼). 하드·10MA FULL은 위 표와 `check_swing_exit` 전담.
 
 #### 스윙 전략 — 설계 정합성·알려진 주의점
 
@@ -766,6 +767,7 @@ GUI·텔레그램 **`sl_p`** = 위 **합성 표시선**(매 사이클 갱신). �
 기술 매도선  = max(20MA − ATR×1, 현재가 − ATR×2)   (일봉 OHLCV)
 본절 락      = scale_out_done == true → 평단×1.01, 미완료 → 0  (max_p % 무관)
 최종 매도선  = max(샹들리에, 기술 매도선, 본절 락, 장부 sl_p 폴백)
+절대 하한    = 평단 × ABSOLUTE_STOP_MAX_LOSS_MULT (0.96, -4%). 위 값이 더 깊으면 끌어올림
 ```
 
 1. **샹들리에 바닥:** `max_p`는 장부 최고가·현재가 중 큰 값.
@@ -786,6 +788,7 @@ GUI·텔레그램 **`sl_p`** = 위 **합성 표시선**(매 사이클 갱신). �
 기술 바닥 = max( entry_fib_level, 일목 구름 하단 )
 시간가중  = 영업 24h 경과 후, 영업 24h마다 (평단 − 기술 바닥) gap의 40% 상향 (최대 평단 근처, `SWING_TIME_DECAY_GAP_CLOSE_PER_24H`)
 하드 바닥 = 시간가중(기술 바닥) → 평단 **이상**이면 평단 × 0.97 (-3%)
+절대 하한 = 평단 × 0.96 (ABSOLUTE_STOP_MAX_LOSS_MULT, -4%) — 기술 바닥이 더 깊으면 끌어올림
 ```
 
 - **`entry_fib_level`:** 진입 시 60봉 고저의 38.2/50/61.8% 중 **현재가 아래** 가장 가까운 피보. 비어 있으면 `infer_swing_entry_fib_from_ohlcv` 로 백필.
@@ -796,8 +799,9 @@ GUI·텔레그램 **`sl_p`** = 위 **합성 표시선**(매 사이클 갱신). �
 
 ```
 본절 락     = max_p 최고수익 > (entry_atr/평단×100×1.5), clip 2.5~12% → 평단×1.01
-러너 5MA    = 1차 익절·1.5R 이후 — 당일 5MA를 따라 올리되 swing_ma5_trail_high 고점 래칫(내려가지 않음)
-매도선(표시) = max( 하드, 본절 락, 러너 5MA 고점 ) → swing_exit_high_water 로 통합선도 래칫 · sl_p 동일
+러너 10MA    = 1차 익절·1.5R 이후 — 당일 10MA를 따라 올리되 swing_ma10_trail_high 고점 래칫(내려가지 않음, 레거시 swing_ma5_trail_high 는 읽기만)
+매도선(표시) = max( 하드, 본절 락, 러너 10MA 고점 ) → swing_exit_high_water 로 통합선도 래칫 · sl_p 동일
+절대 하한    = 평단 × 0.96 (ABSOLUTE_STOP_MAX_LOSS_MULT). 하드·V8 매도선이 이보다 낮으면 이 값으로 끌어올림
 ```
 
 **스윙 실행 분리 (표시선 ≠ 한 번에 전량)**
@@ -805,11 +809,11 @@ GUI·텔레그램 **`sl_p`** = 위 **합성 표시선**(매 사이클 갱신). �
 | 조건 | 함수 | 비고 |
 |------|------|------|
 | 현재가 < 하드 바닥 | `check_swing_exit` → **FULL** | 피보·구름 + 시간가중 |
-| 러너·현재가 < 5MA | `check_swing_exit` / `check_swing_profit_lock_trailing_exit` → **FULL** | 5MA 트레일링 |
+| 러너·현재가 < 10MA | `check_swing_exit` / `check_swing_profit_lock_trailing_exit` → **FULL** | 10MA 트레일링 |
 | 비러너·본절 락 이탈 | `check_swing_profit_lock_trailing_exit` | ATR 동적 임계 초과 후 |
 | 수익 ≥ **1.5R** | `check_swing_exit` → **HALF** | 매도선과 무관, 50%만 |
 
-**매도 루프 우선순위 (스윙):** `check_swing_exit`(HALF/FULL) → **V8 Scale-Out 없음** → 타임스탑 → 수익 락·5MA 트레일링.  
+**매도 루프 우선순위 (스윙):** `check_swing_exit`(HALF/FULL) → **V8 Scale-Out 없음** → 타임스탑 → 수익 락·10MA 트레일링.  
 **매도 루프 우선순위 (V8):** Scale-Out(`entry_atr×3`·`×6`) → 타임스탑 → **손실 시** `hard_stop` → **수익 시** 샹들리에(`decide_v8_exit`).
 
 #### Layer 2: `ticker_cooldowns` (매도 후 재매수 금지, 시간 단위)
@@ -842,6 +846,22 @@ GUI·텔레그램 **`sl_p`** = 위 **합성 표시선**(매 사이클 갱신). �
 
 - **`config.json`의 `twap_*`** 로 **나눠 치는 것**은 **매수 TWAP**(`order_executor`)와 **V8 Scale-Out 매도**(`scale_out` + `order_twap` slice)에만 붙습니다.
 - **타임스탑·하드스탑·샹들리에로 나가는 전량 청산**은 시장가 **한 번에 전량 주문**(실패 시 재시도)입니다. 금액이 커도 이 경로에서는 **TWAP 분할을 쓰지 않습니다.**
+
+#### 섀도우 규칙 (기본 `shadow` — 실주문 불변)
+
+키를 생략하면 **shadow** 입니다. `off`·`shadow` 에서는 기존 매수·매도와 같습니다. `live` 만 실제로 막거나 팝니다. 상세는 [`docs/SHADOW_RULES.md`](docs/SHADOW_RULES.md).
+
+| 키 | 값 | 기본 |
+|----|----|------|
+| `earnings_block_mode` | `off` \| `shadow` \| `live` | `shadow` |
+| `kr_crash_exit_mode` | `off` \| `shadow` \| `live` | `shadow` |
+
+- **미장 실적 진입 (`earnings_block`)** — 미국 신규 매수만. 다음 실적 발표가 매수일 포함 **10거래일(day 0~9)** 안이면 차단 후보. 실적일을 못 구하면 **fail-open**(매수 진행, 로그만). 국장·코인에는 적용하지 않습니다. shadow 는 매수를 그대로 넣고 `[SHADOW-EARNINGS]` 에 티커·의도 가격/수량·실적일·거래일 수를 남깁니다.
+- **국장 지수 급락 청산 (`kr_crash_exit`)** — KST **15:15~15:20** (15:20 미포함). 15분 스케줄의 **15:15 회차**만 이 창에 들어오고, 판정 시각은 **그 사이클이 시작된 시각**입니다(국장 루프가 몇 분 늦어도 같은 회차로 한 번). 날짜당 **한 번**(`bot_state.json` 의 `shadow_rules.kr_crash_evaluated_dates`). KODEX200(069500, 매수 급락 필터와 같은 전일대비) **또는** 보유 종목의 상장시장 지수(KOSPI 종목은 KOSPI, KOSDAQ 종목은 KOSDAQ)가 **전일 종가 대비 -3% 이하**(`INDEX_CRASH_KR`)면 그 국장 보유를 **익절·손절 구분 없이 전량** 시장가 매도 후보로 봅니다. shadow 는 팔지 않고 `[SHADOW-KRCRASH]` 에 티커·수량·현재가·평단·미실현%·발동 지수와 등락률을 남깁니다. live 는 기존 KIS 시장가 매도(`kr_crash` lane)를 탑니다.
+- **로그 파일:** `shadow_events.jsonl` — `trade_history.json` 과 같은 폴더. 한 줄에 JSON 하나(append-only). 필드: `timestamp`(KST ISO), `rule`, `mode`, `market`, `ticker`, `details`.
+- **복기:** `python tools/analyze_shadow.py` (선택 `--csv 경로`). 규칙별 건수와, 실적은 막혔을 매매의 실제 `profit_rate`, 국장 급락은 섀도우 시각 가격 대비 이후 실제 청산가를 출력합니다.
+
+설정 변경 후 **봇/GUI 재시작**이 필요합니다.
 
 ---
 
@@ -1028,6 +1048,7 @@ VIX·Crypto Fear&Greed **예산 배수**(`block`/`reduce`)와 원/달러 **절�
 ### 필터
 
 - `ai_false_breakout_*`, `macro_guard_enabled`, `macro_*`, `alpha_target_vol`, `portfolio_heat_max_pct`
+- `earnings_block_mode`, `kr_crash_exit_mode` — `off` \| `shadow` \| `live`. **기본 `shadow`**(로그만, 실주문 불변). 로그 `shadow_events.jsonl`, 복기 `python tools/analyze_shadow.py`. 위 [섀도우 규칙](#섀도우-규칙-기본-shadow--실주문-불변) · [`docs/SHADOW_RULES.md`](docs/SHADOW_RULES.md).
 
 ---
 
@@ -1177,6 +1198,9 @@ BOT_KIS_RATE_LIMIT_COOLDOWN_SEC=8
 
   "macro_guard_enabled": true,
 
+  "earnings_block_mode": "shadow",
+  "kr_crash_exit_mode": "shadow",
+
   "alpha_target_vol": 0.02,
   "portfolio_heat_max_pct": 0.08,
   "macro_us_put_call_block_threshold": 1.3,
@@ -1200,6 +1224,7 @@ BOT_KIS_RATE_LIMIT_COOLDOWN_SEC=8
 - **`macro_*`:** Phase 4 **시장별 글로벌 알파 신규 매수 차단**(Phase 4 절). `budget_multiplier`는 항상 1.0. 글로벌 `-> 🚨` 는 **매수 창 안**에서만(국·미·코인 동일). `macro_guard_enabled=false` 시 비활성. 스냅샷 필드: `market_buy_allowed`, `market_buy_block_reason`, `us_put_call_ratio`, `coin_whale_long_short_ratio`, `usd_krw_z_score`, `usd_krw_is_rising`, `usd_krw_spot`.
 - **`alpha_target_vol`:** 변동성 타겟 비중의 목표 일일 변동성(소수, 기본 0.02). `ratio = min(1/N, alpha_target_vol / ATR%)`.
 - **`portfolio_heat_max_pct`:** 시장별 `Σ(비중×ATR%)` 상한(소수, 기본 0.08). 초과 시 그 시장 신규 매수 차단(V8·스윙 공통).
+- **`earnings_block_mode` / `kr_crash_exit_mode`:** `off`(규칙 없음) · `shadow`(기본, 로그만) · `live`(미장 실적 10거래일 진입 차단 / 국장 마감 창 지수 -3% 전량 매도). 이벤트는 `shadow_events.jsonl`. `python tools/analyze_shadow.py`.
 - **`macro_us_put_call_block_threshold`:** US Phase4 PCR 차단 임계(기본 **1.3**). 극단적 공포 구간 V자 반등 매수 여지 확보용.
 
 ---

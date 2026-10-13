@@ -296,7 +296,7 @@ tests/test_phase5_share_circuit.py
 | **하드컷** | 수익률 **≤ -3%** | 2h·유예 **무시**, 즉시 FULL |
 | **2h 이후** | — | 기술바닥 FULL **100% 적용** (기존과 동일) |
 
-**유예 대상 아님:** 1.5R HALF, 5MA·RSI FULL, 타임스탑, V8 경로.
+**유예 대상 아님:** 1.5R HALF, 10MA·RSI FULL, 타임스탑, V8 경로.
 
 `config.json` (선택):
 
