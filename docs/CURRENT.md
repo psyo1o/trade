@@ -7,6 +7,7 @@
 - 섀도우 규칙 기본 `shadow`: 미장 실적 10거래일 진입 후보·국장 15:15 지수 -3% 전량 청산 후보를 **로그만** (`shadow_events.jsonl`). live 로 바꾸기 전에는 주문이 바뀌지 않음.
 - 복기: `python tools/analyze_shadow.py`. 설명은 `docs/SHADOW_RULES.md`.
 - 일봉 캐시 TTL 4h. 고점 보정은 시장 통화 입력.
+- 단위 테스트를 현행 동작에 맞춤(KR 예수=총평−보유, OHLCV 날짜를 오늘 기준, Phase5 지수 재검증 플래그, 본절 락 동적 임계). 운영 코드는 그대로.
 
 ## 다음
 
@@ -21,6 +22,7 @@
 
 ## CHANGELOG
 
+- [2026-10-13 오래된 단위 테스트](CHANGELOG.md)
 - [2026-10-13 섀도우 규칙](CHANGELOG.md)
 - [2026-10-09 고점 보정 시장 통화](CHANGELOG.md)
 - [2026-10-08 일봉 캐시 TTL](CHANGELOG.md)

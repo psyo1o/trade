@@ -68,11 +68,18 @@ def test_reconfirm_rechecks_index():
     class _Rb:
         STATE_PATH = Path("dummy")
         ACCOUNT_CIRCUIT_MDD_PCT = 15.0
+        ACCOUNT_CIRCUIT_USE_INDEX = True
 
     triggered_first = {"triggered": True, "drawdown_pct": 20.0, "benchmark": "SPY"}
     triggered_second = {"triggered": False, "drawdown_pct": 10.0, "benchmark": "SPY"}
 
+    def _forbid_equity_reconfirm(*_args, **_kwargs):
+        raise AssertionError("지수 재검증 경로는 KIS 잔고 재조회를 호출하면 안 된다")
+
     with patch(
+        "execution.phase5_ops._reconfirm_equity_triggers",
+        side_effect=_forbid_equity_reconfirm,
+    ), patch(
         "execution.phase5_index_circuit.evaluate_index_circuit_for_market",
         side_effect=[triggered_first, triggered_second],
     ):
@@ -86,6 +93,9 @@ def test_reconfirm_rechecks_index():
     assert confirmed == ["US"]
 
     with patch(
+        "execution.phase5_ops._reconfirm_equity_triggers",
+        side_effect=_forbid_equity_reconfirm,
+    ), patch(
         "execution.phase5_index_circuit.evaluate_index_circuit_for_market",
         return_value=triggered_second,
     ):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from datetime import date, timedelta
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -110,18 +111,28 @@ class TestSelectValidatedEquityOhlcv(unittest.TestCase):
 
 class TestKrOhlcvFinalize(unittest.TestCase):
     def test_finalize_sorts_kis_style_rows(self):
+        """비정렬 KIS 일봉을 날짜순으로 맞춘다. 마지막 봉은 오늘이라 14일 신선도 검사에 걸리지 않는다."""
+        today = date.today()
+        early = [
+            ((today - timedelta(days=14 - i)).strftime("%Y%m%d"), 60000.0 + i)
+            for i in range(12)
+        ]
+        d_prev = (today - timedelta(days=2)).strftime("%Y%m%d")
+        d_mid = (today - timedelta(days=1)).strftime("%Y%m%d")
+        d_last = today.strftime("%Y%m%d")
         raw = _bars_with_dates(
-            [(f"202605{(i % 28) + 1:02d}", 60000.0 + i) for i in range(12)]
+            early
             + [
-                ("20260604", 70000.0),
-                ("20260602", 68000.0),
-                ("20260603", 69000.0),
+                (d_last, 70000.0),
+                (d_prev, 68000.0),
+                (d_mid, 69000.0),
             ]
         )
         out = finalize_ohlcv_daily(raw, ticker="005930", source="test")
         self.assertEqual(len(out), 15)
-        self.assertEqual(out[-3]["d"], "20260602")
-        self.assertEqual(out[-1]["d"], "20260604")
+        self.assertEqual(out[-3]["d"], d_prev)
+        self.assertEqual(out[-2]["d"], d_mid)
+        self.assertEqual(out[-1]["d"], d_last)
         self.assertEqual(out[-1]["c"], 70000.0)
 
     def test_kr_select_pykrx_when_kis_stale(self):

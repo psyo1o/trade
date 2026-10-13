@@ -59,8 +59,8 @@ def test_display_cash_reads_snapshot_when_valid():
     assert display_cash_from_state(state, "KR") == 817_417.0
 
 
-def test_kr_prefers_last_kr_cash_when_snapshot_is_stale_total_blob():
-    """장중 persist(81만) + 옛 스냅(예수=총평 158만) — 미장 시간대에도 81만 표시."""
+def test_kr_corrects_cash_to_total_minus_holdings_when_snapshot_cash_equals_total():
+    """스냅 예수≈총평(1,579,644)이고 보유가 있으면 예수 = 총평 − 보유(817,644)."""
     state = {
         "last_kr_cash_krw": 817_417.0,
         "last_kis_display_snapshot": {
@@ -68,16 +68,19 @@ def test_kr_prefers_last_kr_cash_when_snapshot_is_stale_total_blob():
         },
     }
     snap = {"cash": 1_579_644.0, "total": 1_579_644.0}
+    holdings = 762_000.0
     cash, total = coalesce_ledger_kis_labels(
         "KR",
         state,
         snap,
-        holdings_current=762_000.0,
+        holdings_current=holdings,
         cash_guess=817_417.0,
         total_guess=1_579_417.0,
     )
-    assert cash == 817_417.0
-    assert total == int(round(817_417.0 + 762_000.0))
+    assert cash == 817_644.0
+    assert total == 1_579_644.0
+    assert cash == int(round(1_579_644.0 - holdings))
+    assert total == int(round(cash + holdings))
 
 
 def test_write_snapshot_skips_us_downgrade_after_force_refresh():
