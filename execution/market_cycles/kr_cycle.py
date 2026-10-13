@@ -17,6 +17,139 @@ def _rb():
     return rb
 
 
+def _kr_crash_holdings(rb, kr_output1, held_kr, state) -> list:
+    from strategy.shadow_rules import KrHolding, infer_listing_market
+
+    rows = []
+    for stock in kr_output1 or []:
+        if not isinstance(stock, dict):
+            continue
+        t = rb.normalize_ticker(stock.get("pdno", ""))
+        if not t or t not in held_kr:
+            continue
+        qty = int(rb._to_float(stock.get("hldg_qty", stock.get("t01", stock.get("q", 0)))))
+        if qty <= 0:
+            continue
+        pos = (state.get("positions") or {}).get(t, {})
+        if not isinstance(pos, dict):
+            pos = {}
+        from api.kis_parsers import parse_kr_live_price
+
+        curr = float(parse_kr_live_price(stock, rb._to_float) or 0.0)
+        if curr <= 0:
+            curr = float(pos.get("buy_p") or 0.0)
+        if curr > 0:
+            curr = float(rb._resolve_curr_price_with_gui_override(pos, curr))
+        avg = float(pos.get("buy_p") or 0.0)
+        if avg <= 0:
+            avg = float(
+                rb._to_float(stock.get("pchs_avg_prc", stock.get("pchs_avg_pric", 0)), 0.0) or 0.0
+            )
+        rows.append(
+            KrHolding(
+                ticker=t,
+                qty=qty,
+                price=curr,
+                avg_price=avg,
+                listing_market=infer_listing_market(stock, pos),
+            )
+        )
+    return rows
+
+
+def _apply_kr_crash_exit(rb, ctx: TradingCycleContext, state, kr_output1, held_kr) -> set[str]:
+    """국장 급락 청산. shadow/off 는 주문 없음. live 체결 티커 집합을 반환."""
+    from strategy.shadow_rules import apply_kr_crash_exit, fetch_kr_listing_market
+
+    mode = str(getattr(rb, "KR_CRASH_EXIT_MODE", "shadow"))
+    if mode == "off":
+        return set()
+    now = getattr(ctx, "cycle_started_kst", None) or datetime.now(pytz.timezone("Asia/Seoul"))
+    holdings = _kr_crash_holdings(rb, kr_output1, held_kr, state)
+    sold: set[str] = set()
+
+    def _place(action) -> bool:
+        t = str(action.ticker)
+        qty = int(action.qty)
+        curr_p = float(action.price)
+        buy_p = float(action.avg_price)
+        trig = ", ".join(
+            f"{item.get('index')} {float(item.get('change_pct')):+.2f}%"
+            for item in (action.triggers or [])
+        )
+        reason = f"[KRCRASH-EXIT] {trig}"
+        pos = (state.get("positions") or {}).get(t, {})
+        strategy_type = rb._resolve_sell_loop_strategy_type(pos) if isinstance(pos, dict) else "TREND_V8"
+
+        def _order():
+            return rb.create_market_sell_order_kis(t, qty, is_us=False, curr_price=curr_p)
+
+        fill = rb._idempotent_kis_sell(
+            state,
+            market="KR",
+            ticker=t,
+            lane=rb.order_idem.LANE_KR_CRASH,
+            qty=qty,
+            fallback_price=curr_p,
+            place_order=_order,
+            cycle_tag=ctx.buy_cycle_tag,
+        )
+        if not fill.ok:
+            print(f"  ❌ [LIVE-KRCRASH] {t} 매도 실패: {fill.note or '응답 없음'}")
+            return False
+        profit_rate = ((curr_p - buy_p) / buy_p) * 100 if buy_p > 0 else 0.0
+        stats = state.setdefault("stats", {"wins": 0, "losses": 0, "total_profit": 0.0})
+        if profit_rate > 0:
+            stats["wins"] = int(stats.get("wins", 0) or 0) + 1
+        else:
+            stats["losses"] = int(stats.get("losses", 0) or 0) + 1
+        stats["total_profit"] = float(stats.get("total_profit", 0.0) or 0.0) + float(profit_rate)
+        kr_name = rb.get_kr_company_name(t)
+        rb._record_trade_event(
+            "KR", t, "SELL", qty, price=curr_p, profit_rate=profit_rate, reason=reason, name=kr_name
+        )
+        print(f"  ✅ [국장 급락 매도] {kr_name}({t}) | 수익률: {profit_rate:+.2f}% | {reason}")
+        rb.send_telegram(
+            f"🚨 [국장 급락 청산] {t}({kr_name})\n사유: {reason}\n최종 수익률: {profit_rate:+.2f}%"
+        )
+
+        def _mut(st: dict) -> None:
+            rb.set_cooldown(st, t)
+            rb.set_ticker_cooldown_after_sell(
+                st,
+                t,
+                reason,
+                profit_rate=float(profit_rate),
+                strategy_type=strategy_type,
+                market="KR",
+                remaining_qty=0.0,
+            )
+
+        rb.ledger_apply.persist_position_remove(
+            state, t, context="KR CRASH EXIT", state_path=rb.STATE_PATH, mutate_fn=_mut
+        )
+        sold.add(t)
+        return True
+
+    result = apply_kr_crash_exit(
+        mode=mode,
+        now=now,
+        state=state,
+        holdings=holdings,
+        resolve_listing=fetch_kr_listing_market,
+        place_sell=_place if mode == "live" else None,
+        threshold=float(getattr(rb, "INDEX_CRASH_KR", -3.0)),
+    )
+    if result.marked:
+        try:
+            rb.save_state(rb.STATE_PATH, state)
+        except Exception as exc:
+            print(f"  ⚠️ [KRCRASH] 평가 일자 저장 실패: {exc}")
+    if mode != "live":
+        return set()
+    return {a.ticker for a in result.actions if a.sold} | sold
+
+
 def run_kr_cycle(ctx: TradingCycleContext) -> None:
     rb = _rb()
     state = ctx.state
@@ -36,9 +169,13 @@ def run_kr_cycle(ctx: TradingCycleContext) -> None:
         # 매도는 MDD와 무관하게 항상 실행 (손실 방어)
         positions_count = rb._count_positions_in_state(held_kr, state.get("positions", {}))
         rb._prefetch_kr_sell_ohlcv_if_needed(kr_output1, held_kr, positions_count)
+        kr_crash_sold = _apply_kr_crash_exit(rb, ctx, state, kr_output1, held_kr)
+        kr_sell_fills += len(kr_crash_sold)
         for stock in kr_output1:
             t = rb.normalize_ticker(stock.get('pdno', ''))
             if not t:
+                continue
+            if t in kr_crash_sold:
                 continue
             qty = int(rb._to_float(stock.get('hldg_qty', stock.get('t01', stock.get('q', 0)))))
             if qty <= 0 or t not in held_kr:

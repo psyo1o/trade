@@ -208,25 +208,39 @@ def run_us_buy_cycle(
 
             us_box = [float(us_cash)]
             entry_atr = float(rb.get_safe_atr(t, ohlcv) or 0.0)
-            ok_us_buy = rb._execute_us_market_buy_twap(
-                t,
-                us_name,
-                float(target_budget),
-                curr_p,
-                sl_p,
-                entry_atr,
-                t_name,
-                s_name,
-                state,
-                us_box,
-                strategy_type=strategy_type,
-                entry_fib_level=entry_fib_level,
+
+            def _place_us_buy():
+                return rb._execute_us_market_buy_twap(
+                    t,
+                    us_name,
+                    float(target_budget),
+                    curr_p,
+                    sl_p,
+                    entry_atr,
+                    t_name,
+                    s_name,
+                    state,
+                    us_box,
+                    strategy_type=strategy_type,
+                    entry_fib_level=entry_fib_level,
+                )
+
+            from strategy.shadow_rules import execute_us_entry_respecting_earnings
+
+            ok_us_buy = execute_us_entry_respecting_earnings(
+                mode=str(getattr(rb, "EARNINGS_BLOCK_MODE", "shadow")),
+                market="US",
+                ticker=t,
+                price=float(curr_p),
+                qty=int(qty),
+                place_order=_place_us_buy,
             )
             if not ok_us_buy:
-                print(
-                    f"  ⏭️ {us_name}({t}): [US 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
-                    f"배정 ${target_budget:.2f}, 종가 ${curr_p:.2f} (TWAP·KIS·예수 확인)"
-                )
+                if not getattr(ok_us_buy, "blocked", False):
+                    print(
+                        f"  ⏭️ {us_name}({t}): [US 매수 미체결] 시그널·필터 통과 후 주문 없음 — "
+                        f"배정 ${target_budget:.2f}, 종가 ${curr_p:.2f} (TWAP·KIS·예수 확인)"
+                    )
             else:
                 ctx.buy_fills += 1
                 rb._register_swing_risk_after_buy(state, t, ohlcv, "US")
