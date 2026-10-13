@@ -27,6 +27,13 @@ def benchmark_label(market: str) -> str:
     return {"KR": "KODEX200", "US": "SPY", "COIN": "BTC"}.get(mk, benchmark_ticker(mk))
 
 
+# 국장 상장시장 지수 — 매수측 KODEX200(069500.KS)과 같은 전일대비 공식
+KR_LISTING_INDEX_YF: dict[str, str] = {
+    "KOSPI": "^KS11",
+    "KOSDAQ": "^KQ11",
+}
+
+
 def _period_to_bars(period: str) -> int:
     p = str(period or "6mo").lower()
     if p in ("6mo", "6m"):
@@ -78,6 +85,32 @@ def fetch_benchmark_closes(market: str, *, period: str = "6mo") -> pd.Series | N
     return _fetch_yf_closes(sym, period=period)
 
 
+def pair_change_pct(prev_close: float, curr_close: float) -> float | None:
+    """전일 종가 대비 등락률(%). 전일 종가가 없으면 None."""
+    try:
+        prev = float(prev_close)
+        curr = float(curr_close)
+    except (TypeError, ValueError):
+        return None
+    if prev <= 0:
+        return None
+    return ((curr - prev) / prev) * 100.0
+
+
+def symbol_daily_change_pct(symbol: str) -> float | None:
+    """야후 일봉 마지막 두 종가의 등락률(%). 조회 실패 시 None.
+
+    매수 급락 필터(``daily_change_pct``)와 국장 급락 청산이 같은 공식을 쓴다.
+    """
+    try:
+        closes = _fetch_yf_closes(symbol, period="5d")
+        if closes is None or len(closes) < 2:
+            return None
+        return pair_change_pct(float(closes.iloc[-2]), float(closes.iloc[-1]))
+    except Exception:
+        return None
+
+
 def daily_change_pct(market: str) -> float:
     mk = normalize_market(market)
     try:
@@ -86,17 +119,11 @@ def daily_change_pct(market: str) -> float:
             ticker = benchmark_ticker("COIN")
             oc = coin_broker.fetch_ohlcv(ticker, "day", 3)
             if oc and len(oc) >= 2:
-                prev_close = float(oc[-2]["c"])
-                curr_close = float(oc[-1]["c"])
-                if prev_close > 0:
-                    return ((curr_close - prev_close) / prev_close) * 100.0
+                ch = pair_change_pct(float(oc[-2]["c"]), float(oc[-1]["c"]))
+                return float(ch) if ch is not None else 0.0
             return 0.0
-        closes = _fetch_yf_closes(benchmark_ticker(mk), period="5d")
-        if closes is not None and len(closes) >= 2:
-            prev_close = float(closes.iloc[-2])
-            curr_close = float(closes.iloc[-1])
-            if prev_close > 0:
-                return ((curr_close - prev_close) / prev_close) * 100.0
+        ch = symbol_daily_change_pct(benchmark_ticker(mk))
+        return float(ch) if ch is not None else 0.0
     except Exception:
         return 0.0
     return 0.0

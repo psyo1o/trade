@@ -34,6 +34,7 @@ LANE_SCALE_OUT_2 = "scale_out_2"
 LANE_EXIT = "exit"
 LANE_MANUAL = "manual"
 LANE_PHASE5 = "phase5"
+LANE_KR_CRASH = "kr_crash"
 
 
 @dataclass(frozen=True)
@@ -1301,7 +1302,7 @@ def reconcile_positions_for_cycle(
         if sold <= 0:
             continue
         pos = positions.get(tk)
-        if lane in (LANE_EXIT, LANE_SWING_FULL):
+        if lane in (LANE_EXIT, LANE_SWING_FULL, LANE_KR_CRASH):
             if tk not in positions:
                 continue
             ctx = f"정합 FULL/EXIT {mkt}:{tk}"
@@ -1379,7 +1380,7 @@ def reconcile_ticker_lane(
     positions = state.get("positions")
     if not isinstance(positions, dict):
         return False
-    if ln in (LANE_EXIT, LANE_SWING_FULL):
+    if ln in (LANE_EXIT, LANE_SWING_FULL, LANE_KR_CRASH):
         if t not in positions:
             return False
         ctx = f"정합 {ln} {m}:{t}"

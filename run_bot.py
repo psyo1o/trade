@@ -19,6 +19,7 @@ run_bot — V5.0 통합 자동매매 엔진 (국장 / 미장 / 코인)
     * ``bot_state.json`` — positions, cooldown, stats, Phase5 ``peak_total_equity``·``last_reset_week``·
       ``account_circuit_peak_reset_pending``·서킷 쿨다운 등(월요일 주차 MDD).
     * ``trade_history.json`` — 체결/이벤트 기록(락 사용).
+    * ``shadow_events.jsonl`` — 실적 차단·국장 급락 섀도우 이벤트(append-only).
 
 주요 의존
     * ``api.kis_api`` / ``api.upbit_api`` — 브로커·주문.
@@ -168,6 +169,7 @@ from strategy.sector_lock import allow_kr_sector_entry, allow_us_sector_entry, s
 from strategy.macro_guard import (
     get_macro_guard_snapshot,
 )
+from strategy.shadow_rules import configure_shadow_events_path, normalize_mode
 from strategy.alpha_sizing import (
     atr_pct_from_ohlcv,
     compute_market_portfolio_heat,
@@ -305,6 +307,7 @@ def get_top_market_cap_tickers(limit=150, *, force_refresh: bool = False):
 BASE_DIR = Path(__file__).resolve().parent
 STATE_PATH = BASE_DIR / "bot_state.json"
 TRADE_HISTORY_PATH = BASE_DIR / "trade_history.json"
+SHADOW_EVENTS_PATH = BASE_DIR / "shadow_events.jsonl"
 KIS_TOKEN_PATH = BASE_DIR / "kis_token.json"
 TRADE_HISTORY_LOCK = threading.Lock()
 
@@ -340,6 +343,7 @@ from utils.helpers import (
 from utils.trade_sector import resolve_trade_sector
 configure_kis_token_path(KIS_TOKEN_PATH)
 configure_trade_history(TRADE_HISTORY_PATH, TRADE_HISTORY_LOCK)
+configure_shadow_events_path(SHADOW_EVENTS_PATH)
 
 with open(BASE_DIR / "config.json", "r", encoding="utf-8") as f:
     config = json.load(f)
@@ -448,6 +452,24 @@ PORTFOLIO_HEAT_MAX_PCT = float(config.get("portfolio_heat_max_pct", 0.06))
 INDEX_CRASH_KR = -3.0     # 국장 KODEX200 급락 기준 (%)
 INDEX_CRASH_US = -1.8     # 미장 SPY 급락 기준 (%)
 INDEX_CRASH_COIN = -3.5   # 코인 BTC 급락 기준 (%)
+
+def _shadow_rule_mode(key: str) -> str:
+    raw = config.get(key, "shadow")
+    mode = normalize_mode(raw, default="shadow")
+    text = str(raw if raw is not None else "").strip().lower()
+    if text and text not in ("off", "shadow", "live"):
+        print(f"  ⚠️ [{key}] '{raw}' 은 off|shadow|live 가 아님 — {mode}")
+    return mode
+
+
+# 섀도우 규칙. 키 생략 시 shadow (로그만, 실주문 불변). live 만 차단·매도.
+EARNINGS_BLOCK_MODE = _shadow_rule_mode("earnings_block_mode")
+KR_CRASH_EXIT_MODE = _shadow_rule_mode("kr_crash_exit_mode")
+print(
+    f"[섀도우 규칙] earnings_block_mode={EARNINGS_BLOCK_MODE} "
+    f"kr_crash_exit_mode={KR_CRASH_EXIT_MODE} "
+    f"log={SHADOW_EVENTS_PATH.name}"
+)
 
 WEATHER_LABEL_BEAR = "🌧️ BEAR"
 
@@ -4706,7 +4728,7 @@ def _check_swing_trailing_exit(
 
 
 # 타임스탑 — KR/US는 **거래일 24h**(휴장일 pause), COIN은 24/7 연속시간
-#   V8: 336h(14거래일) + 유예 +4% | SWING: 72h(3일) + 유예 +2%
+#   V8: 72h(영업 3일) + 유예 +4% | SWING: 72h(3일) + 유예 +2%
 #   상수 단일 출처: strategy.rules (여기서 덮어쓰면 README·GUI와 어긋남)
 # (보유시각: buy_date 우선, 없으면 buy_time)
 # V8_TIME_STOP_* / SWING_TIME_STOP_* — strategy.rules import 재노출
@@ -4950,6 +4972,7 @@ def run_trading_bot():
     print("\n" + "="*55)
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🤖 V5.0 통합 자동매매 봇 가동...")
     print("="*55)
+    cycle_started_kst = datetime.now(pytz.timezone("Asia/Seoul"))
 
     state = _prepare_cycle_state()
     _sync_positions_for_cycle(state)
@@ -5013,6 +5036,7 @@ def run_trading_bot():
         macro_snap=macro_snap,
         buy_cycle_tag=_buy_cycle_tag,
         final_targets_kr=final_targets,
+        cycle_started_kst=cycle_started_kst,
     )
     run_kr_cycle(_cycle_ctx)
     run_us_cycle(_cycle_ctx)

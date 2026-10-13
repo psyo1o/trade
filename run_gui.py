@@ -98,6 +98,7 @@ from strategy.rules import (
     SWING_PROFIT_LOCK_ATR_MULT,
     SWING_PROFIT_LOCK_PCT_MAX,
     SWING_PROFIT_LOCK_PCT_MIN,
+    ABSOLUTE_STOP_MAX_LOSS_MULT,
     SWING_RUNNER_TRAIL_MA_DAYS,
     SWING_SCALE_OUT_R_MULT,
     SWING_TIME_DECAY_GAP_CLOSE_PER_24H,
@@ -301,7 +302,9 @@ def _build_strategy_guide_text() -> str:
         "- 120MA 위 (예외: 당일 거래량≥20일 최고 → 바닥권 턴어라운드 허용)\n"
         "- 장기추세: 50MA>200MA (또는 종가>50MA)\n"
         "- 3중 교차: 거래량>20일평균 · MACD>시그널 · RSI 50~75\n"
-        "- 초기 sl_p: max(20MA−ATR, 종가−2×ATR) — 평단 대비 고정% 캡 없음\n"
+        "- 초기 sl_p: max(20MA−ATR, 종가−2×ATR)\n"
+        f"- 청산 매도선·스윙 하드 바닥 하한: 평단×{ABSOLUTE_STOP_MAX_LOSS_MULT:.2f} (-4%). "
+        "기술선이 더 깊으면 이 값으로 끌어올림\n"
         "- 국장 추가: V8 루프 갭 +5% 컷 (스윙 갭 +3%와 별도)\n"
         "- 통과 로그: [V8-BUY] / 실패: [V8] … 패스 사유\n\n"
         "■ 4) V8 매도 — get_final_exit_price · check_pro_exit\n"
@@ -350,7 +353,17 @@ def _build_strategy_guide_text() -> str:
         "- 매도선·sl_p: 15분마다 재계산 (장부 탭·생존신고 동일)\n"
         "- 실시간 현황: 현재가·수량·전략(V8/스윙/헷지)\n"
         "- 장부: 최고가(max_p)·매도선·보유시간(영업시간)\n"
-        "- 수동 매도: 수량 입력+버튼 (전량/부분, 부분은 stats 별도 누적)\n"
+        "- 수동 매도: 수량 입력+버튼 (전량/부분, 부분은 stats 별도 누적)\n\n"
+        "■ 9) 섀도우 규칙 (config, 기본 shadow — 실주문 불변)\n"
+        "- earnings_block_mode: 미장 신규 매수. 실적이 매수일 포함 10거래일(day 0~9) 안이면\n"
+        "  shadow=매수 유지+[SHADOW-EARNINGS] 로그, live=매수 차단, off=규칙 없음.\n"
+        "  실적일 조회 실패는 fail-open(매수 진행). 국장·코인에는 적용하지 않음.\n"
+        "- kr_crash_exit_mode: KST 15:15~15:20 한 번(날짜당 멱등). KODEX200 또는\n"
+        "  상장시장 지수(KOSPI/KOSDAQ)가 전일 대비 -3% 이하면 그 국장 보유 전량 매도 후보.\n"
+        "  shadow=매도 안 함+[SHADOW-KRCRASH], live=시장가 전량, off=규칙 없음.\n"
+        "- 로그: shadow_events.jsonl (trade_history.json 과 같은 폴더)\n"
+        "- 복기: python tools/analyze_shadow.py  (선택 --csv)\n"
+        "- 모드를 바꾼 뒤에는 봇/GUI 재시작\n"
     )
 
 
