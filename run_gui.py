@@ -236,6 +236,8 @@ def _build_strategy_guide_text() -> str:
     max_us = int(getattr(run_bot, "MAX_POSITIONS_US", 3))
     max_coin = int(getattr(run_bot, "MAX_POSITIONS_COIN", 5))
     buy_win = int(getattr(run_bot, "config", {}).get("buy_window_minutes_before_close", 30))
+    earn_mode = str(getattr(run_bot, "EARNINGS_BLOCK_MODE", "shadow"))
+    crash_mode = str(getattr(run_bot, "KR_CRASH_EXIT_MODE", "shadow"))
     kr_hedge_detail = "\n".join(
         f"  · {a.code} — {a.name_ko}" for a in hedge_assets_for_market("KR")
     )
@@ -291,6 +293,17 @@ def _build_strategy_guide_text() -> str:
         "  (헷지도 MAX 슬롯 한도 동일 적용)\n"
         "- BEAR 날씨: 신규 매수 전면 차단 (헷지 포함 · 현금 관망)\n"
         "- 이미 보유·쿨다운·최소주문·예수금 부족 시 패스\n\n"
+        "■ 2b) 섀도우 규칙 (기본 shadow — 주문·포지션 변경 없음)\n"
+        f"- 현재 기동 값: earnings_block_mode={earn_mode} / kr_crash_exit_mode={crash_mode}\n"
+        "- 값: off(완전 무동작) | shadow(로그만, 매매는 오늘과 동일) | live(실제 차단·매도)\n"
+        "- 미장 실적 차단: V8·스윙 신규 매수. 실적일이 매수일(미국 동부) 포함 10거래일 안이면 차단.\n"
+        "  · 당일 장후(after-close) 포함. 조회 실패는 매수 허용(fail-open)+경고.\n"
+        "  · shadow 로그: [SHADOW-EARNINGS] would block TICKER, earnings DATE\n"
+        "- 국장 급락 청산: KST 15:15~15:20 사이클. KODEX200(069500) 또는 종목 상장시장\n"
+        "  (KOSPI/KOSDAQ) 전일 대비 ≤ -3% 이면 보유 전량(수익·손실 모두).\n"
+        "  · shadow 로그: [SHADOW-KRCRASH] would sell TICKER qty at PRICE, pnl%\n"
+        "- 기록: logs/shadow_events.jsonl (추가만). 사후: py -3.11 analysis/run_shadow_review.py\n"
+        "- 모드 변경은 config.json 수정 후 GUI/봇 재시작.\n\n"
         "■ 3) V8 추세 매수 — calculate_pro_signals (strategy_type=TREND_V8)\n"
         "- 최소 120봉 OHLCV (목표 캐시 200봉)\n"
         "- Hurst H<0.45 → 횡보·역추세 차단 (50~100봉 R/S)\n"

@@ -26,7 +26,7 @@ AI·사람이 **어디를 열지** 빠르게 고르기 위한 지도.
 |------|------|
 | [`HEDGE_UNIVERSE.md`](HEDGE_UNIVERSE.md) | 헷지 티커·BEAR/Phase4 현금 관망 정책 |
 | [`../analysis/STRATEGY_REVIEW.md`](../analysis/STRATEGY_REVIEW.md) | 거래 복기·고도화 제안 |
-| [`../analysis/README.md`](../analysis/README.md) | analysis 툴 사용법 |
+| [`../analysis/README.md`](../analysis/README.md) | analysis 툴 사용법 · 섀도우 사후평가 |
 | 루트 [`../README.md`](../README.md) §전략 | V8/스윙 상수·타임스탑·매수 게이트 |
 
 ## 구조·멱등

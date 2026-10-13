@@ -56,6 +56,8 @@ test_run_output.txt
 
 # OHLCV 캐시 (런타임)
 data/ohlcv_cache/
+data/earnings_cache.json
+data/kr_listing_cache.json
 
 # analysis 가격 캐시 (코드·docs·.gitkeep만 추적)
 analysis/cache/*.json

@@ -59,8 +59,24 @@
     "id": "equity_circuit_local",
     "label": "Equity 스냅샷 서킷 (로컬)",
     "start": "2026-08-20",
-    "end": "2099-12-31",
+    "end": "2026-09-11",
     "commits": [],
     "notes": "Phase0~3 risk/display 분리·sanitize Rule1/2/3 (미커밋)"
+  },
+  {
+    "id": "v8_72h_swing_10ma",
+    "label": "V8 72h · 스윙 10MA",
+    "start": "2026-09-12",
+    "end": "2026-10-12",
+    "commits": [],
+    "notes": "V8 타임스탑 72h(3거래일), 스윙 러너 10MA(고점 래칫). 그 이전 README의 14일·5MA 표기는 이 시점부터 낡은 값"
+  },
+  {
+    "id": "shadow_earnings_krcrash",
+    "label": "실적차단·국장급락청산 섀도우",
+    "start": "2026-10-13",
+    "end": "2099-12-31",
+    "commits": [],
+    "notes": "미장 실적 10거래일 진입 차단, 국장 15:15 KST 지수 -3% 전량 청산. 기본 shadow(로그만). live는 config earnings_block_mode / kr_crash_exit_mode"
   }
 ]

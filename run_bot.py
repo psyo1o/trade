@@ -415,6 +415,22 @@ ACCOUNT_CIRCUIT_ANCHOR_MIN_RATIO = float(config.get("account_circuit_share_ancho
 # KIS 잔고: ``on_trade``(기본)=매매·강제새로고침·입출금 시만 API / ``always``=기존처럼 자주 조회
 KIS_BALANCE_SYNC_MODE = str(config.get("kis_balance_sync_mode", "on_trade")).strip().lower()
 
+# 섀도우 규칙 — 기본 shadow(로그만). live 일 때만 주문·포지션이 바뀐다. off 는 완전 무동작.
+from strategy.rule_modes import normalize_rule_mode
+from strategy.shadow_events import set_shadow_events_path
+
+EARNINGS_BLOCK_MODE = normalize_rule_mode(config.get("earnings_block_mode"), default="shadow")
+KR_CRASH_EXIT_MODE = normalize_rule_mode(config.get("kr_crash_exit_mode"), default="shadow")
+_shadow_events_cfg = str(config.get("shadow_events_path") or "").strip()
+SHADOW_EVENTS_PATH = _shadow_events_cfg or None
+set_shadow_events_path(SHADOW_EVENTS_PATH)
+if EARNINGS_BLOCK_MODE != "off" or KR_CRASH_EXIT_MODE != "off":
+    print(
+        f"[RULES] earnings_block_mode={EARNINGS_BLOCK_MODE} "
+        f"kr_crash_exit_mode={KR_CRASH_EXIT_MODE} "
+        f"(shadow=로그만, live=주문, off=비활성)"
+    )
+
 
 def _account_circuit_min_share_pct(market: str) -> float:
     """시장별 최소 포트폴리오 비중(%). 0 이하면 해당 시장 서킷 비활성."""
@@ -4706,7 +4722,7 @@ def _check_swing_trailing_exit(
 
 
 # 타임스탑 — KR/US는 **거래일 24h**(휴장일 pause), COIN은 24/7 연속시간
-#   V8: 336h(14거래일) + 유예 +4% | SWING: 72h(3일) + 유예 +2%
+#   V8: 72h(3거래일, 2026-09-12~) + 유예 +4% | SWING: 72h(3일) + 유예 +2%
 #   상수 단일 출처: strategy.rules (여기서 덮어쓰면 README·GUI와 어긋남)
 # (보유시각: buy_date 우선, 없으면 buy_time)
 # V8_TIME_STOP_* / SWING_TIME_STOP_* — strategy.rules import 재노출

@@ -7,6 +7,20 @@
 
 ---
 
+## 2026-10-13 — 미장 실적 차단·국장 급락 청산 (기본 shadow)
+
+- **무엇을:** 두 규칙을 `off|shadow|live` 로 추가. 기본 **shadow** — 로그만 남기고 주문·포지션은 바꾸지 않음. `off` 는 조회·로그·기록까지 없음. `live` 만 실제 차단·매도.
+  - 미장 V8·스윙 신규 매수: 실적일이 매수일(미국 동부) **포함 10거래일** 안이면 차단. 당일 장후 포함. yfinance 실적일 + 디스크 캐시. 실패 시 매수 허용(fail-open)+경고.
+  - 국장 보유: KST **15:15~15:20** 사이클에서 KODEX200(069500) 또는 종목 상장시장(KOSPI/KOSDAQ)이 전일 대비 **≤ -3%** 이면 전량 청산(수익·손실 모두). 지수 없으면 매도하지 않음. live 주문은 lane `kr_crash`.
+  - 기록: `logs/shadow_events.jsonl`. 사후: `analysis/run_shadow_review.py` (1/3/5 거래일).
+  - README의 V8 타임스탑 **14일**·러너 **5MA** 표기를 **72h(3거래일)·10MA**(2026-09-12~)로 맞춤. `strategy_eras.json` 시대 추가.
+- **왜:** 실적 직전 진입과 국장 급락 마감 보유를 먼저 관찰만 하고, 켜기 전에 사후 손익을 보기 위함.
+- **주요 파일:** `strategy/earnings_gate.py`, `strategy/kr_crash_exit.py`, `execution/kr_crash_exit.py`, `execution/market_cycles/us_buy_cycle.py`, `execution/market_cycles/kr_cycle.py`, `run_bot.py`, `analysis/run_shadow_review.py`, `README.md`
+- **이어서 할 일 / 주의:** 거래 PC는 `git pull` 후 GUI/봇 **완전 재시작**. 키를 안 넣어도 shadow. `live` 로 바꿀 때만 `config.json` 의 `earnings_block_mode` / `kr_crash_exit_mode` 를 `live` 로 하고 재시작. 시작 로그 `[RULES]` 확인. 실적·지수는 야후/네이버 — 실패해도 기존 매매는 유지(실적은 통과, 급락은 매도 안 함).
+- **테스트:** `python -m pytest tests/test_shadow_rules.py -q` (13 passed). 라이브 스모크 해당 없음(LLM 미변경).
+
+---
+
 ## 2026-10-09 — 고점 보정: 미장 USD·코인 USDT 직접 입력
 
 - **무엇을:** 고점 보정 금액을 시장 통화로 입력 (국장 원 · 미장 USD · 코인 USDT(바이낸스)/원(업비트)). 시장 `peak_equity_*`는 입력값 그대로, 합산 고점은 환율 환산액으로 가감. GUI 금액 라벨·예시·확인창이 시장 선택에 따라 단위 표시. `capital_adjustments`에 `amount_native`·`amount_unit`·`krw_per_unit` 기록. 레거시 `amount_krw` 인자는 환율로 나눠 계속 지원.
